@@ -3839,6 +3839,16 @@ def build_parser():
         help='Delivery technology (default: sanger). PacBio triggers FASTQ clustering after validation.')
     mailroom_parser.add_argument('--pacbio-library-prep', default='Kinnex 16S rRNA Kit',
         help='PacBio library-preparation protocol retained in provenance.')
+    mailroom_parser.add_argument('--pacbio-threads', type=int, default=8,
+        help='CPU threads for PacBio vsearch clustering during automatic kinnex import (default: 8).')
+    mailroom_parser.add_argument('--pacbio-vsearch-strand', choices=['plus', 'both'], default='plus',
+        help='vsearch strand mode for PacBio clustering (default: plus).')
+    mailroom_parser.add_argument('--pacbio-vsearch-query-cov', type=float, default=0.0,
+        help='Optional PacBio vsearch --query_cov threshold from 0 to 1; 0 disables the flag (default: 0).')
+    mailroom_parser.add_argument('--pacbio-vsearch-maxaccepts', type=int, default=0,
+        help='PacBio vsearch --maxaccepts value for clustering; 0 keeps all accepted hits (default: 0).')
+    mailroom_parser.add_argument('--pacbio-vsearch-maxrejects', type=int, default=0,
+        help='PacBio vsearch --maxrejects value for clustering; 0 keeps the vsearch default behaviour for no reject cap (default: 0).')
     mailroom_parser.add_argument('--dataset', required=True,
         help='Stable batch label written to every map row, for example UoG_01.')
     mailroom_parser.add_argument('--forward-primer', default=None,
@@ -3943,6 +3953,16 @@ def build_parser():
     kinnex_parser.add_argument('--cluster-identity', type=float, default=0.995)
     kinnex_parser.add_argument('--min-reads', type=int, default=20)
     kinnex_parser.add_argument('--min-dominant-fraction', type=float, default=0.80)
+    kinnex_parser.add_argument('--threads', type=int, default=1,
+        help='CPU threads for vsearch clustering (default: 1).')
+    kinnex_parser.add_argument('--vsearch-strand', choices=['plus', 'both'], default='plus',
+        help='vsearch strand mode for cluster_fast (default: plus).')
+    kinnex_parser.add_argument('--vsearch-query-cov', type=float, default=0.0,
+        help='Optional vsearch --query_cov threshold from 0 to 1; 0 disables the flag (default: 0).')
+    kinnex_parser.add_argument('--vsearch-maxaccepts', type=int, default=0,
+        help='vsearch --maxaccepts value for clustering; 0 keeps all accepted hits (default: 0).')
+    kinnex_parser.add_argument('--vsearch-maxrejects', type=int, default=0,
+        help='vsearch --maxrejects value for clustering; 0 keeps the vsearch default behaviour for no reject cap (default: 0).')
     kinnex_parser.add_argument('--library-prep', default='Kinnex 16S rRNA Kit',
         help='Library-preparation protocol to retain in PacBio QC provenance.')
 
@@ -4116,6 +4136,11 @@ def build_parser():
     assistant_parser.add_argument('--pacbio-cluster-identity', type=float, default=0.995)
     assistant_parser.add_argument('--pacbio-min-reads', type=int, default=20)
     assistant_parser.add_argument('--pacbio-min-dominant-fraction', type=float, default=0.80)
+    assistant_parser.add_argument('--pacbio-threads', type=int, default=1)
+    assistant_parser.add_argument('--pacbio-vsearch-strand', choices=['plus', 'both'], default='plus')
+    assistant_parser.add_argument('--pacbio-vsearch-query-cov', type=float, default=0.0)
+    assistant_parser.add_argument('--pacbio-vsearch-maxaccepts', type=int, default=0)
+    assistant_parser.add_argument('--pacbio-vsearch-maxrejects', type=int, default=0)
     assistant_parser.add_argument('--pacbio-library-prep', default='Kinnex 16S rRNA Kit')
     assistant_parser.add_argument('-o', '--out', required=True)
 
@@ -4569,6 +4594,11 @@ def cmd_mailroom(args):
                 pacbio_outputs = run_kinnex_import(
                     result['pacbio_map'], Path(args.out) / 'pacbio_16s_import',
                     library_prep=args.pacbio_library_prep,
+                    threads=args.pacbio_threads,
+                    strand=args.pacbio_vsearch_strand,
+                    query_cov=args.pacbio_vsearch_query_cov,
+                    maxaccepts=args.pacbio_vsearch_maxaccepts,
+                    maxrejects=args.pacbio_vsearch_maxrejects,
                 )
                 for role in ('fasta', 'marker_qc', 'read_qc', 'report'):
                     manifest.add_output(pacbio_outputs[role], role=f'pacbio_{role}')
@@ -4648,6 +4678,9 @@ def cmd_pacbio_16s_import(args):
             max_read_length=args.max_read_length, min_mean_quality=args.min_mean_quality,
             cluster_identity=args.cluster_identity, min_reads=args.min_reads,
             min_dominant_fraction=args.min_dominant_fraction, library_prep=args.library_prep,
+            threads=args.threads, strand=args.vsearch_strand,
+            query_cov=args.vsearch_query_cov, maxaccepts=args.vsearch_maxaccepts,
+            maxrejects=args.vsearch_maxrejects,
         )
         for role in ('fasta', 'marker_qc', 'report', 'read_qc'):
             manifest.add_output(outputs[role], role=f'pacbio_{role}')
@@ -4925,6 +4958,11 @@ def cmd_assistant(args):
                 cluster_identity=args.pacbio_cluster_identity, min_reads=args.pacbio_min_reads,
                 min_dominant_fraction=args.pacbio_min_dominant_fraction,
                 library_prep=args.pacbio_library_prep,
+                threads=args.pacbio_threads,
+                strand=args.pacbio_vsearch_strand,
+                query_cov=args.pacbio_vsearch_query_cov,
+                maxaccepts=args.pacbio_vsearch_maxaccepts,
+                maxrejects=args.pacbio_vsearch_maxrejects,
             )
             manifest.add_stage('pacbio_16s_import', 'COMPLETE', detail=f"{kinnex_outputs['accepted']}/{kinnex_outputs['total']} isolates accepted")
 

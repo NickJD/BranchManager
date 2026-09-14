@@ -85,6 +85,41 @@ class OperationalWorkflowTests(unittest.TestCase):
             self.assertIn('PASS_HIGH_CONFIDENCE', qc)
             self.assertIn('dominant cluster 3', qc)
 
+    def test_kinnex_import_forwards_vsearch_options(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fastq = root / 'ISO1.fastq'
+            sequence = 'A' * 1500
+            fastq.write_text(f'@a\n{sequence}\n+\n{"I" * 1500}\n')
+            mapping = root / 'kinnex.tsv'
+            mapping.write_text('sequence_id\tfastq_file\nISO1\tISO1.fastq\n')
+            seen_commands = []
+
+            def fake_vsearch(command, **_kwargs):
+                seen_commands.append(command)
+                uc = Path(command[command.index('--uc') + 1])
+                uc.write_text('S\t0\t1500\t*\t*\t*\t*\t*\tread00000001;size=1;\t*\n')
+
+            with mock.patch('branchmanager.pipeline.kinnex.shutil.which', return_value='vsearch'), \
+                 mock.patch('branchmanager.pipeline.kinnex.run_cmd', side_effect=fake_vsearch):
+                run_kinnex_import(
+                    mapping, root / 'out', min_reads=1, threads=8, strand='both',
+                    query_cov=0.75, maxaccepts=5, maxrejects=17,
+                )
+
+            self.assertEqual(len(seen_commands), 1)
+            self.assertEqual(seen_commands[0][:4], ['vsearch', '--cluster_fast', str(root / 'out' / 'clustering_work' / 'ISO1.derep.fasta'), '--id'])
+            self.assertIn('--threads', seen_commands[0])
+            self.assertIn('8', seen_commands[0])
+            self.assertIn('--strand', seen_commands[0])
+            self.assertIn('both', seen_commands[0])
+            self.assertIn('--query_cov', seen_commands[0])
+            self.assertIn('0.75', seen_commands[0])
+            self.assertIn('--maxaccepts', seen_commands[0])
+            self.assertIn('5', seen_commands[0])
+            self.assertIn('--maxrejects', seen_commands[0])
+            self.assertIn('17', seen_commands[0])
+
     def test_onboarding_writes_normalised_per_read_map(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

@@ -427,6 +427,47 @@ class DatabaseBehaviourTests(unittest.TestCase):
         self.assertEqual(args.out, 'qc_out')
         self.assertFalse(hasattr(args, 'db'))
 
+    def test_build_parser_accepts_kinnex_vsearch_options(self):
+        args = build_parser().parse_args([
+            'pacbio-16s-import',
+            '--pacbio-map', 'pacbio.tsv',
+            '--threads', '6',
+            '--vsearch-strand', 'both',
+            '--vsearch-query-cov', '0.8',
+            '--vsearch-maxaccepts', '12',
+            '--vsearch-maxrejects', '34',
+            '-o', 'out',
+        ])
+
+        self.assertEqual(args.command, 'pacbio-16s-import')
+        self.assertEqual(args.threads, 6)
+        self.assertEqual(args.vsearch_strand, 'both')
+        self.assertEqual(args.vsearch_query_cov, 0.8)
+        self.assertEqual(args.vsearch_maxaccepts, 12)
+        self.assertEqual(args.vsearch_maxrejects, 34)
+
+    def test_build_parser_accepts_mailroom_pacbio_vsearch_options(self):
+        args = build_parser().parse_args([
+            'mailroom',
+            '--technology', 'pacbio',
+            '--read-dir', 'reads',
+            '--metadata', 'supplier.tsv',
+            '--dataset', 'PACBIO_01',
+            '--pacbio-threads', '3',
+            '--pacbio-vsearch-strand', 'both',
+            '--pacbio-vsearch-query-cov', '0.65',
+            '--pacbio-vsearch-maxaccepts', '7',
+            '--pacbio-vsearch-maxrejects', '21',
+            '-o', 'out',
+        ])
+
+        self.assertEqual(args.command, 'mailroom')
+        self.assertEqual(args.pacbio_threads, 3)
+        self.assertEqual(args.pacbio_vsearch_strand, 'both')
+        self.assertEqual(args.pacbio_vsearch_query_cov, 0.65)
+        self.assertEqual(args.pacbio_vsearch_maxaccepts, 7)
+        self.assertEqual(args.pacbio_vsearch_maxrejects, 21)
+
     def test_interview_resolves_mailroom_output_and_delegates_to_shared_qc(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             mailroom = Path(tmpdir) / 'mailroom'

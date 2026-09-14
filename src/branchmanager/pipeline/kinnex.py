@@ -76,6 +76,11 @@ def _cluster_representative(
     max_read_length: int,
     min_mean_quality: float,
     cluster_identity: float,
+    threads: int,
+    strand: str,
+    query_cov: float,
+    maxaccepts: int,
+    maxrejects: int,
     library_prep: str,
 ) -> tuple[str | None, dict]:
     """Return the modal sequence from the largest vsearch cluster and its QC."""
@@ -113,10 +118,21 @@ def _cluster_representative(
     uc = workdir / f'{sequence_id}.clusters.uc'
     if shutil.which('vsearch') is None:
         raise RuntimeError('vsearch is required for PacBio read clustering; install it before using --pacbio-map')
-    run_cmd([
+    cmd = [
         'vsearch', '--cluster_fast', str(derep), '--id', str(cluster_identity),
-        '--sizein', '--uc', str(uc), '--threads', '1', '--quiet',
-    ])
+        '--sizein', '--uc', str(uc), '--quiet',
+    ]
+    if threads and int(threads) > 0:
+        cmd.extend(['--threads', str(int(threads))])
+    if strand:
+        cmd.extend(['--strand', str(strand)])
+    if query_cov > 0:
+        cmd.extend(['--query_cov', str(query_cov)])
+    if maxaccepts >= 0:
+        cmd.extend(['--maxaccepts', str(int(maxaccepts))])
+    if maxrejects >= 0:
+        cmd.extend(['--maxrejects', str(int(maxrejects))])
+    run_cmd(cmd)
     clusters: dict[str, list[str]] = defaultdict(list)
     with open(uc) as handle:
         for line in handle:
@@ -151,11 +167,24 @@ def run_kinnex_import(
     cluster_identity: float = 0.995,
     min_reads: int = 20,
     min_dominant_fraction: float = 0.80,
+    threads: int = 1,
+    strand: str = 'plus',
+    query_cov: float = 0.0,
+    maxaccepts: int = 0,
+    maxrejects: int = 0,
     library_prep: str = 'Kinnex 16S rRNA Kit',
 ) -> dict:
     """Build one reviewed PacBio 16S representative per isolate FASTQ."""
     if not 0 < cluster_identity <= 1 or not 0 < min_dominant_fraction <= 1:
         raise ValueError('cluster identity and dominant-cluster fraction must be between 0 and 1')
+    if int(threads) < 1:
+        raise ValueError('threads must be at least 1')
+    if strand not in {'plus', 'both'}:
+        raise ValueError("strand must be 'plus' or 'both'")
+    if not 0 <= query_cov <= 1:
+        raise ValueError('query_cov must be between 0 and 1')
+    if int(maxaccepts) < 0 or int(maxrejects) < 0:
+        raise ValueError('maxaccepts and maxrejects must be non-negative')
     output = Path(outdir).resolve()
     output.mkdir(parents=True, exist_ok=True)
     workdir = output / 'clustering_work'
@@ -165,7 +194,9 @@ def run_kinnex_import(
         representative, row = _cluster_representative(
             sequence_id, fastq, workdir, min_read_length=min_read_length,
             max_read_length=max_read_length, min_mean_quality=min_mean_quality,
-            cluster_identity=cluster_identity, library_prep=library_prep,
+            cluster_identity=cluster_identity, threads=threads, strand=strand,
+            query_cov=query_cov, maxaccepts=maxaccepts, maxrejects=maxrejects,
+            library_prep=library_prep,
         )
         reasons = []
         if row['passed_read_count'] < min_reads:

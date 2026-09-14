@@ -374,6 +374,8 @@ Iso001	UoG_01	well_A02.ab1	907R	reverse	assemble
 Iso002	UoG_01	well_B01.ab1	27F	forward	best_read
 ```
 
+Segmented PacBio HiFi 16S imports use `vsearch --cluster_fast` inside kinnex. `branchmanager pacbio-16s-import` exposes `--threads`, `--vsearch-strand`, `--vsearch-query-cov`, `--vsearch-maxaccepts`, and `--vsearch-maxrejects`, and `branchmanager mailroom --technology pacbio` forwards the same controls with `--pacbio-...` prefixes when it automatically runs kinnex after validating the FASTQ map.
+
 Multiple rows may share the same `sequence_id` when an isolate has multiple primer reads. Relative paths are resolved from the batch-map location. A wide one-row-per-isolate representation is also accepted when laboratories naturally supply separate primer columns:
 
 ```tsv
