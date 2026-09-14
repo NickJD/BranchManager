@@ -3925,6 +3925,24 @@ def build_parser():
     onboarding_parser.add_argument('-o', '--out', required=True,
         help='Output directory for the normalised submission and Onboarding report.')
 
+    kinnex_parser = sub.add_parser(
+        'pacbio-16s-import',
+        help='PacBio 16S Import: cluster segmented HiFi FASTQs into one marker per isolate.',
+        formatter_class=_Fmt,
+    )
+    kinnex_parser.add_argument('--pacbio-map', required=True,
+        help='CSV/TSV with one row per isolate: sequence_id (or isolate_id) and file/fastq_file.')
+    kinnex_parser.add_argument('-o', '--out', required=True,
+        help='Output directory for representatives FASTA, marker-QC sidecar, and PacBio QC report.')
+    kinnex_parser.add_argument('--min-read-length', type=int, default=1000)
+    kinnex_parser.add_argument('--max-read-length', type=int, default=2000)
+    kinnex_parser.add_argument('--min-mean-quality', type=float, default=20.0)
+    kinnex_parser.add_argument('--cluster-identity', type=float, default=0.995)
+    kinnex_parser.add_argument('--min-reads', type=int, default=20)
+    kinnex_parser.add_argument('--min-dominant-fraction', type=float, default=0.80)
+    kinnex_parser.add_argument('--library-prep', default='Kinnex 16S rRNA Kit',
+        help='Library-preparation protocol to retain in PacBio QC provenance.')
+
     status_meeting_parser = sub.add_parser(
         'status-meeting',
         help='Status Meeting: import factual isolate lifecycle changes into the project ledger.',
@@ -4006,6 +4024,7 @@ def build_parser():
     assistant_input = assistant_parser.add_mutually_exclusive_group(required=True)
     assistant_input.add_argument('--sample-map', help='AB1/primer-read sample map; runs Paper Trail and Merge Meeting.')
     assistant_input.add_argument('--fasta', help='Partner-supplied marker FASTA; bypasses Paper Trail and Merge Meeting.')
+    assistant_input.add_argument('--pacbio-map', help='One segmented PacBio HiFi FASTQ per isolate; clusters reads then continues as partner-sequenced markers.')
     assistant_parser.add_argument('--partner-metadata', required=True)
     assistant_parser.add_argument('--partner-id', default=None,
         help='Expected partner acronym for validation, for example QUB or UoG.')
@@ -4088,6 +4107,13 @@ def build_parser():
         help='CSV/TSV decisions for PASS_WITH_WARNINGS markers, with sequence_id, decision, reviewer, and optional notes.')
     assistant_parser.add_argument('--accept-unverified-marker-qc', action='store_true', default=False,
         help='Audited acceptance of a partner FASTA without BranchManager marker-QC provenance.')
+    assistant_parser.add_argument('--pacbio-min-read-length', type=int, default=1000)
+    assistant_parser.add_argument('--pacbio-max-read-length', type=int, default=2000)
+    assistant_parser.add_argument('--pacbio-min-mean-quality', type=float, default=20.0)
+    assistant_parser.add_argument('--pacbio-cluster-identity', type=float, default=0.995)
+    assistant_parser.add_argument('--pacbio-min-reads', type=int, default=20)
+    assistant_parser.add_argument('--pacbio-min-dominant-fraction', type=float, default=0.80)
+    assistant_parser.add_argument('--pacbio-library-prep', default='Kinnex 16S rRNA Kit')
     assistant_parser.add_argument('-o', '--out', required=True)
 
     background_check_parser = sub.add_parser(
@@ -4593,6 +4619,29 @@ def cmd_onboarding(args):
         raise SystemExit(2)
 
 
+def cmd_pacbio_16s_import(args):
+    from branchmanager.pipeline.kinnex import run_kinnex_import
+
+    manifest = RunManifest(args.out, 'pacbio-16s-import')
+    manifest.add_input(args.pacbio_map, role='pacbio_fastq_map')
+    try:
+        outputs = run_kinnex_import(
+            args.pacbio_map, args.out, min_read_length=args.min_read_length,
+            max_read_length=args.max_read_length, min_mean_quality=args.min_mean_quality,
+            cluster_identity=args.cluster_identity, min_reads=args.min_reads,
+            min_dominant_fraction=args.min_dominant_fraction, library_prep=args.library_prep,
+        )
+        for role in ('fasta', 'marker_qc', 'report', 'read_qc'):
+            manifest.add_output(outputs[role], role=f'pacbio_{role}')
+        manifest.add_stage('pacbio_16s_import', 'COMPLETE', detail=f"{outputs['accepted']}/{outputs['total']} isolates accepted")
+        manifest.finish('COMPLETE')
+    except Exception as exc:
+        manifest.finish('FAILED', error=exc)
+        raise
+    print(f"[pacbio-16s-import] {outputs['accepted']}/{outputs['total']} isolate(s) accepted.\n"
+          f"  Representatives : {outputs['fasta']}\n  Marker QC       : {outputs['marker_qc']}\n  QC report       : {outputs['report']}")
+
+
 def _cmd_project_import(args, *, genomes: bool):
     import fcntl
     import sqlite3
@@ -4820,7 +4869,7 @@ def cmd_assistant(args):
     root.mkdir(parents=True, exist_ok=True)
     manifest = RunManifest(root, 'assistant')
     for role, source in (
-        ('sample_map', args.sample_map), ('marker_fasta', args.fasta),
+        ('sample_map', args.sample_map), ('marker_fasta', args.fasta), ('pacbio_map', args.pacbio_map),
         ('partner_metadata', args.partner_metadata), ('marker_qc', args.marker_qc),
         ('marker_review', args.marker_review),
         ('primary_reference', args.ref), ('reference_taxonomy', args.taxa),
@@ -4847,9 +4896,23 @@ def cmd_assistant(args):
         if it_desk_report['status'] != 'PASS':
             raise RuntimeError(f'IT Desk checks failed; inspect {it_desk_report["tsv"]}')
 
+        kinnex_dir = root / '01_pacbio_16s_import'
+        kinnex_outputs = None
+        if args.pacbio_map:
+            from branchmanager.pipeline.kinnex import run_kinnex_import
+            kinnex_outputs = run_kinnex_import(
+                args.pacbio_map, kinnex_dir,
+                min_read_length=args.pacbio_min_read_length, max_read_length=args.pacbio_max_read_length,
+                min_mean_quality=args.pacbio_min_mean_quality,
+                cluster_identity=args.pacbio_cluster_identity, min_reads=args.pacbio_min_reads,
+                min_dominant_fraction=args.pacbio_min_dominant_fraction,
+                library_prep=args.pacbio_library_prep,
+            )
+            manifest.add_stage('pacbio_16s_import', 'COMPLETE', detail=f"{kinnex_outputs['accepted']}/{kinnex_outputs['total']} isolates accepted")
+
         onboarding_dir = root / '01_onboarding'
         onboarding_args = argparse.Namespace(
-            sample_map=args.sample_map, fasta=args.fasta, partner_metadata=args.partner_metadata,
+            sample_map=args.sample_map, fasta=kinnex_outputs['fasta'] if kinnex_outputs else args.fasta, partner_metadata=args.partner_metadata,
             read_dir=args.read_dir, primers=args.primers, partner_id=args.partner_id,
             dataset=args.dataset, out=str(onboarding_dir),
         )
@@ -4887,6 +4950,11 @@ def cmd_assistant(args):
             marker_qc = paper_trail_dir / 'assembly_report.tsv'
             manifest.add_stage('paper_trail', 'COMPLETE')
             manifest.add_stage('merge_meeting', 'COMPLETE')
+        elif kinnex_outputs:
+            marker_input = onboarding_dir / 'normalised_input.fasta'
+            marker_qc = Path(kinnex_outputs['marker_qc'])
+            manifest.add_stage('paper_trail', 'SKIPPED', detail='Kinnex clustering replaced Sanger trace processing')
+            manifest.add_stage('merge_meeting', 'SKIPPED', detail='Kinnex representative selected from dominant read cluster')
         else:
             if not args.marker_qc and not args.accept_unverified_marker_qc:
                 raise RuntimeError(
@@ -5206,6 +5274,8 @@ def main(argv=None):
         cmd_interview(args)
     elif args.command == 'onboarding':
         cmd_onboarding(args)
+    elif args.command == 'pacbio-16s-import':
+        cmd_pacbio_16s_import(args)
     elif args.command == 'status-meeting':
         _cmd_project_import(args, genomes=False)
     elif args.command == 'records-update':

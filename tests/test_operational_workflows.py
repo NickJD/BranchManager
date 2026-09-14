@@ -23,6 +23,7 @@ from branchmanager.marker_provenance import load_marker_provenance, marker_qc_fl
 from branchmanager.personnel import load_exit_requests
 from branchmanager.pipeline.classify import _parse_vsearch_match
 from branchmanager.pipeline.chimera import _parse_uchime_row
+from branchmanager.pipeline.kinnex import run_kinnex_import
 from branchmanager.pipeline.tree import _orient_tree_input_fasta
 from branchmanager.pipeline.workflow_helpers import build_selection_decision
 from branchmanager.project_state import import_genome_results
@@ -32,6 +33,37 @@ from branchmanager.utils.subprocess import run_cmd
 
 
 class OperationalWorkflowTests(unittest.TestCase):
+    def test_kinnex_import_selects_abundance_supported_representative(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fastq = root / 'ISO1.fastq'
+            primary = 'A' * 1500
+            minor = 'A' * 1499 + 'C'
+            fastq.write_text(
+                f'@a\n{primary}\n+\n{"I" * 1500}\n'
+                f'@b\n{primary}\n+\n{"I" * 1500}\n'
+                f'@c\n{minor}\n+\n{"I" * 1500}\n'
+            )
+            mapping = root / 'kinnex.tsv'
+            mapping.write_text('sequence_id\tfastq_file\nISO1\tISO1.fastq\n')
+
+            def fake_vsearch(command, **_kwargs):
+                uc = Path(command[command.index('--uc') + 1])
+                uc.write_text(
+                    'S\t0\t1500\t*\t*\t*\t*\t*\tread00000001;size=2;\t*\n'
+                    'H\t0\t1500\t99.9\t+\t0\t0\t*\tread00000002;size=1;\tread00000001;size=2;\n'
+                )
+
+            with mock.patch('branchmanager.pipeline.kinnex.shutil.which', return_value='vsearch'), \
+                 mock.patch('branchmanager.pipeline.kinnex.run_cmd', side_effect=fake_vsearch):
+                outputs = run_kinnex_import(mapping, root / 'out', min_reads=2)
+
+            self.assertEqual(outputs['accepted'], 1)
+            self.assertIn(f'>ISO1\n{primary}', Path(outputs['fasta']).read_text())
+            qc = Path(outputs['marker_qc']).read_text()
+            self.assertIn('PASS_HIGH_CONFIDENCE', qc)
+            self.assertIn('dominant cluster 3', qc)
+
     def test_onboarding_writes_normalised_per_read_map(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

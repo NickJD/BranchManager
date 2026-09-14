@@ -303,6 +303,27 @@ branchmanager onboarding \
 
 FASTA Onboarding writes `normalised_input.fasta`. It does not invent chromatogram quality evidence. Supply a reviewed `--marker-qc` table to Performance Review where one exists, or use `--accept-unverified-marker-qc` as an explicit audited acceptance; unverified marker evidence remains visible in the reports.
 
+### PacBio 16S partner submissions
+
+Use PacBio 16S only after SMRT Link has segmented/de-concatenated and demultiplexed the library molecules. One FASTQ is supplied per cultured isolate, containing many observations of the approximately 1.5 kb full-length 16S amplicon. BranchManager filters reads by length and mean quality, dereplicates them, clusters the unique sequences with vsearch at 99.5% identity, and selects the highest-abundance observed sequence from the dominant cluster. An isolate passes only when it has at least 20 passing reads and the dominant cluster contains at least 80% of them; adjust these defaults only with documented validation. The current default library provenance is `Kinnex 16S rRNA`; it is recorded in the marker QC reason field alongside the SMRT Link segmentation workflow.
+
+```tsv
+sequence_id	fastq_file
+Iso001	fastq/Iso001.fastq.gz
+Iso002	fastq/Iso002.fastq.gz
+```
+
+```bash
+branchmanager pacbio-16s-import --pacbio-map QUB_PACBIO_01/pacbio_map.tsv -o QUB_PACBIO_01/00_pacbio_16s
+
+# Or run it as the partner-sequenced input to the full workflow:
+branchmanager assistant --pacbio-map QUB_PACBIO_01/pacbio_map.tsv \
+  --partner-metadata project_partner_metadata.tsv --partner-id QUB --dataset QUB_PACBIO_01 \
+  --db project.db --ref gtdb_16s.fasta -o QUB_PACBIO_01/run
+```
+
+PacBio 16S Import writes `pacbio_16s_representatives.fasta`, `marker_qc.tsv`, `read_qc.tsv`, and `pacbio_16s_qc.tsv`. Failed or mixed isolates are excluded from the marker FASTA and remain visible in the QC report; `read_qc.tsv` retains the source FASTQ link in the downstream provenance, while raw FASTQs and the per-isolate clustering work files remain available for audit. The PacBio QC sidecar is consumed automatically by `assistant`, so it is not accepted as unverified partner FASTA.
+
 Partner acronyms and submission labels are separate. For example, `UoG_01` and `UoG_02` are distinct `--dataset` values, while both sets of ledger rows use `partner_id=UoG`. Sequence IDs must be unique and stable across the entire project.
 
 Keep exactly one cumulative metadata ledger with one row per durable isolate/marker ID. It owns `partner_id`, `selected_for_genome_sequencing`, and `already_sequenced`; chromatogram run IDs do not belong in it. Keep a separate read map under each partner/batch, for example `UoG/UoG_01/ab1_mapping.csv`, which maps every physical trace filename to its durable isolate ID, direction, and `processing_mode`. Duplicate ledger IDs, partner mismatches, missing traces, and traces assigned to more than one isolate are Onboarding errors.
