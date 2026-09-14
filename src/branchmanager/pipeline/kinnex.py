@@ -48,7 +48,8 @@ def _read_map(path: str | Path) -> list[tuple[str, Path]]:
     with open(path, newline='') as handle:
         for row in csv.DictReader(handle, delimiter=delimiter):
             lowered = {str(key).strip().lower(): str(value or '').strip() for key, value in row.items() if key}
-            sequence_id = lowered.get('sequence_id') or lowered.get('isolate_id') or lowered.get('sample_id')
+            sequence_id = (lowered.get('sequence_id') or lowered.get('sequenceid') or lowered.get('isolate_id')
+                           or lowered.get('isolateid') or lowered.get('sample_id') or lowered.get('sampleid'))
             filename = lowered.get('file') or lowered.get('fastq') or lowered.get('fastq_file') or lowered.get('read_file')
             if not sequence_id or not filename:
                 raise ValueError('PacBio map requires sequence_id (or isolate_id) and file (or fastq_file) columns')

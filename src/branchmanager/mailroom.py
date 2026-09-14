@@ -1,4 +1,4 @@
-"""AB1 batch inventory and supplier-metadata reconciliation before Onboarding."""
+"""Technology-aware partner-delivery reconciliation before Onboarding."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from branchmanager.pipeline.paper_trail import (
 
 
 AB1_SUFFIXES = ('.ab1', '.abi', '.ab1.gz', '.abi.gz')
+FASTQ_SUFFIXES = ('.fastq', '.fq', '.fastq.gz', '.fq.gz')
 SUPPLIER_ID_COLUMNS = (
     'sequencing_id', 'supplier_read_id', 'supplier_id', 'trace_id',
     'read_id', 'ab1_id', 'file', 'filename', 'read_file', 'ab1_file',
@@ -122,6 +123,112 @@ def _collect_ab1_files(read_dir: str | Path, recursive: bool) -> list[Path]:
     )
 
 
+def _collect_fastq_files(read_dir: str | Path, recursive: bool) -> list[Path]:
+    root = Path(read_dir).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f'PacBio directory does not exist: {root}')
+    iterator: Iterable[Path] = root.rglob('*') if recursive else root.iterdir()
+    return sorted(
+        child.resolve() for child in iterator
+        if child.is_file() and str(child).lower().endswith(FASTQ_SUFFIXES)
+    )
+
+
+def _strip_fastq_suffix(value: str | Path) -> str:
+    name = Path(str(value)).name
+    lower = name.lower()
+    for suffix in sorted(FASTQ_SUFFIXES, key=len, reverse=True):
+        if lower.endswith(suffix):
+            return name[:-len(suffix)]
+    return Path(name).stem
+
+
+def prepare_pacbio_map(
+    read_dir: str | Path,
+    submission_metadata: str | Path,
+    outdir: str | Path,
+    *,
+    dataset: str,
+    recursive: bool = True,
+    library_prep: str = 'Kinnex 16S rRNA Kit',
+) -> dict[str, object]:
+    """Validate one segmented PacBio FASTQ per isolate and write ``pacbio_map.tsv``."""
+    output = Path(outdir).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    read_root = Path(read_dir).expanduser().resolve()
+    rows = _read_table(submission_metadata)
+    files = _collect_fastq_files(read_root, recursive)
+    index: dict[str, set[Path]] = defaultdict(set)
+    for path in files:
+        for key in (path.name.casefold(), _strip_fastq_suffix(path).casefold()):
+            index[key].add(path)
+
+    report: list[dict[str, object]] = []
+    mapped: list[dict[str, object]] = []
+    file_owner: dict[Path, str] = {}
+    seen_ids: set[str] = set()
+    for line_number, row in enumerate(rows, start=2):
+        sequence_id = _row_value(
+            row, 'sequence_id', 'sequenceid', 'isolate_id', 'isolateid', 'sample_id', 'sampleid',
+            'unique_id', 'sample', 'isolate',
+        )
+        supplier_id = _row_value(row, *SUPPLIER_ID_COLUMNS)
+        supplied_dataset = _row_value(row, *DATASET_COLUMNS)
+        if not sequence_id:
+            report.append(_issue('ERROR', line_number, '', supplier_id, 'MISSING_SEQUENCE_ID', 'PacBio metadata requires an isolate/sequence ID'))
+            continue
+        if sequence_id in seen_ids:
+            report.append(_issue('ERROR', line_number, sequence_id, supplier_id, 'DUPLICATE_SEQUENCE_ID', 'PacBio requires exactly one FASTQ per isolate'))
+            continue
+        seen_ids.add(sequence_id)
+        if supplied_dataset and supplied_dataset.casefold() != str(dataset).casefold():
+            report.append(_issue('ERROR', line_number, sequence_id, supplier_id, 'CONFLICTING_DATASET', f'supplier row uses {supplied_dataset!r}; Mailroom batch is {dataset!r}'))
+        if not supplier_id:
+            report.append(_issue('ERROR', line_number, sequence_id, '', 'MISSING_FASTQ_FILE', 'PacBio metadata requires a FASTQ filename'))
+            continue
+        supplied = Path(supplier_id).expanduser()
+        direct = supplied if supplied.is_absolute() else read_root / supplied
+        matches = [direct.resolve()] if direct.is_file() else sorted(index.get(Path(supplier_id).name.casefold(), set()) | index.get(_strip_fastq_suffix(supplier_id).casefold(), set()))
+        if not matches:
+            report.append(_issue('ERROR', line_number, sequence_id, supplier_id, 'FASTQ_FILE_NOT_FOUND', f'no PacBio FASTQ matched {supplier_id!r}'))
+            continue
+        if len(matches) > 1:
+            report.append(_issue('ERROR', line_number, sequence_id, supplier_id, 'AMBIGUOUS_FASTQ_FILE', ';'.join(str(path) for path in matches)))
+            continue
+        path = matches[0]
+        if path in file_owner:
+            report.append(_issue('ERROR', line_number, sequence_id, supplier_id, 'FASTQ_FILE_MULTIPLE_ASSIGNMENTS', f'{path} is already assigned to {file_owner[path]}'))
+            continue
+        file_owner[path] = sequence_id
+        mapped.append({
+            'sequence_id': sequence_id, 'dataset': str(dataset),
+            'fastq_file': _relative_path(path, output), 'sequencing_platform': 'PacBio HiFi',
+            'library_prep': library_prep,
+        })
+    for path in files:
+        if path not in file_owner:
+            report.append(_issue('WARNING', '', '', '', 'UNMAPPED_FASTQ_FILE', str(path)))
+
+    map_path, inventory_path = output / 'pacbio_map.tsv', output / 'pacbio_inventory.tsv'
+    report_path, summary_path = output / 'mailroom_report.tsv', output / 'mailroom_summary.json'
+    _write_tsv(map_path, mapped, ('sequence_id', 'dataset', 'fastq_file', 'sequencing_platform', 'library_prep'))
+    _write_tsv(inventory_path, [
+        {'fastq_file': _relative_path(path, output), 'filename': path.name, 'size_bytes': path.stat().st_size}
+        for path in files
+    ], ('fastq_file', 'filename', 'size_bytes'))
+    _write_tsv(report_path, report, ('severity', 'line', 'sequence_id', 'supplier_read_id', 'code', 'detail'))
+    errors = sum(row['severity'] == 'ERROR' for row in report)
+    warnings = sum(row['severity'] == 'WARNING' for row in report)
+    summary = {
+        'status': 'FAIL' if errors else 'PASS', 'dataset': str(dataset), 'technology': 'pacbio',
+        'metadata_rows': len(rows), 'physical_fastq_files': len(files), 'mapped_reads': len(mapped),
+        'isolates': len(seen_ids), 'mapped_isolates': len(mapped), 'errors': errors, 'warnings': warnings,
+    }
+    summary_path.write_text(json.dumps(summary, indent=2) + '\n')
+    return {'status': summary['status'], 'pacbio_map': str(map_path), 'inventory': str(inventory_path),
+            'report': str(report_path), 'summary': str(summary_path), **summary}
+
+
 def _build_file_index(inventory: list[dict[str, object]]) -> dict[str, set[Path]]:
     index: dict[str, set[Path]] = defaultdict(set)
     for row in inventory:
@@ -217,6 +324,13 @@ def prepare_ab1_map(
             report.append(_issue('ERROR', line_number, sequence_id, supplier_id, 'AMBIGUOUS_READ_FILE', ';'.join(str(path) for path in matches)))
             continue
         path = matches[0]
+        if path not in inventory_by_path:
+            report.append(_issue(
+                'ERROR', line_number, sequence_id, supplier_id, 'UNSUPPORTED_READ_FILE',
+                f'{path} is not an AB1/ABI chromatogram; Mailroom is Sanger-only. '
+                'Use pacbio-16s-import / --pacbio-map for segmented PacBio HiFi FASTQ files.',
+            ))
+            continue
         previous_owner = file_owner.get(path)
         if previous_owner:
             report.append(_issue('ERROR', line_number, sequence_id, supplier_id, 'READ_FILE_MULTIPLE_ASSIGNMENTS', f'{path} is already assigned to {previous_owner}'))

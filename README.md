@@ -246,6 +246,17 @@ KKY011	SW_0016	Reverse	1492R	assemble
 
 Mailroom returns `REVIEW_REQUIRED` when files reconcile but primer names remain unresolved, and `FAIL` for structural/file errors. Correct the supplier metadata or confirm primers before Onboarding.
 
+For PacBio 16S, retain the same Mailroom entry point but select the technology explicitly. PacBio Mailroom validates one segmented HiFi FASTQ per isolate, reconciles it with the supplied `sequenceid`/`sequence_id` and `read_file`/`fastq_file` columns, writes `pacbio_map.tsv`, and automatically runs clustering and representative selection under `pacbio_16s_import/`. Sanger remains the default.
+
+```bash
+branchmanager mailroom \
+  --technology pacbio \
+  --read-dir UKNZ_01/All_Pacbio \
+  --metadata UKNZ_01/UKNZ_01_pacbio_metadata.csv \
+  --dataset UKNZ_01 \
+  -o UKNZ_01/mailroom
+```
+
 ---
 
 ### `branchmanager interview`

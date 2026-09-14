@@ -3823,19 +3823,22 @@ def build_parser():
 
     mailroom_parser = sub.add_parser(
         'mailroom',
-        help='Mailroom: inventory an AB1 delivery and build its batch map.',
+        help='Mailroom: validate a Sanger or PacBio partner delivery and build its batch map.',
         description=(
-            'Reconcile a directory of AB1/ABI chromatograms with supplier metadata and write '
-            'a validated one-row-per-read ab1_map.tsv. Primer names are taken from supplier '
-            'metadata, embedded ABIF fields, or explicit batch-level forward/reverse settings. '
-            'Unresolved primers are reported for review and are never silently inferred as fact.'
+            'Sanger (the default) reconciles AB1/ABI chromatograms and writes ab1_map.tsv. '
+            'PacBio reconciles one segmented HiFi FASTQ per isolate, writes pacbio_map.tsv, '
+            'then runs PacBio 16S clustering and representative selection automatically.'
         ),
         formatter_class=_Fmt,
     )
     mailroom_parser.add_argument('--read-dir', required=True,
-        help='Directory containing the AB1/ABI files for one partner batch.')
+        help='Directory containing Sanger AB1/ABI or segmented PacBio HiFi FASTQ files for one partner batch.')
     mailroom_parser.add_argument('--metadata', required=True,
-        help='Supplier CSV/TSV with sequencing/read ID, isolate ID, and forward/reverse direction. Primer and processing-mode columns are optional.')
+        help='Supplier CSV/TSV. Sanger requires read ID, isolate ID, and direction; PacBio requires isolate ID and FASTQ filename.')
+    mailroom_parser.add_argument('--technology', choices=['sanger', 'pacbio'], default='sanger',
+        help='Delivery technology (default: sanger). PacBio triggers FASTQ clustering after validation.')
+    mailroom_parser.add_argument('--pacbio-library-prep', default='Kinnex 16S rRNA Kit',
+        help='PacBio library-preparation protocol retained in provenance.')
     mailroom_parser.add_argument('--dataset', required=True,
         help='Stable batch label written to every map row, for example UoG_01.')
     mailroom_parser.add_argument('--forward-primer', default=None,
@@ -4540,41 +4543,56 @@ def cmd_paper_trail(args):
 
 
 def cmd_mailroom(args):
-    from branchmanager.mailroom import prepare_ab1_map
+    from branchmanager.mailroom import prepare_ab1_map, prepare_pacbio_map
 
     manifest = RunManifest(args.out, 'mailroom')
-    manifest.add_input(args.read_dir, role='ab1_directory')
+    manifest.add_input(args.read_dir, role=f'{args.technology}_directory')
     manifest.add_input(args.metadata, role='supplier_metadata')
     try:
-        result = prepare_ab1_map(
-            args.read_dir,
-            args.metadata,
-            args.out,
-            dataset=args.dataset,
-            forward_primer=args.forward_primer,
-            reverse_primer=args.reverse_primer,
-            processing_mode=args.processing_mode,
-            recursive=args.recursive,
-        )
-        for role in ('ab1_map', 'inventory', 'report', 'summary'):
-            manifest.add_output(result[role], role=role)
+        if args.technology == 'sanger':
+            result = prepare_ab1_map(
+                args.read_dir, args.metadata, args.out, dataset=args.dataset,
+                forward_primer=args.forward_primer, reverse_primer=args.reverse_primer,
+                processing_mode=args.processing_mode, recursive=args.recursive,
+            )
+            for role in ('ab1_map', 'inventory', 'report', 'summary'):
+                manifest.add_output(result[role], role=role)
+        else:
+            result = prepare_pacbio_map(
+                args.read_dir, args.metadata, args.out, dataset=args.dataset,
+                recursive=args.recursive, library_prep=args.pacbio_library_prep,
+            )
+            for role in ('pacbio_map', 'inventory', 'report', 'summary'):
+                manifest.add_output(result[role], role=role)
+            if result['status'] == 'PASS':
+                from branchmanager.pipeline.kinnex import run_kinnex_import
+                pacbio_outputs = run_kinnex_import(
+                    result['pacbio_map'], Path(args.out) / 'pacbio_16s_import',
+                    library_prep=args.pacbio_library_prep,
+                )
+                for role in ('fasta', 'marker_qc', 'read_qc', 'report'):
+                    manifest.add_output(pacbio_outputs[role], role=f'pacbio_{role}')
+                result['pacbio_outputs'] = pacbio_outputs
+                if pacbio_outputs['accepted'] != pacbio_outputs['total']:
+                    result['status'] = 'REVIEW_REQUIRED'
         manifest.add_stage(
             'mailroom', result['status'],
             detail=f"{result['mapped_reads']} mapped reads; {result['errors']} errors",
         )
-        manifest.finish('COMPLETE' if result['status'] == 'PASS' else 'FAILED')
+        manifest.finish('COMPLETE' if result['status'] in {'PASS', 'REVIEW_REQUIRED'} else 'FAILED')
     except Exception as exc:
         manifest.finish('FAILED', error=exc)
         raise
     print(
-        f"[mailroom] {result['status']}: {result['physical_ab1_files']} AB1 file(s), "
+        f"[mailroom] {result['status']}: {result.get('physical_ab1_files', result.get('physical_fastq_files', 0))} {args.technology} file(s), "
         f"{result['mapped_reads']} mapped read(s), {result['isolates']} metadata isolate(s), "
         f"{result['mapped_isolates']} with mapped reads, "
-        f"{result['errors']} error(s), {result['unresolved_primers']} unresolved primer(s).\n"
-        f"  Batch map : {result['ab1_map']}\n"
+        f"{result['errors']} error(s), {result.get('unresolved_primers', 0)} unresolved primer(s).\n"
+        f"  Batch map : {result.get('ab1_map', result.get('pacbio_map'))}\n"
         f"  Inventory : {result['inventory']}\n"
         f"  Report    : {result['report']}\n"
         f"  Summary   : {result['summary']}"
+        + (f"\n  Representatives : {result['pacbio_outputs']['fasta']}\n  Marker QC       : {result['pacbio_outputs']['marker_qc']}" if result.get('pacbio_outputs') else '')
     )
     if result['status'] != 'PASS':
         raise SystemExit(2)

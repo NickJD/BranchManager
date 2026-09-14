@@ -20,6 +20,7 @@ from branchmanager.db.interface import Database
 from branchmanager.it_desk import run_it_desk_checks, write_it_desk_report
 from branchmanager.onboarding import validate_submission, write_onboarding_outputs
 from branchmanager.marker_provenance import load_marker_provenance, marker_qc_flag
+from branchmanager.mailroom import prepare_ab1_map, prepare_pacbio_map
 from branchmanager.personnel import load_exit_requests
 from branchmanager.pipeline.classify import _parse_vsearch_match
 from branchmanager.pipeline.chimera import _parse_uchime_row
@@ -33,6 +34,26 @@ from branchmanager.utils.subprocess import run_cmd
 
 
 class OperationalWorkflowTests(unittest.TestCase):
+    def test_mailroom_reports_fastq_as_unsupported_instead_of_crashing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / 'ISO1.fastq').write_text('@r\nACGT\n+\nIIII\n')
+            metadata = root / 'metadata.tsv'
+            metadata.write_text('sequence_id\tread_file\tdirection\nISO1\tISO1.fastq\tforward\n')
+            result = prepare_ab1_map(root, metadata, root / 'out', dataset='PACBIO_01')
+            self.assertEqual(result['status'], 'FAIL')
+            self.assertIn('UNSUPPORTED_READ_FILE', Path(result['report']).read_text())
+
+    def test_pacbio_mailroom_writes_a_validated_fastq_map(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / 'ISO1.fastq.gz').write_bytes(b'placeholder')
+            metadata = root / 'metadata.tsv'
+            metadata.write_text('sequenceid\tread_file\nISO1\tISO1.fastq.gz\n')
+            result = prepare_pacbio_map(root, metadata, root / 'out', dataset='PACBIO_01')
+            self.assertEqual(result['status'], 'PASS')
+            self.assertIn('ISO1\tPACBIO_01\t../ISO1.fastq.gz\tPacBio HiFi', Path(result['pacbio_map']).read_text())
+
     def test_kinnex_import_selects_abundance_supported_representative(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
