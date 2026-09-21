@@ -143,6 +143,47 @@ def _filter_fasta_to_ids(src: str | Path, dst: str | Path, allowed_ids: set[str]
     return len(records)
 
 
+def _load_qc_rejection_reasons(outdir: str | Path) -> dict:
+    """Look up why a sequence ID never made it into the current run's accepted
+    ID set, using the paper-trail/merge-meeting QC manifest one stage up from
+    `outdir` (typically `<root>/02_paper_trail_merge_meeting/failed_qc_sequences/
+    failed_qc_manifest.tsv`). Returns {sequence_id: 'reason(;reason...)'} for
+    every sequence that was rejected before assembly/insertion, so downstream
+    warnings can report the real upstream cause instead of a generic
+    "not found" message.
+    """
+    reasons: dict[str, str] = {}
+    root = Path(outdir).parent
+    candidates = [
+        root / '02_paper_trail_merge_meeting' / 'failed_qc_sequences' / 'failed_qc_manifest.tsv',
+        Path(outdir) / 'failed_qc_sequences' / 'failed_qc_manifest.tsv',
+    ]
+    manifest_path = next((c for c in candidates if c.exists()), None)
+    if manifest_path is None:
+        return reasons
+    try:
+        with open(manifest_path, newline='') as handle:
+            for row in csv.DictReader(handle, delimiter='\t'):
+                seq_id = str(row.get('SequenceID') or '').strip()
+                if not seq_id:
+                    continue
+                status = str(row.get('Status') or '').strip()
+                rec = str(row.get('Recommendation') or '').strip()
+                seq_reasons = str(row.get('Reasons') or '').strip()
+                detail = status or 'failed_qc'
+                if rec:
+                    detail = f'{detail}_recommend_{rec.lower()}'
+                if seq_reasons:
+                    detail = f'{detail}:{seq_reasons}'
+                reasons[seq_id] = detail
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "[PERFORMANCE REVIEW] Could not read QC rejection manifest %s to annotate partner metadata warnings",
+            manifest_path,
+        )
+    return reasons
+
+
 def _write_partner_metadata_warnings(path: str | Path, warning_rows):
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -151,6 +192,46 @@ def _write_partner_metadata_warnings(path: str | Path, warning_rows):
         for source_id, reason in warning_rows:
             handle.write(f'{source_id}\t{reason}\n')
     return str(p)
+
+
+def _write_rejected_before_assembly(path: str | Path, rejected_rows):
+    """Write a sidecar of partner-metadata IDs that never produced a marker
+    sequence (e.g. every read failed QC before assembly), so downstream
+    reports can still list them with an explicit resequence-required status
+    instead of silently omitting them.
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, 'w') as handle:
+        handle.write('SourceID\tPartnerID\tAlreadySequenced\tSelectedForSequencing\tReason\n')
+        for source_id, partner_id, already_sequenced, selected_for_sequencing, reason in rejected_rows:
+            handle.write(f'{source_id}\t{partner_id}\t{already_sequenced}\t{selected_for_sequencing}\t{reason}\n')
+    return str(p)
+
+
+def _load_rejected_before_assembly(path: str | Path) -> list[dict]:
+    p = Path(path)
+    if not p.exists():
+        return []
+    rows = []
+    try:
+        with open(p, newline='') as handle:
+            for row in csv.DictReader(handle, delimiter='\t'):
+                source_id = str(row.get('SourceID') or '').strip()
+                if not source_id:
+                    continue
+                rows.append({
+                    'id': source_id,
+                    'partner_id': str(row.get('PartnerID') or source_id).strip() or source_id,
+                    'already_sequenced': str(row.get('AlreadySequenced') or '').strip().lower() == 'true',
+                    'selected_for_sequencing': str(row.get('SelectedForSequencing') or '').strip().lower() == 'true',
+                    'reason': str(row.get('Reason') or '').strip(),
+                })
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "[PERFORMANCE REVIEW] Could not read rejected-before-assembly sidecar %s", p
+        )
+    return rows
 
 
 def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_short: dict, run_ids):
@@ -171,6 +252,7 @@ def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_shor
         raise SystemExit(f'[PERFORMANCE REVIEW] Failed to read partner metadata {metadata_path}: {e}')
 
     run_id_set = {str(x) for x in run_ids}
+    qc_rejection_reasons = _load_qc_rejection_reasons(outdir)
     with db.connect() as conn:
         sequence_datasets = {
             str(sequence_id): str(dataset or '')
@@ -179,6 +261,7 @@ def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_shor
     dataset_roles = db.get_dataset_roles()
     resolved_rows = []
     warnings = []
+    rejected_before_assembly = []
     matched_sources = set()
     for row in metadata_rows:
         source_id = str(row.get('source_id') or '').strip()
@@ -199,7 +282,18 @@ def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_shor
             if existing:
                 mapped = existing
         if not mapped:
-            warnings.append((source_id, 'metadata_id_not_found_in_project_database_or_current_run'))
+            qc_reason = qc_rejection_reasons.get(source_id)
+            if qc_reason:
+                warnings.append((source_id, f'metadata_id_rejected_before_assembly:{qc_reason}'))
+                rejected_before_assembly.append((
+                    source_id,
+                    row.get('partner_id') or source_id,
+                    bool(row.get('selected_for_wgs')),
+                    bool(row.get('selected_for_sequencing')),
+                    qc_reason,
+                ))
+            else:
+                warnings.append((source_id, 'metadata_id_not_found_in_project_database_or_current_run'))
             continue
 
         mapped_dataset = sequence_datasets.get(str(mapped), '')
@@ -238,6 +332,16 @@ def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_shor
             warnings,
         )
         log.warning('[PERFORMANCE REVIEW] Partner metadata warnings written to %s', warn_path)
+    if rejected_before_assembly:
+        rejected_path = _write_rejected_before_assembly(
+            Path(outdir) / 'rejected_before_assembly.tsv',
+            rejected_before_assembly,
+        )
+        log.warning(
+            '[PERFORMANCE REVIEW] %d partner isolate(s) produced no marker sequence and will be carried into '
+            'the final reports as resequence-required placeholders: %s',
+            len(rejected_before_assembly), rejected_path,
+        )
 
     return db.get_sequencing_metadata_for_ids(run_ids)
 
@@ -752,6 +856,7 @@ def _organise_run_outputs(outdir: str, *, primary_db_name: str | None = None):
         'qc.stats',
         'qc_rejections.tsv',
         'partner_metadata_warnings.tsv',
+        'rejected_before_assembly.tsv',
     ):
         _move_if_exists(out, name, 'assessment')
     for name in (
@@ -2619,6 +2724,49 @@ def _cmd_performance_review_impl(args):
                         )
                 except Exception as _ne:
                     raise RuntimeError(f'Ranked local-clade figure refresh failed: {_ne}') from _ne
+
+                # Carry through every partner-submitted isolate ID, even those
+                # that never produced a marker sequence (e.g. all reads failed
+                # QC before assembly). Without this, such isolates silently
+                # disappear from the final reports instead of surfacing as an
+                # explicit resequence-required item for the hiring panel.
+                try:
+                    rejected_rows = _load_rejected_before_assembly(
+                        Path(outdir) / 'rejected_before_assembly.tsv'
+                    )
+                    known_ids = {str(row.get('id')) for row in assessment_rows}
+                    added = 0
+                    for rejected in rejected_rows:
+                        rid = str(rejected['id'])
+                        if rid in known_ids:
+                            continue
+                        assessment_rows.append({
+                            'id': rid,
+                            'partner_id': rejected.get('partner_id') or rid,
+                            'dataset': run_dataset,
+                            'selected_for_genome_sequencing': bool(rejected.get('selected_for_sequencing')),
+                            'already_sequenced': bool(rejected.get('already_sequenced')),
+                            'marker_qc_class': 'FAIL_QC',
+                            'marker_qc_recommendation': 'RESEQUENCE',
+                            'marker_qc_reasons': rejected.get('reason') or 'no_output_sequence',
+                            'marker_manual_review_status': 'NOT_REVIEWED',
+                            'marker_qc_flag': 'MARKER_QC_FAILED',
+                            'placement_flags': 'NO_MARKER_SEQUENCE',
+                            'no_marker_sequence': True,
+                            'chimera_call': 'NOT_RUN',
+                            'chimera_score': 'NA',
+                        })
+                        known_ids.add(rid)
+                        added += 1
+                    if added:
+                        logging.getLogger(__name__).info(
+                            "[PERFORMANCE REVIEW] Added %d resequence-required placeholder row(s) "
+                            "for isolates with no assembled marker sequence", added,
+                        )
+                except Exception as e:
+                    logging.getLogger(__name__).warning(
+                        "[PERFORMANCE REVIEW] Could not merge rejected-before-assembly isolates into final reports: %s", e
+                    )
 
                 # Final report write after tree-derived fields have been attached.
                 assess_path = write_sequence_assessment_tsv(

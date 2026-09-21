@@ -1123,6 +1123,18 @@ def _evidence_quality(row: dict) -> str:
 
 def build_selection_decision(row: dict) -> dict:
     """Build transparent, categorical genome-sequencing recommendation evidence."""
+    if row.get('no_marker_sequence'):
+        reason = str(row.get('marker_qc_reasons') or 'every read failed QC before assembly').strip()
+        return {
+            'decision': 'RESEQUENCE REQUIRED - NO SEQUENCE',
+            'evidence_quality': 'NONE',
+            'cultured_gap': 'UNKNOWN - no marker sequence',
+            'project_coverage': 'UNKNOWN - no marker sequence',
+            'reference_context': 'UNKNOWN - no marker sequence',
+            'genome_coverage': 'NOT REPRESENTED - no marker sequence',
+            'species_context': '',
+            'decision_reason': f'no marker sequence was assembled for this isolate; {reason}',
+        }
     cultured_gap = _cultured_gap(row)
     project_coverage = _project_coverage(row)
     reference_context = _reference_context(row)
@@ -1333,18 +1345,19 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
         fh.write('\t'.join(headers) + '\n')
         prepared = [(build_selection_decision(row), row) for row in rows]
         decision_order = {
-            'PRIORITISE - SET PRIMARY': 0,
-            'RESERVE - SET BACKUP': 1,
-            'STRONG CANDIDATE': 2,
-            'SECONDARY - STRAIN DIVERSITY': 3,
-            'SECONDARY CANDIDATE': 4,
-            'REVIEW BEFORE SELECTION': 5,
-            'REVIEW - PANGENOME BOUNDARY': 6,
-            'EXCLUDE - BASELINE REDUNDANT': 7,
-            'LOWER PRIORITY - LIMITED ADDED VALUE': 8,
-            'LOWER PRIORITY - TARGET MET': 9,
-            'ALREADY SELECTED - GENOME PENDING': 10,
-            'ALREADY SEQUENCED': 11,
+            'RESEQUENCE REQUIRED - NO SEQUENCE': 0,
+            'PRIORITISE - SET PRIMARY': 1,
+            'RESERVE - SET BACKUP': 2,
+            'STRONG CANDIDATE': 3,
+            'SECONDARY - STRAIN DIVERSITY': 4,
+            'SECONDARY CANDIDATE': 5,
+            'REVIEW BEFORE SELECTION': 6,
+            'REVIEW - PANGENOME BOUNDARY': 7,
+            'EXCLUDE - BASELINE REDUNDANT': 8,
+            'LOWER PRIORITY - LIMITED ADDED VALUE': 9,
+            'LOWER PRIORITY - TARGET MET': 10,
+            'ALREADY SELECTED - GENOME PENDING': 11,
+            'ALREADY SEQUENCED': 12,
         }
         prepared.sort(key=lambda item: (
             decision_order.get(item[0]['decision'], 99),
