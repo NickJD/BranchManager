@@ -156,6 +156,20 @@ class RunManifest:
             'warnings': [],
             'error': '',
         }
+        command_words = list(argv if argv is not None else sys.argv)
+        config_path = None
+        for index, word in enumerate(command_words):
+            if word == '--config' and index + 1 < len(command_words):
+                config_path = command_words[index + 1]
+            elif str(word).startswith('--config='):
+                config_path = str(word).split('=', 1)[1]
+        if config_path:
+            self.data['project_config'] = file_record(config_path, role='project_profile', required=True)
+            try:
+                with open(config_path, encoding='utf-8') as handle:
+                    self.data['project'] = json.load(handle).get('project', {})
+            except (OSError, ValueError, AttributeError):
+                self.data['project'] = {}
         self.write()
 
     def add_input(self, path: str | Path, *, role: str = 'input', required: bool = True) -> dict:

@@ -168,5 +168,11 @@ def load_partner_sequencing_metadata(path: str | Path, sheet_name: str | None = 
             'selected_for_wgs': genome_available,
             'raw_selected_value': '' if raw_genome is None else str(raw_genome),
             'raw_commitment_value': '' if raw_selection is None else str(raw_selection),
+            'project_metadata': {
+                str(key): str(value or '').strip()
+                for key, value in raw.items()
+                if key not in {id_col, partner_col, genome_col, selection_col}
+                and value not in (None, '')
+            },
         })
     return rows

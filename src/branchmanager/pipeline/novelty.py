@@ -416,7 +416,7 @@ def compute_db_nearest_identities(mapped_derep: str, outdir: str, db, run_datase
     try:
         with db.connect() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT id, sequence FROM sequences WHERE dataset IS NOT ? OR dataset IS NULL", (run_dataset,))
+            cur.execute("SELECT id, sequence FROM sequences WHERE (dataset IS NOT ? OR dataset IS NULL) AND sequence IS NOT NULL AND sequence != ''", (run_dataset,))
             rows = cur.fetchall()
         records = [(r[0], r[1]) for r in rows]
         if records:
@@ -978,12 +978,12 @@ def _compute_sequencing_context(
         with db.connect() as conn:
             cur = conn.cursor()
             cur.execute(
-                "SELECT s.id, s.sequence, s.dataset, s.baseline_tier, t.taxonomy, "
+                "SELECT s.id, s.sequence, s.dataset, s.baseline_tier, COALESCE(t.taxonomy, g.gtdb_taxonomy), "
                 "COALESCE(m.selected_for_wgs, 0), COALESCE(m.selected_for_sequencing, 0) "
                 "FROM sequences s "
                 "LEFT JOIN taxonomy t ON s.id = t.id AND (t.dataset = s.dataset OR t.dataset IS NULL) "
                 "LEFT JOIN sequencing_metadata m ON s.id = m.id "
-                "WHERE s.sequence IS NOT NULL AND s.sequence != ''"
+                "LEFT JOIN genome_records g ON g.sequence_id = s.id"
             )
             rows = cur.fetchall()
         by_id = {}
@@ -1022,7 +1022,7 @@ def _compute_sequencing_context(
                 'partner_available': is_partner_genome,
                 'selected_pending': is_pending_selection,
             }
-            if is_baseline_genome or is_partner_genome:
+            if (is_baseline_genome or is_partner_genome) and entry['sequence']:
                 genome_records.append((sid, entry['sequence']))
                 genome_metadata[sid] = collection_metadata[sid]
     except Exception as e:

@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "project": {
+    "name": "My isolate collection",
+    "collection_name": "Collection or biobank name",
+    "organism_scope": [
+      "Bacteria"
+    ],
+    "marker_gene": "16S rRNA",
+    "taxonomy_authority": "GTDB",
+    "partner_field": "partner_id",
+    "selection_unit": "genome",
+    "tags": {
+      "environment": "replace with sample environment",
+      "geography": "replace with geographic scope",
+      "study_id": "replace with study identifier"
+    },
+    "selection_budget": 12
+  },
+  "data": {
+    "primary_taxonomy_fasta": "${COLLECTION_TAXONOMY_FASTA}",
+    "baseline_fasta": "${COLLECTION_BASELINE_FASTA}",
+    "partner_metadata": "${COLLECTION_PARTNER_METADATA}",
+    "anchor_fasta": "path/to/collection_anchors.fasta",
+    "anchor_metadata": "path/to/collection_anchors.tsv"
+  },
+  "defaults": {
+    "assistant": {
+      "ref": "${COLLECTION_TAXONOMY_FASTA}",
+      "ref_name": "taxonomy database name",
+      "baseline_fasta": "${COLLECTION_BASELINE_FASTA}",
+      "baseline_dataset": "CollectionBaseline",
+      "partner_metadata": "${COLLECTION_PARTNER_METADATA}",
+      "sequence_domain": "bacteria",
+      "anchors": "path/to/collection_anchors.fasta",
+      "pangenome_target": 9,
+      "candidate_set_size": 9
+    },
+    "filing-cabinet": {
+      "fasta": "${COLLECTION_BASELINE_FASTA}",
+      "dataset": "CollectionBaseline",
+      "ref": "${COLLECTION_TAXONOMY_FASTA}",
+      "sequence_domain": "bacteria",
+      "anchors": "path/to/collection_anchors.fasta"
+    },
+    "performance-review": {
+      "ref": "${COLLECTION_TAXONOMY_FASTA}",
+      "ref_name": "taxonomy database name",
+      "baseline_fasta": "${COLLECTION_BASELINE_FASTA}",
+      "baseline_dataset": "CollectionBaseline",
+      "partner_metadata": "${COLLECTION_PARTNER_METADATA}",
+      "sequence_domain": "bacteria",
+      "anchors": "path/to/collection_anchors.fasta",
+      "pangenome_target": 9,
+      "candidate_set_size": 9
+    },
+    "add-external-genomes": {
+      "dataset": "ExternalCollectionGenomeBaseline",
+      "baseline_tier": "secondary"
+    }
+  },
+  "baselines": [
+    {
+      "dataset": "CollectionPrimaryBaseline",
+      "tier": "priority",
+      "fasta": "path/to/primary_baseline.fasta",
+      "taxonomy_assignments": "path/to/primary_taxonomy.tsv",
+      "classify": false
+    },
+    {
+      "dataset": "CollectionSecondaryBaseline",
+      "tier": "secondary",
+      "fasta": "path/to/secondary_baseline.fasta",
+      "classify": false
+    }
+  ]
+}

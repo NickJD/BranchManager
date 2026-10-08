@@ -91,6 +91,29 @@ BranchManager replaces subjective manual picking with a transparent, evidence-ba
 
 ## Quick start
 
+### Collection profiles
+
+Use a JSON project profile to keep collection-specific names, reference databases, baseline datasets, anchor FASTA, domain, and selection policy together. A profile supplies defaults; an explicit command-line option always takes precedence. Copy [`configs/project.template.json`](configs/project.template.json) and edit it for a collection. Environment substitutions use `${NAME}` or `${NAME:-fallback}`, allowing local paths to stay out of shared configuration files. Relative data paths are resolved from the profile's directory.
+
+The checked-in [`configs/rumen_gateway.json`](configs/rumen_gateway.json) records the current Rumen Gateway assumptions: GTDB r232 primary taxonomy, Greengenes2 2024.09 cross-check, Hungate priority baseline, Rumen Gateway MWL, nine-genome target, current redundancy/extension thresholds, and the bundled Rumen Gateway-era anchor set. Its historical external paths can be overridden with the `RGW_*` environment variables shown in that file, or directly on the command line. For example:
+
+```bash
+branchmanager assistant --config configs/rumen_gateway.json \
+  --sample-map batch_map.tsv --db project.sqlite --dataset Collection_01 \
+  --partner-id LAB_A -o runs/Collection_01
+```
+
+The profile's `project` object is collection metadata and is copied into run manifests; `data` documents relevant files; `defaults` maps command names to CLI argument names. Each run manifest records the profile file checksum. Additional columns in the partner ledger are retained per isolate in the database's `sequencing_metadata.project_metadata_json` field, while BranchManager interprets its standard ID, partner, selection, and genome-availability columns. The Rumen Gateway anchor set is a profile default and should be replaced with vetted, domain-appropriate anchors for other collections. See [collection profiles and scope](docs/collection-profiles-and-validation.md) before interpreting results from a new marker/domain.
+
+Profiles can declare multiple baselines under `baselines`, each with a unique `dataset`, `fasta`, `tier` (`priority` or `secondary`), and optional `taxonomy_assignments` or `classify`. A single Filing Cabinet invocation loads each baseline into its own dataset and tier, then builds one combined backbone from the available marker sequences:
+
+```bash
+branchmanager filing-cabinet --config configs/rumen_gateway.json \
+  --db project.sqlite --build-tree -o filing_cabinet
+```
+
+The profile's `project.selection_budget` supplies the default number of primary genomes nominated in a Quarterly Review; override it with `--genome-budget`. Backups are controlled separately. In a validation table, precision@k is the fraction of the k selected candidates that meet the prespecified success outcome, while recall@k is the fraction of all successful candidates recovered among those k. These metrics should use the same k as the real sequencing budget.
+
 For a complete partner submission, use the guarded golden path:
 
 ```bash
@@ -1015,6 +1038,29 @@ branchmanager annual-report --db project.sqlite -o final_annual_report
 `isolate_status.tsv` requires `sequence_id` and `status`; supported states include `RECEIVED`, `TRACE_REVIEW`, `MARKER_QC_PASSED`, `PROPOSED`, `SAB_APPROVED`, `DNA_EXTRACTION_FAILED`, `SEQUENCED`, `GENOME_QC_FAILED`, and `GENOME_QC_PASSED`.
 
 `genome_results.tsv` requires `sequence_id` and `genome_id`/`accession`. Recommended fields are `genome_status`, `completeness`, `contamination`, `gtdb_taxonomy`, `ani_cluster`, and `genome_path`. A `SEQUENCED` row with both quality metrics is automatically assigned genome-QC pass/fail using the configured thresholds. Explicit QC pass values that conflict with supplied metrics are rejected. Only QC-passed genomes update the available genome collection.
+
+### Add genomes sequenced outside the selection workflow
+
+Use `add-external-genomes` to register a project-level baseline genome collection. Supply one row per isolate/genome. Genome-level taxonomy is retained even when the isolate has no 16S marker. If marker sequences are available, pass a FASTA with headers matching `sequence_id`:
+
+```bash
+branchmanager add-external-genomes --config configs/rumen_gateway.json --db project.sqlite \
+  --input external_genomes.tsv --marker-fasta external_16s.fasta \
+  --dataset ExternalArchive --baseline-tier secondary -o imports/external_archive
+```
+
+Required columns are `sequence_id` and `genome_id` or `accession`. Optional fields include `gtdb_taxonomy`, `genome_qc_pass`, completeness/contamination, `ani_cluster`, and per-row `dataset`/`baseline_tier`. Genome availability is recorded as confirmed. Markerless isolates contribute genome/taxonomy coverage and are omitted from 16S similarity searches and trees.
+
+## Benchmarking recommendations
+
+Before using selection output as a scientific conclusion, benchmark it against independently adjudicated outcomes on held-out cohorts. The repository includes a schema and evaluator in [`examples/benchmark_labels.template.tsv`](examples/benchmark_labels.template.tsv) and [`scripts/benchmark_selection.py`](scripts/benchmark_selection.py). Include all eligible candidates for each case, label the predeclared outcome independently of BranchManager, and include competing methods under the same `case_id` values. Evaluate multiple selection budgets (`precision@k`, `recall@k`) and overall rank quality (`mean average precision`); report cohort-level results and uncertainty, not just pooled values.
+
+```bash
+python scripts/benchmark_selection.py --input adjudicated_rankings.tsv \
+  --out benchmark_summary.tsv --k 1 5 10
+```
+
+The output includes case-level bootstrap 95% percentile intervals (2,000 resamples by default; set `--bootstrap 0` to disable). This evaluator summarizes rankings; it does not supply validation data or establish biological validity. A journal submission still needs real, documented, held-out collection data; a comparator; sensitivity analyses for thresholds/reference versions; and error analysis for QC failures, unresolved taxonomy, and missing or biased references. The validation protocol and scientific scope checklist are in [collection profiles and scope](docs/collection-profiles-and-validation.md).
 
 Every Performance Review, Quarterly Review, and Records Update works on a locked staged database and atomically publishes the result after validation. Annual Report writes an HTML dashboard, isolate and genome ledgers, workflow history, and the latest decision-change audit.
 

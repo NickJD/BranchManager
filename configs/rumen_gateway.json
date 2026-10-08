@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "project": {
+    "name": "Rumen Gateway",
+    "collection_name": "Hungate Collection and partner rumen isolate collection",
+    "organism_scope": [
+      "Bacteria",
+      "Archaea"
+    ],
+    "marker_gene": "16S rRNA",
+    "taxonomy_authority": "GTDB",
+    "partner_field": "partner_id",
+    "selection_unit": "genome",
+    "profile_notes": "Current Rumen Gateway defaults. Override any path or setting on the CLI or in a copied project profile.",
+    "selection_budget": 24
+  },
+  "data": {
+    "primary_taxonomy_fasta": "${RGW_GTDB_FASTA:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/Taxa_Databases/GTDB/gtdb_r232_bac_arch_ssu_reps.fna.gz}",
+    "secondary_taxonomy_fasta": "${RGW_GG2_FASTA:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/Taxa_Databases/GG2/2024.09.backbone.full-length.fna.gz}",
+    "secondary_taxonomy_table": "${RGW_GG2_TAXONOMY:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/Taxa_Databases/GG2/2024.09.taxonomy.id.tsv.gz}",
+    "baseline_fasta": "${RGW_HUNGATE_FASTA:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/Taxa_Databases/Hungate/Sanger_Hun.fasta}",
+    "partner_metadata": "${RGW_PARTNER_METADATA:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/BranchManager_Bac_runs/project_partner_metadata.tsv}",
+    "most_wanted_list": "${RGW_MWL:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/MWL/MWL.csv}",
+    "anchor_fasta": "../src/branchmanager/data/reference_anchors.fasta",
+    "anchor_metadata": "../src/branchmanager/data/reference_anchors.tsv"
+  },
+  "defaults": {
+    "assistant": {
+      "ref": "${RGW_GTDB_FASTA:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/Taxa_Databases/GTDB/gtdb_r232_bac_arch_ssu_reps.fna.gz}",
+      "ref_name": "GTDB",
+      "alt_ref": [
+        "${RGW_GG2_FASTA:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/Taxa_Databases/GG2/2024.09.backbone.full-length.fna.gz}"
+      ],
+      "alt_taxa": [
+        "${RGW_GG2_TAXONOMY:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/Taxa_Databases/GG2/2024.09.taxonomy.id.tsv.gz}"
+      ],
+      "alt_ref_name": [
+        "Greengenes2"
+      ],
+      "baseline_fasta": "${RGW_HUNGATE_FASTA:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/Taxa_Databases/Hungate/Sanger_Hun.fasta}",
+      "baseline_dataset": "Hungate",
+      "baseline_tier": "priority",
+      "mwl": "${RGW_MWL:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/MWL/MWL.csv}",
+      "sequence_domain": "bacteria",
+      "anchors": "../src/branchmanager/data/reference_anchors.fasta",
+      "pangenome_target": 9,
+      "candidate_set_size": 9,
+      "baseline_redundancy_identity": 99.8,
+      "baseline_redundancy_min_query_coverage": 95.0,
+      "baseline_extension_min_identity": 98.65,
+      "baseline_extension_min_query_coverage": 95.0,
+      "threads": 10,
+      "tree_method": "fasttree",
+      "db": "${RGW_DATABASE:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/BranchManager_Bac_runs/project.sqlite}",
+      "partner_metadata": "${RGW_PARTNER_METADATA:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/BranchManager_Bac_runs/project_partner_metadata.tsv}"
+    },
+    "filing-cabinet": {
+      "dataset": "Hungate",
+      "baseline_tier": "priority",
+      "ref": "${RGW_GTDB_FASTA:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/Taxa_Databases/GTDB/gtdb_r232_bac_arch_ssu_reps.fna.gz}",
+      "sequence_domain": "bacteria",
+      "anchors": "../src/branchmanager/data/reference_anchors.fasta",
+      "threads": 10,
+      "tree_method": "fasttree",
+      "db": "${RGW_DATABASE:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/BranchManager_Bac_runs/project.sqlite}",
+      "fasta": "${RGW_HUNGATE_FASTA:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/Taxa_Databases/Hungate/Sanger_Hun.fasta}"
+    },
+    "performance-review": {
+      "ref": "${RGW_GTDB_FASTA:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/Taxa_Databases/GTDB/gtdb_r232_bac_arch_ssu_reps.fna.gz}",
+      "ref_name": "GTDB",
+      "alt_ref": [
+        "${RGW_GG2_FASTA:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/Taxa_Databases/GG2/2024.09.backbone.full-length.fna.gz}"
+      ],
+      "alt_taxa": [
+        "${RGW_GG2_TAXONOMY:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/Taxa_Databases/GG2/2024.09.taxonomy.id.tsv.gz}"
+      ],
+      "alt_ref_name": [
+        "Greengenes2"
+      ],
+      "baseline_fasta": "${RGW_HUNGATE_FASTA:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/Taxa_Databases/Hungate/Sanger_Hun.fasta}",
+      "baseline_dataset": "Hungate",
+      "baseline_tier": "priority",
+      "mwl": "${RGW_MWL:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/MWL/MWL.csv}",
+      "sequence_domain": "bacteria",
+      "anchors": "../src/branchmanager/data/reference_anchors.fasta",
+      "pangenome_target": 9,
+      "candidate_set_size": 9,
+      "baseline_redundancy_identity": 99.8,
+      "baseline_redundancy_min_query_coverage": 95.0,
+      "baseline_extension_min_identity": 98.65,
+      "baseline_extension_min_query_coverage": 95.0,
+      "threads": 10,
+      "tree_method": "fasttree",
+      "db": "${RGW_DATABASE:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/BranchManager_Bac_runs/project.sqlite}",
+      "partner_metadata": "${RGW_PARTNER_METADATA:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/BranchManager_Bac_runs/project_partner_metadata.tsv}"
+    },
+    "quarterly-review": {
+      "genome_budget": 24,
+      "pangenome_target": 9,
+      "baseline_redundancy_identity": 99.8,
+      "baseline_redundancy_min_query_coverage": 95.0,
+      "baseline_extension_min_identity": 98.65,
+      "baseline_extension_min_query_coverage": 95.0
+    },
+    "add-external-genomes": {
+      "dataset": "ExternalRumenArchive",
+      "baseline_tier": "secondary"
+    }
+  },
+  "baselines": [
+    {
+      "dataset": "Hungate",
+      "tier": "priority",
+      "fasta": "${RGW_HUNGATE_FASTA:-/Users/nicholas/Nextcloud/Current_Work/RGW/16s/workflow/Taxa_Databases/Hungate/Sanger_Hun.fasta}",
+      "classify": true
+    }
+  ]
+}

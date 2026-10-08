@@ -1,0 +1,3 @@
+sequence_id	genome_id	accession	dataset	baseline_tier	gtdb_taxonomy	genome_qc_pass	completeness	contamination	ani_cluster	collection_source
+ARCHIVE_001	GCA_000000001.1	GCA_000000001.1	ExternalArchive	secondary	d__Bacteria;p__Bacillota;g__Example;s__Example species	yes	98.5	1.2	ANI_001	public_archive
+ARCHIVE_002	GCA_000000002.1	GCA_000000002.1	ExternalArchive	secondary	d__Bacteria;p__Bacteroidota;g__Other;s__Other species	no				local sequencing project

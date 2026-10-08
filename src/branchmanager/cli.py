@@ -62,6 +62,9 @@ from branchmanager.pipeline.workflow_helpers import (
 from branchmanager.taxonomy import canonicalise_sequence_id, normalise_domain_query, taxonomy_matches_kingdom
 from branchmanager.partner_metadata import load_partner_sequencing_metadata
 from branchmanager.run_manifest import RunManifest, utc_now
+from branchmanager.project_config import (
+    apply_project_config_defaults, config_path_from_argv, load_project_config,
+)
 
 
 SEQUENCE_DOMAIN_CHOICES = (
@@ -314,6 +317,7 @@ def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_shor
             'source_file': str(metadata_path),
             'raw_selected_value': row.get('raw_selected_value', ''),
             'raw_commitment_value': row.get('raw_commitment_value', ''),
+            'project_metadata': row.get('project_metadata', {}),
         })
 
     for run_id in sorted(run_id_set - matched_sources):
@@ -1744,6 +1748,120 @@ def cmd_filing_cabinet(args):
         f'  Project database: {original}\n'
         f'  Backbone output : {outdir}'
     )
+
+
+def cmd_filing_cabinet_configured_baselines(args):
+    """Register every baseline in a profile, then make one combined backbone."""
+    import fcntl
+    import sqlite3
+    import re
+    from branchmanager.utils.fasta import write_fasta
+
+    baselines = list(getattr(args, 'configured_baselines', []) or [])
+    if not baselines:
+        return cmd_filing_cabinet(args)
+    outdir = Path(args.out or '.').expanduser().resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    original = Path(args.db).expanduser().resolve()
+    original.parent.mkdir(parents=True, exist_ok=True)
+    if getattr(args, 'build_tree', False):
+        tree.preflight_tree_tools(getattr(args, 'tree_method', 'fasttree'))
+    manifest = RunManifest(outdir, 'filing_cabinet')
+    for baseline in baselines:
+        manifest.add_input(baseline['fasta'], role=f"baseline:{baseline.get('dataset', 'unnamed')}")
+        for field, role in (('taxonomy_assignments', 'taxonomy_assignments'), ('taxa', 'taxonomy')):
+            if baseline.get(field):
+                manifest.add_input(baseline[field], role=f"{role}:{baseline.get('dataset', 'unnamed')}")
+    if args.ref:
+        manifest.add_input(args.ref, role='taxonomy_reference')
+    if args.anchors:
+        manifest.add_input(args.anchors, role='tree_anchors')
+    staged = outdir / '.configured_baselines.sqlite'
+    lock_path = original.with_name(original.name + '.lock')
+    with open(lock_path, 'a+') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            staged.unlink(missing_ok=True)
+            if original.exists():
+                with sqlite3.connect(str(original)) as source, sqlite3.connect(str(staged)) as target:
+                    source.backup(target)
+            else:
+                Database(str(staged)).initialise()
+
+            datasets = []
+            for index, baseline in enumerate(baselines, start=1):
+                required = {'dataset', 'fasta', 'tier'}
+                missing = required - set(baseline)
+                if missing:
+                    raise ValueError(f"Baseline profile entry {index} is missing: {', '.join(sorted(missing))}")
+                dataset = str(baseline['dataset'])
+                datasets.append(dataset)
+                slug = re.sub(r'[^A-Za-z0-9_.-]+', '_', dataset).strip('._') or f'baseline_{index}'
+                child = argparse.Namespace(**vars(args))
+                child.db = str(staged)
+                child.fasta = baseline['fasta']
+                child.dataset = dataset
+                child.baseline_tier = baseline['tier']
+                child.taxa = baseline.get('taxa')
+                child.taxa_assignments = baseline.get('taxonomy_assignments')
+                child.classify = bool(baseline.get('classify', False))
+                child.build_tree = False
+                child.out = str(outdir / 'baselines' / f'{index:02d}_{slug}')
+                cmd_filing_cabinet(child)
+
+            project_db = Database(str(staged))
+            if getattr(args, 'build_tree', False):
+                placeholders = ','.join('?' for _ in datasets)
+                with project_db.connect() as conn:
+                    rows = conn.execute(
+                        f"SELECT id, sequence FROM sequences WHERE dataset IN ({placeholders}) "
+                        "AND sequence IS NOT NULL AND sequence != '' ORDER BY dataset, id",
+                        tuple(datasets),
+                    ).fetchall()
+                    taxonomy_rows = conn.execute(
+                        f"SELECT s.id, t.taxonomy, t.confidence FROM sequences s "
+                        f"LEFT JOIN taxonomy t ON s.id=t.id WHERE s.dataset IN ({placeholders}) "
+                        "ORDER BY s.dataset, s.id",
+                        tuple(datasets),
+                    ).fetchall()
+                if not rows:
+                    raise RuntimeError('No marker sequences were available across configured baselines to build a tree')
+                combined_fasta = outdir / 'configured_baselines.fasta'
+                write_fasta(rows, str(combined_fasta))
+                write_combined_taxonomy_tsv(outdir / 'filing_cabinet_combined_taxonomy.tsv', taxonomy_rows)
+                tree.initialise_or_update_tree(
+                    ref_fasta=getattr(args, 'ref', None), user_fasta=str(combined_fasta),
+                    outdir=str(outdir), db=None, threads=int(getattr(args, 'threads', 4) or 4),
+                    anchor_file=getattr(args, 'anchors', None),
+                    tree_method=getattr(args, 'tree_method', 'fasttree'),
+                )
+                manifest.add_output(combined_fasta, role='combined_baseline_markers')
+                manifest.add_output(outdir / 'current_alignment.fasta', role='alignment')
+                manifest.add_output(outdir / 'current_tree.nwk', role='tree')
+
+            with sqlite3.connect(str(staged)) as conn:
+                integrity = conn.execute('PRAGMA integrity_check').fetchone()[0]
+                total = conn.execute(
+                    f"SELECT COUNT(*) FROM sequences WHERE dataset IN ({','.join('?' for _ in datasets)})",
+                    tuple(datasets),
+                ).fetchone()[0]
+            if integrity != 'ok':
+                raise RuntimeError(f'configured baseline database failed integrity_check: {integrity}')
+            publish = original.with_name(original.name + '.publishing')
+            publish.unlink(missing_ok=True)
+            with sqlite3.connect(str(staged)) as source, sqlite3.connect(str(publish)) as target:
+                source.backup(target)
+            os.replace(publish, original)
+            staged.unlink(missing_ok=True)
+            manifest.add_stage('filing_cabinet', 'COMPLETE', detail=f'{total} records across {len(datasets)} baselines')
+            manifest.finish('COMPLETE')
+            manifest.add_output(original, role='project_database')
+            print(f'[filing-cabinet] Registered {total} sequence record(s) across {len(datasets)} configured baselines.\n  Project database: {original}\n  Backbone output : {outdir}')
+        except BaseException as exc:
+            manifest.finish('FAILED', error=exc)
+            raise
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _cmd_performance_review_impl(args):
@@ -3441,7 +3559,11 @@ def build_parser():
         ),
         formatter_class=_Fmt,
     )
+    parser.add_argument('--config', help='Project profile JSON. Profile values provide defaults; command-line options override them.')
     sub = parser.add_subparsers(dest='command')
+
+    def add_project_config_option(command_parser):
+        command_parser.add_argument('--config', help='Project profile JSON. Profile values provide defaults; command-line options override them.')
 
     filing_cabinet_parser = sub.add_parser(
         'filing-cabinet',
@@ -3455,13 +3577,14 @@ def build_parser():
         ),
         formatter_class=_Fmt,
     )
-    filing_cabinet_parser.add_argument('--fasta', required=True,
+    add_project_config_option(filing_cabinet_parser)
+    filing_cabinet_parser.add_argument('--fasta', required=False,
         help='Input FASTA file containing the baseline sequences to load.')
     filing_cabinet_parser.add_argument('--db', required=True,
         help='Path to the BranchManager SQLite database (created if it does not exist).')
     filing_cabinet_parser.add_argument('-o', '--out', required=False, default='.',
         help='Output directory for tree, iTOL files, and reports (default: current directory).')
-    filing_cabinet_parser.add_argument('--dataset', required=True,
+    filing_cabinet_parser.add_argument('--dataset', required=False,
         help='Label for this dataset stored in the DB (e.g. Hungate). Used to colour iTOL strips.')
     filing_cabinet_parser.add_argument('--baseline-tier', choices=['priority', 'secondary'], default=None,
         help='Cultured baseline tier for this dataset: priority for Hungate, secondary for other rumen isolate genomes. Inferred from --dataset when omitted.')
@@ -3562,6 +3685,7 @@ def build_parser():
         ),
         formatter_class=_Fmt,
     )
+    add_project_config_option(performance_review_parser)
     performance_review_parser.add_argument('--input', required=True,
         help='FASTA file of new sequences to analyse.')
     performance_review_parser.add_argument('--db', required=True,
@@ -3736,11 +3860,12 @@ def build_parser():
         ),
         formatter_class=_Fmt,
     )
+    add_project_config_option(quarterly_review_parser)
     quarterly_review_parser.add_argument('--db', required=True,
         help='Rolling BranchManager SQLite database containing all partner and baseline sequences.')
     quarterly_review_parser.add_argument('-o', '--out', required=True,
         help='Output directory for quarterly_review_summary.tsv, next_genome_set.tsv, and quarterly_review_manifest.tsv.')
-    quarterly_review_parser.add_argument('--genome-budget', type=int, required=True,
+    quarterly_review_parser.add_argument('--genome-budget', type=int, required=False,
         help='Number of new PRIMARY genomes to nominate in this round. This is intentionally explicit.')
     quarterly_review_parser.add_argument('--backups-per-primary', type=int, default=1,
         help='Number of extraction-failure/diversity backups to nominate per primary (default: 1).')
@@ -3969,6 +4094,25 @@ def build_parser():
         type=int, default=2400,
         help='Maximum height in pixels for each visual-report PNG; larger reports are split into numbered pages (minimum: 600, default: 2400).')
 
+    replacement_parser = sub.add_parser(
+        'replace-selected-markers',
+        help='Replace selected future-genome markers with newly assembled Sanger 16S consensus sequences.',
+        formatter_class=_Fmt,
+    )
+    replacement_parser.add_argument('--sample-map', required=True,
+        help='CSV/TSV mapping selected isolate IDs to new forward/reverse Sanger AB1 reads.')
+    replacement_parser.add_argument('--db', required=True,
+        help='Existing BranchManager SQLite project database.')
+    replacement_parser.add_argument('--primer', dest='primers', action='append', default=None)
+    replacement_parser.add_argument('--primer-sequence', dest='primer_sequences', action='append', default=None,
+        metavar='NAME=SEQUENCE')
+    replacement_parser.add_argument('--min-overlap', type=int, default=paper_trail_policy.min_overlap)
+    replacement_parser.add_argument('--min-overlap-identity', type=float, default=paper_trail_policy.min_overlap_identity)
+    replacement_parser.add_argument('--threads', type=int, default=4)
+    replacement_parser.add_argument('--allow-missing-quality', action='store_true', default=False)
+    replacement_parser.add_argument('-o', '--out', required=True,
+        help='Output directory for Sanger QC, replacement audit, and replacement FASTA.')
+
     mailroom_parser = sub.add_parser(
         'mailroom',
         help='Mailroom: validate a Sanger or PacBio partner delivery and build its batch map.',
@@ -4138,6 +4282,21 @@ def build_parser():
         help='Maximum estimated contamination for automatic QC pass (default: 5).')
     records_update_parser.add_argument('-o', '--out', required=True)
 
+    external_genomes_parser = sub.add_parser(
+        'add-external-genomes',
+        help='Register previously sequenced collection genomes, with optional 16S markers.',
+        formatter_class=_Fmt,
+    )
+    add_project_config_option(external_genomes_parser)
+    external_genomes_parser.add_argument('--db', required=True)
+    external_genomes_parser.add_argument('--input', required=True,
+        help='CSV/TSV with sequence_id, genome_id/accession, optional dataset/tier and genome-level taxonomy/QC fields.')
+    external_genomes_parser.add_argument('--marker-fasta', default=None,
+        help='Optional marker FASTA keyed by sequence_id; records without a marker remain genome-only.')
+    external_genomes_parser.add_argument('--dataset', default='ExternalGenomeBaseline')
+    external_genomes_parser.add_argument('--baseline-tier', choices=['priority', 'secondary'], default='secondary')
+    external_genomes_parser.add_argument('-o', '--out', required=True)
+
     exit_interview_parser = sub.add_parser(
         'exit-interview',
         help='Exit Interview: withdraw sequences from active project analyses with an audit trail.',
@@ -4192,6 +4351,7 @@ def build_parser():
         help='Assistant to the Branch Manager: run Onboarding through the Hiring Panel.',
         formatter_class=_Fmt,
     )
+    add_project_config_option(assistant_parser)
     assistant_input = assistant_parser.add_mutually_exclusive_group(required=True)
     assistant_input.add_argument('--sample-map', help='AB1/primer-read sample map; runs Paper Trail and Merge Meeting.')
     assistant_input.add_argument('--fasta', help='Partner-supplied marker FASTA; bypasses Paper Trail and Merge Meeting.')
@@ -4212,6 +4372,8 @@ def build_parser():
     assistant_parser.add_argument('--baseline-dataset', default='Baseline')
     assistant_parser.add_argument('--baseline-tier', choices=['priority', 'secondary'], default=None)
     assistant_parser.add_argument('--baseline-taxa-assignments', default=None)
+    assistant_parser.add_argument('--anchors', default=None,
+        help='Reference anchor FASTA for tree scaffolding; defaults to the active project profile or bundled anchors.')
     assistant_parser.add_argument('--mwl', default=None)
     assistant_parser.add_argument('--sequence-domain', choices=SEQUENCE_DOMAIN_CHOICES, default='bacteria')
     assistant_parser.add_argument('--threads', type=int, default=4,
@@ -4776,6 +4938,114 @@ def cmd_mailroom(args):
         raise SystemExit(2)
 
 
+def cmd_replace_selected_markers(args):
+    """QC new Sanger reads and atomically replace eligible selected markers."""
+    from branchmanager.marker_provenance import load_marker_provenance, write_marker_qc_bridge
+    from branchmanager.utils.fasta import read_fasta, write_fasta
+
+    root = Path(args.out).expanduser().resolve()
+    sanger_out = root / 'sanger_qc'
+    manifest = RunManifest(root, 'replace-selected-markers')
+    manifest.add_input(args.sample_map, role='replacement_sample_map')
+    manifest.add_input(args.db, role='project_database')
+    policy = _paper_trail_module.DEFAULT_QC_POLICY
+    primer_sequences = dict(_paper_trail_module.DEFAULT_PRIMER_SEQUENCES)
+    for specification in args.primer_sequences or []:
+        if '=' not in str(specification):
+            raise SystemExit('[replace-selected-markers] --primer-sequence must use NAME=SEQUENCE.')
+        name, sequence = str(specification).split('=', 1)
+        sequence = ''.join(sequence.split()).upper()
+        if not name.strip() or len(sequence) < 12:
+            raise SystemExit('[replace-selected-markers] --primer-sequence requires a name and at least 12 bases.')
+        primer_sequences[name.strip().upper()] = sequence
+    try:
+        qc_outputs = _paper_trail_module.run_paper_trail(
+            [], sanger_out, sample_map=args.sample_map,
+            primers=args.primers or _paper_trail_module.DEFAULT_PRIMERS,
+            primer_sequences=primer_sequences, min_length=1300,
+            min_read_length=policy.min_read_length, min_quality=policy.min_quality,
+            min_mean_quality=policy.min_mean_quality, mask_quality=policy.mask_quality,
+            max_read_expected_errors=policy.max_read_expected_errors,
+            max_output_expected_errors=policy.max_output_expected_errors,
+            warn_n_percent=policy.warn_n_percent, max_n_percent=policy.max_n_percent,
+            warn_internal_low_quality_run=policy.warn_internal_low_quality_run,
+            max_internal_low_quality_run=policy.max_internal_low_quality_run,
+            secondary_peak_ratio=policy.secondary_peak_ratio,
+            max_mixed_peak_percent=policy.max_mixed_peak_percent,
+            mixed_peak_min_quality=policy.mixed_peak_min_quality,
+            max_conflict_density=policy.max_conflict_density,
+            max_ambiguous_overlap_conflicts_without_review=policy.max_ambiguous_overlap_conflicts_without_review,
+            quality_difference=policy.quality_difference, allow_missing_quality=args.allow_missing_quality,
+            min_overlap=args.min_overlap, min_overlap_identity=args.min_overlap_identity,
+            threads=args.threads,
+        )
+        assembled = Path(qc_outputs['assembled_fasta'])
+        provenance, _qc_source = load_marker_provenance(
+            assembled, qc_path=qc_outputs['assembly_tsv'], accept_unverified=False,
+        )
+        sequence_by_id = {sequence_id: sequence for sequence_id, sequence in read_fasta(assembled)}
+        eligible, report_rows = [], []
+        for row in provenance:
+            sequence_id = str(row['sequence_id'])
+            qc_class = str(row.get('marker_qc_class') or '').upper()
+            if qc_class != 'PASS_HIGH_CONFIDENCE' or sequence_id not in sequence_by_id:
+                report_rows.append({
+                    'sequence_id': sequence_id, 'status': 'QC_NOT_HIGH_CONFIDENCE',
+                    'detail': row.get('marker_qc_reasons') or qc_class,
+                })
+                continue
+            eligible.append({**row, 'sequence': sequence_by_id[sequence_id]})
+        db = Database(args.db)
+        db.initialise()
+        applied = db.replace_selected_markers(
+            eligible, source_manifest=str(root / 'run_manifest.json'), source_fasta=str(assembled),
+        )
+        applied_by_id = {row['sequence_id']: row for row in applied if row.get('sequence_id')}
+        replaced_ids = {row['sequence_id'] for row in applied if row['status'] == 'REPLACED'}
+        if replaced_ids:
+            db.upsert_sequence_provenance([row for row in eligible if row['sequence_id'] in replaced_ids])
+            for row in applied:
+                if row['status'] == 'REPLACED':
+                    db.update_isolate_status(
+                        row['sequence_id'], 'MARKER_REPLACED', detail=row['detail'],
+                        source_file=str(assembled),
+                    )
+        for row in eligible:
+            report_rows.append(applied_by_id.get(row['sequence_id'], {
+                'sequence_id': row['sequence_id'], 'status': 'NOT_PROCESSED', 'detail': '',
+            }))
+        report_path = root / 'marker_replacement_report.tsv'
+        root.mkdir(parents=True, exist_ok=True)
+        with open(report_path, 'w', newline='') as handle:
+            writer = csv.DictWriter(handle, fieldnames=['sequence_id', 'status', 'detail'], delimiter='\t')
+            writer.writeheader(); writer.writerows(report_rows)
+        replacement_fasta = root / 'replaced_markers.fasta'
+        write_fasta(
+            [(sequence_id, sequence_by_id[sequence_id]) for sequence_id in sorted(replaced_ids)],
+            replacement_fasta,
+        )
+        provenance_path = write_marker_qc_bridge(root / 'marker_qc_provenance.tsv', provenance)
+        for path, role in (
+            (qc_outputs['assembled_fasta'], 'sanger_assembled_fasta'),
+            (qc_outputs['assembly_tsv'], 'sanger_assembly_report'),
+            (report_path, 'marker_replacement_report'), (replacement_fasta, 'replaced_markers'),
+            (provenance_path, 'marker_qc_provenance'),
+        ):
+            manifest.add_output(path, role=role)
+        manifest.add_stage('paper_trail', 'COMPLETE', detail='1300 bp Sanger replacement QC')
+        manifest.add_stage('marker_replacement', 'COMPLETE', detail=f'{len(replaced_ids)} markers replaced')
+        manifest.finish('COMPLETE')
+    except Exception as exc:
+        manifest.finish('FAILED', error=exc)
+        raise
+    print(
+        f"[replace-selected-markers] {len(replaced_ids)} marker(s) replaced.\n"
+        f"  Replacement report : {report_path}\n"
+        f"  Replacement FASTA  : {replacement_fasta}\n"
+        '  Re-run Performance Review before using taxonomy, novelty, or tree results for these isolates.'
+    )
+
+
 def cmd_onboarding(args):
     from branchmanager.onboarding import validate_submission, write_onboarding_outputs
     from branchmanager.pipeline.paper_trail import DEFAULT_PRIMERS
@@ -4894,6 +5164,60 @@ def _cmd_project_import(args, *, genomes: bool):
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
     command_label = 'records-update' if genomes else 'status-meeting'
     print(f'[{command_label}] {len(rows) - rejected} row(s) imported; {rejected} rejected.\n  Report: {report}')
+
+
+def cmd_add_external_genomes(args):
+    """Add genome evidence acquired outside BranchManager's selection cycle."""
+    import fcntl
+    import sqlite3
+    from branchmanager.project_state import import_external_genomes, write_import_report
+
+    root = Path(args.out).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    manifest = RunManifest(root, 'external_genome_import')
+    manifest.add_input(args.input, role='external_genomes')
+    if args.marker_fasta:
+        manifest.add_input(args.marker_fasta, role='optional_marker_sequences')
+    original = Path(args.db).expanduser().resolve()
+    if not original.is_file():
+        raise SystemExit(f'[external-genomes] Project database does not exist: {original}')
+    staged = root / '.external_genomes_project.sqlite'
+    with open(original.with_name(original.name + '.lock'), 'a+') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            staged.unlink(missing_ok=True)
+            with sqlite3.connect(str(original)) as source, sqlite3.connect(str(staged)) as target:
+                source.backup(target)
+            db = Database(str(staged))
+            db.initialise()
+            results = import_external_genomes(
+                db, args.input, marker_fasta=args.marker_fasta,
+                default_dataset=args.dataset, default_tier=args.baseline_tier,
+            )
+            report = write_import_report(root / 'external_genome_import_report.tsv', results)
+            manifest.add_output(report, role='import_report')
+            rejected = sum(row.get('result') == 'REJECTED' for row in results)
+            manifest.add_stage('external_genome_import', 'COMPLETE' if rejected == 0 else 'COMPLETE_WITH_WARNINGS',
+                               detail=f'{len(results) - rejected} imported; {rejected} rejected')
+            manifest.finish('COMPLETE' if rejected == 0 else 'COMPLETE_WITH_WARNINGS')
+            db.record_project_run(
+                f'external-genome-import:{manifest.data["started_at"]}', 'external_genome_import',
+                manifest.data['status'], manifest_path=str(manifest.json_path),
+                started_at=manifest.data['started_at'], completed_at=manifest.data['completed_at'],
+            )
+            publish = original.with_name(original.name + '.publishing')
+            publish.unlink(missing_ok=True)
+            with sqlite3.connect(str(staged)) as source, sqlite3.connect(str(publish)) as target:
+                source.backup(target)
+            os.replace(publish, original)
+            staged.unlink(missing_ok=True)
+            manifest.add_output(original, role='project_database')
+        except BaseException as exc:
+            manifest.finish('FAILED', error=exc)
+            raise
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    print(f'[external-genomes] {len(results) - rejected} genome(s) imported; {rejected} rejected.\n  Report: {report}')
 
 
 def cmd_exit_interview(args):
@@ -5185,7 +5509,7 @@ def cmd_assistant(args):
             taxa_assignments=None, previous_review=None, shorten_ids=False,
             min_len=800, max_n_percent=args.max_n_percent,
             sequence_domain=args.sequence_domain,
-            phylum=None, target=None, force_rebuild=False, anchors=None,
+            phylum=None, target=None, force_rebuild=False, anchors=args.anchors,
             threads=args.threads, tree_method=args.tree_method,
             neighbourhood_format='png', pangenome_target=args.pangenome_target,
             candidate_set_size=args.candidate_set_size, user_colours=None,
@@ -5457,9 +5781,22 @@ def cmd_quarterly_review(args):
 
 def main(argv=None):
     parser = build_parser()
+    selected_config = config_path_from_argv(argv)
+    if selected_config:
+        project_config = load_project_config(selected_config)
+        apply_project_config_defaults(parser, project_config)
     args = parser.parse_args(argv)
+    if args.command == 'quarterly-review' and args.genome_budget is None:
+        parser.error('quarterly-review requires --genome-budget or a project selection_budget in --config')
+    if selected_config and args.command == 'filing-cabinet':
+        args.configured_baselines = project_config.get('baselines', [])
+        if not args.configured_baselines and (not args.fasta or not args.dataset):
+            parser.error('filing-cabinet requires --fasta and --dataset, or a project config with a baselines list')
     if args.command == 'filing-cabinet':
-        cmd_filing_cabinet(args)
+        if getattr(args, 'configured_baselines', None):
+            cmd_filing_cabinet_configured_baselines(args)
+        else:
+            cmd_filing_cabinet(args)
     elif args.command == 'performance-review':
         cmd_performance_review(args)
     elif args.command == 'quarterly-review':
@@ -5484,6 +5821,8 @@ def main(argv=None):
         _cmd_project_import(args, genomes=False)
     elif args.command == 'records-update':
         _cmd_project_import(args, genomes=True)
+    elif args.command == 'add-external-genomes':
+        cmd_add_external_genomes(args)
     elif args.command == 'exit-interview':
         cmd_exit_interview(args)
     elif args.command == 'annual-report':

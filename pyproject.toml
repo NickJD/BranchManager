@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "BranchManager"
-version = "0.1.0"
+version = "0.1.2"
 authors = [
     {name = "Nicholas Dimonaco", email = "nicholas@dimonaco.co.uk"}
 ]
@@ -27,7 +27,8 @@ Homepage = "https://github.com/NickJD/BranchManager"
 "Bug Tracker" = "https://github.com/NickJD/BranchManager/issues"
 
 [project.scripts]
-BranchManager = "BranchManager.cli:main"
+BranchManager = "branchmanager.cli:main"
+branchmanager = "branchmanager.cli:main"
 
 
 
@@ -36,11 +37,12 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["BranchManager*"]
+include = ["branchmanager*"]
 
 [tool.setuptools.package-data]
-BranchManager = [
+branchmanager = [
     # anchors
     "db/*",
+    "data/*",
 
 ]

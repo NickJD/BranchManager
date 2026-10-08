@@ -238,7 +238,118 @@ def import_genome_results(
                 'source_file': str(Path(path).resolve()),
                 'raw_selected_value': 'genome_qc_pass',
                 'raw_commitment_value': current.get('raw_commitment_value', ''),
+                'project_metadata': current.get('project_metadata', {}),
             }])
+    return results
+
+
+def import_external_genomes(
+    db, path: str | Path, *, marker_fasta: str | Path | None = None,
+    default_dataset: str = 'ExternalGenomeBaseline', default_tier: str = 'secondary',
+) -> list[dict]:
+    """Register genomes acquired outside the candidate-selection workflow.
+
+    A marker sequence is optional. Genome-only records receive an empty marker
+    slot, remain available for genome-coverage/taxonomy context, and are
+    excluded from marker similarity searches and trees.
+    """
+    from branchmanager.taxonomy import canonicalise_sequence_id
+    from branchmanager.utils.fasta import read_fasta
+
+    rows = _read_rows(path)
+    markers = {}
+    if marker_fasta:
+        for header, sequence in read_fasta(str(marker_fasta)):
+            markers[canonicalise_sequence_id(header)] = sequence
+    results = []
+    sequences_by_dataset = {}
+    tax_entries = []
+    genome_entries = []
+    metadata_entries = []
+    role_entries = {}
+    known = db.get_all_ids()
+    existing_metadata = db.get_sequencing_metadata_for_ids()
+    for line_number, row in enumerate(rows, start=2):
+        sequence_id = _value(row, 'sequence_id', 'isolate_id', 'sample_id', 'id')
+        genome_id = _value(row, 'genome_id', 'assembly_id', 'accession', 'genome_accession')
+        if not sequence_id or not genome_id:
+            results.append({'line': line_number, 'sequence_id': sequence_id, 'genome_id': genome_id,
+                            'result': 'REJECTED', 'detail': 'sequence_id and genome_id/accession are required'})
+            continue
+        dataset = _value(row, 'dataset', 'collection', 'baseline_dataset') or default_dataset
+        tier = (_value(row, 'baseline_tier', 'tier') or default_tier).strip().lower()
+        if tier not in {'priority', 'secondary'}:
+            results.append({'line': line_number, 'sequence_id': sequence_id, 'genome_id': genome_id,
+                            'result': 'REJECTED', 'detail': 'baseline_tier must be priority or secondary'})
+            continue
+        marker = markers.get(canonicalise_sequence_id(sequence_id), '')
+        if sequence_id not in known:
+            sequences_by_dataset.setdefault(dataset, []).append((sequence_id, marker))
+            role_entries[dataset] = tier
+            known.add(sequence_id)
+        elif marker:
+            with db.connect() as conn:
+                conn.execute(
+                    "UPDATE sequences SET sequence=?, length=? WHERE id=? AND (sequence IS NULL OR sequence='')",
+                    (marker, len(marker), sequence_id),
+                )
+        taxonomy = _value(row, 'gtdb_taxonomy', 'gtdbtk_taxonomy', 'taxonomy')
+        old = existing_metadata.get(sequence_id, {})
+        if taxonomy:
+            confidence = _optional_float(_value(row, 'taxonomy_confidence', 'confidence'))
+            tax_entries.append((sequence_id, taxonomy, confidence, old.get('dataset') or dataset))
+        metadata_entries.append({
+            'id': sequence_id, 'partner_id': _value(row, 'partner_id', 'partner') or old.get('partner_id', 'external'),
+            'dataset': old.get('dataset') or dataset,
+            'selected_for_sequencing': bool(old.get('selected_for_sequencing')),
+            'selected_for_wgs': True, 'source_id': sequence_id, 'source_file': str(Path(path).resolve()),
+            'raw_selected_value': 'external_genome_available',
+            'raw_commitment_value': old.get('raw_commitment_value', ''),
+            'project_metadata': {
+                key: value for key, value in row.items()
+                if key not in {
+                    'sequence_id', 'isolate_id', 'sample_id', 'id', 'genome_id',
+                    'assembly_id', 'accession', 'genome_accession', 'dataset',
+                    'collection', 'baseline_dataset', 'baseline_tier', 'tier',
+                    'gtdb_taxonomy', 'gtdbtk_taxonomy', 'taxonomy',
+                    'taxonomy_confidence', 'confidence', 'genome_status',
+                    'genome_qc_pass', 'qc_pass', 'completeness', 'genome_completeness',
+                    'contamination', 'genome_contamination', 'ani_cluster',
+                    'species_cluster', 'genome_path', 'assembly_path', 'notes', 'detail',
+                }
+            },
+        })
+        genome_status = _value(row, 'genome_status') or 'SEQUENCED'
+        genome_qc = _optional_bool(_value(row, 'genome_qc_pass', 'qc_pass'))
+        if genome_qc is None:
+            genome_qc = genome_status.strip().upper() == 'GENOME_QC_PASSED'
+        genome_entries.append({
+            'genome_id': genome_id, 'sequence_id': sequence_id,
+            'accession': _value(row, 'accession', 'genome_accession') or genome_id,
+            'genome_status': genome_status,
+            'genome_qc_pass': genome_qc,
+            'completeness': _optional_float(_value(row, 'completeness', 'genome_completeness')),
+            'contamination': _optional_float(_value(row, 'contamination', 'genome_contamination')),
+            'gtdb_taxonomy': taxonomy,
+            'ani_cluster': _value(row, 'ani_cluster', 'species_cluster'),
+            'genome_path': _value(row, 'genome_path', 'assembly_path'),
+            'notes': _value(row, 'notes', 'detail'), 'source_file': str(Path(path).resolve()),
+        })
+        results.append({'line': line_number, 'sequence_id': sequence_id, 'genome_id': genome_id,
+                        'result': 'IMPORTED', 'detail': 'genome available; marker ' + ('attached' if marker else 'not supplied')})
+
+    for dataset, tier in role_entries.items():
+        db.upsert_dataset_role(dataset, 'baseline', genomes_available=True, baseline_tier=tier)
+    if sequences_by_dataset:
+        # Empty sequence values are intentional genome-only records.
+        for dataset, subset in sequences_by_dataset.items():
+            db.insert_sequences(subset, dataset=dataset, baseline_tier=role_entries[dataset])
+    if tax_entries:
+        db.insert_taxonomy(tax_entries)
+    if metadata_entries:
+        db.upsert_sequencing_metadata(metadata_entries)
+    if genome_entries:
+        db.upsert_genome_records(genome_entries)
     return results
 
 

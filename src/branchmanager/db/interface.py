@@ -487,6 +487,7 @@ class Database:
             for column, definition in (
                 ('selected_for_sequencing', 'INTEGER DEFAULT 0'),
                 ('raw_commitment_value', 'TEXT'),
+                ('project_metadata_json', 'TEXT'),
                 ('operational_status', "TEXT DEFAULT 'RECEIVED'"),
                 ('status_detail', 'TEXT'),
                 ('manual_review_status', "TEXT DEFAULT 'NOT_REVIEWED'"),
@@ -747,9 +748,9 @@ class Database:
         with self.connect() as conn:
             cur = conn.cursor()
             if dataset:
-                cur.execute("SELECT id, sequence FROM sequences WHERE dataset = ?", (dataset,))
+                cur.execute("SELECT id, sequence FROM sequences WHERE dataset = ? AND sequence IS NOT NULL AND sequence != ''", (dataset,))
             else:
-                cur.execute("SELECT id, sequence FROM sequences")
+                cur.execute("SELECT id, sequence FROM sequences WHERE sequence IS NOT NULL AND sequence != ''")
             rows = cur.fetchall()
 
         if not rows:
@@ -858,7 +859,7 @@ class Database:
         p.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT id, sequence FROM sequences WHERE dataset = ?", (dataset,))
+            cur.execute("SELECT id, sequence FROM sequences WHERE dataset = ? AND sequence IS NOT NULL AND sequence != ''", (dataset,))
             rows = cur.fetchall()
         if not rows:
             return False
@@ -1213,18 +1214,20 @@ class Database:
                     row.get('source_file') or '',
                     row.get('raw_selected_value') if row.get('raw_selected_value') is not None else '',
                     row.get('raw_commitment_value') if row.get('raw_commitment_value') is not None else '',
+                    json.dumps(row.get('project_metadata'), sort_keys=True, ensure_ascii=False) if row.get('project_metadata') is not None else None,
                 ))
             if rows:
                 cur.executemany(
                     "INSERT INTO sequencing_metadata "
                     "(id, partner_id, dataset, selected_for_sequencing, selected_for_wgs, "
-                    "source_id, source_file, raw_selected_value, raw_commitment_value) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+                    "source_id, source_file, raw_selected_value, raw_commitment_value, project_metadata_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
                     "partner_id=excluded.partner_id, dataset=excluded.dataset, "
                     "selected_for_sequencing=excluded.selected_for_sequencing, "
                     "selected_for_wgs=excluded.selected_for_wgs, source_id=excluded.source_id, "
                     "source_file=excluded.source_file, raw_selected_value=excluded.raw_selected_value, "
-                    "raw_commitment_value=excluded.raw_commitment_value",
+                    "raw_commitment_value=excluded.raw_commitment_value, "
+                    "project_metadata_json=COALESCE(excluded.project_metadata_json, sequencing_metadata.project_metadata_json)",
                     rows,
                 )
             conn.commit()
@@ -1244,14 +1247,14 @@ class Database:
                 placeholders = ','.join('?' for _ in resolved)
                 cur.execute(
                     f"SELECT id, partner_id, dataset, selected_for_sequencing, selected_for_wgs, "
-                    f"source_id, source_file, raw_selected_value, raw_commitment_value "
+                    f"source_id, source_file, raw_selected_value, raw_commitment_value, project_metadata_json "
                     f"FROM sequencing_metadata WHERE id IN ({placeholders})",
                     tuple(resolved),
                 )
             else:
                 cur.execute(
                     "SELECT id, partner_id, dataset, selected_for_sequencing, selected_for_wgs, "
-                    "source_id, source_file, raw_selected_value, raw_commitment_value "
+                    "source_id, source_file, raw_selected_value, raw_commitment_value, project_metadata_json "
                     "FROM sequencing_metadata"
                 )
             rows = cur.fetchall()
@@ -1266,10 +1269,91 @@ class Database:
                 'source_file': source_file or '',
                 'raw_selected_value': raw_selected_value or '',
                 'raw_commitment_value': raw_commitment_value or '',
+                'project_metadata': json.loads(project_metadata_json) if project_metadata_json else {},
             }
             for rid, partner_id, dataset, selected_for_sequencing, selected_for_wgs,
-            source_id, source_file, raw_selected_value, raw_commitment_value in rows
+            source_id, source_file, raw_selected_value, raw_commitment_value, project_metadata_json in rows
         }
+
+    def replace_selected_markers(self, replacements, *, source_manifest='', source_fasta=''):
+        """Atomically replace approved Sanger markers for selected, unsequenced isolates.
+
+        The old marker and its provenance are retained in ``marker_replacements``.
+        Derived marker analyses are removed so a later Performance Review cannot
+        accidentally present taxonomy or novelty calculated from the old sequence.
+        """
+        prepared = []
+        for row in replacements or []:
+            sequence_id = str(row.get('sequence_id') or row.get('id') or '').strip()
+            sequence = ''.join(str(row.get('sequence') or '').split()).upper().replace('U', 'T')
+            if sequence_id and sequence:
+                prepared.append((sequence_id, sequence, dict(row)))
+        results = []
+        with self.connect() as conn:
+            cur = conn.cursor()
+            for requested_id, sequence, replacement in prepared:
+                sequence_id = self._resolve_sequence_id_with_cursor(cur, requested_id)
+                result = {'requested_id': requested_id, 'sequence_id': sequence_id or '', 'status': '', 'detail': ''}
+                if not sequence_id:
+                    result.update(status='NOT_FOUND', detail='isolate is not registered in the project database')
+                    results.append(result)
+                    continue
+                row = cur.execute(
+                    'SELECT s.sequence, s.length, COALESCE(m.selected_for_sequencing, 0), '
+                    'COALESCE(m.selected_for_wgs, 0) FROM sequences s '
+                    'LEFT JOIN sequencing_metadata m ON m.id=s.id WHERE s.id=?', (sequence_id,),
+                ).fetchone()
+                old_sequence, old_length, selected, genome_available = row
+                genome_records = cur.execute(
+                    'SELECT COUNT(*) FROM genome_records WHERE sequence_id=?', (sequence_id,),
+                ).fetchone()[0]
+                if not selected:
+                    result.update(status='NOT_SELECTED', detail='isolate is not currently selected for genome sequencing')
+                    results.append(result)
+                    continue
+                if genome_available or genome_records:
+                    result.update(status='GENOME_ALREADY_AVAILABLE', detail='marker replacement is restricted to future genome selections')
+                    results.append(result)
+                    continue
+                if len(sequence) < 1300:
+                    result.update(status='TOO_SHORT', detail='replacement consensus is shorter than 1300 bp')
+                    results.append(result)
+                    continue
+                old_provenance = cur.execute(
+                    'SELECT source_manifest, source_sequence_file, source_sequence_sha256, source_read_ids, '
+                    'source_read_files, marker_qc_class, marker_qc_recommendation, marker_qc_reasons, '
+                    'manual_review_status, chimera_call, chimera_score FROM sequence_provenance WHERE sequence_id=?',
+                    (sequence_id,),
+                ).fetchone()
+                old_provenance_json = json.dumps(old_provenance or (), separators=(',', ':'))
+                new_provenance = {
+                    key: replacement.get(key) for key in (
+                        'source_manifest', 'source_sequence_file', 'source_sequence_sha256', 'source_read_ids',
+                        'source_read_files', 'marker_qc_class', 'marker_qc_recommendation', 'marker_qc_reasons',
+                        'manual_review_status', 'chimera_call', 'chimera_score',
+                    )
+                }
+                cur.execute(
+                    'INSERT INTO marker_replacements '
+                    '(sequence_id, old_sequence, old_sequence_sha256, old_length, old_provenance_json, '
+                    'new_sequence, new_sequence_sha256, new_length, new_provenance_json, source_manifest, source_fasta) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    (sequence_id, old_sequence, hashlib.sha256(str(old_sequence).encode()).hexdigest(),
+                     int(old_length or len(str(old_sequence))), old_provenance_json, sequence,
+                     hashlib.sha256(sequence.encode()).hexdigest(), len(sequence),
+                     json.dumps(new_provenance, sort_keys=True, default=str, separators=(',', ':')),
+                     str(source_manifest), str(source_fasta)),
+                )
+                cur.execute('UPDATE sequences SET sequence=?, length=? WHERE id=?', (sequence, len(sequence), sequence_id))
+                cur.execute('DELETE FROM taxonomy WHERE id=?', (sequence_id,))
+                cur.execute('DELETE FROM taxonomy_alt WHERE id=?', (sequence_id,))
+                cur.execute('DELETE FROM distances WHERE id=?', (sequence_id,))
+                cur.execute('DELETE FROM classification_evidence WHERE sequence_id=?', (sequence_id,))
+                cur.execute('DELETE FROM assessment_snapshots WHERE sequence_id=?', (sequence_id,))
+                result.update(status='REPLACED', detail=f'{int(old_length or len(str(old_sequence)))} bp → {len(sequence)} bp')
+                results.append(result)
+            conn.commit()
+        return results
 
     def save_assessment_snapshot(self, snapshot_id, assessment_rows, *, dataset='', source_path=''):
         """Persist one complete performance review without mutating genome status."""

@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS sequencing_metadata (
     source_file TEXT,
     raw_selected_value TEXT,
     raw_commitment_value TEXT,
+    project_metadata_json TEXT,
     operational_status TEXT DEFAULT 'RECEIVED',
     status_detail TEXT,
     manual_review_status TEXT DEFAULT 'NOT_REVIEWED'
@@ -188,7 +189,24 @@ CREATE TABLE IF NOT EXISTS sequence_removals (
     removed_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS marker_replacements (
+    replacement_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sequence_id TEXT NOT NULL,
+    old_sequence TEXT NOT NULL,
+    old_sequence_sha256 TEXT NOT NULL,
+    old_length INTEGER NOT NULL,
+    old_provenance_json TEXT NOT NULL,
+    new_sequence TEXT NOT NULL,
+    new_sequence_sha256 TEXT NOT NULL,
+    new_length INTEGER NOT NULL,
+    new_provenance_json TEXT NOT NULL,
+    source_manifest TEXT,
+    source_fasta TEXT,
+    replaced_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_genome_records_sequence ON genome_records(sequence_id);
 CREATE INDEX IF NOT EXISTS idx_isolate_status_events_sequence ON isolate_status_events(sequence_id);
 CREATE INDEX IF NOT EXISTS idx_sequence_removals_sequence ON sequence_removals(sequence_id);
+CREATE INDEX IF NOT EXISTS idx_marker_replacements_sequence ON marker_replacements(sequence_id);
 """
