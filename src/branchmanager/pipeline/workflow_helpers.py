@@ -578,6 +578,9 @@ def build_sequence_assessment_rows(
                     'pangenome_target': val('PangenomeTarget', default='9'),
                     'pangenome_gap': val('PangenomeGap'),
                     'genome_sequencing_metadata_source': val('GenomeSequencingMetadataSource'),
+                    'closest_project_isolate': val('ClosestProjectIsolate', default='None'),
+                    'closest_project_isolate_identity': val('ClosestProjectIsolateIdentity', default='0.00'),
+                    'project_isolate_only_match': val('ProjectIsolateOnlyMatch', default='False'),
                 }
     except FileNotFoundError:
         import logging as _logging
@@ -593,6 +596,7 @@ def build_sequence_assessment_rows(
         for key in (
             'nearest_hit', 'hungate_nearest_hit', 'secondary_baseline_nearest_hit',
             'cultured_rumen_nearest_hit', 'project_nearest_hit', 'reference_nearest_hit',
+            'closest_project_isolate',
         ):
             hit = row.get(key)
             if hit not in (None, '', 'NA', 'None'):
@@ -688,6 +692,17 @@ def build_sequence_assessment_rows(
             baseline_hit_taxonomy,
         )
 
+        # Make it unmistakable when a candidate's only close match is another
+        # submitted project isolate rather than genuine baseline/reference evidence —
+        # otherwise an apparently "not novel" candidate could just be resembling an
+        # unconfirmed sibling submission.
+        closest_project_isolate = n.get('closest_project_isolate', 'NA')
+        project_isolate_only_match = str(n.get('project_isolate_only_match', 'False')).strip().lower() == 'true'
+        placement_flags = w.get('flags', '')
+        if project_isolate_only_match and closest_project_isolate not in (None, '', 'NA', 'None'):
+            extra_flag = f'ONLY_MATCHES_PROJECT_ISOLATE:{closest_project_isolate}'
+            placement_flags = ';'.join(f for f in (placement_flags, extra_flag) if f)
+
         assessment_rows.append({
             'id': iid,
             # ClassificationHit = best vsearch hit in the REFERENCE DB (GTDB/SILVA) → drives Taxonomy
@@ -776,6 +791,10 @@ def build_sequence_assessment_rows(
             'already_sequenced': n.get('already_sequenced', 'NA'),
             'nearest_genome_hit': n.get('nearest_genome_hit', 'NA'),
             'nearest_genome_identity': n.get('nearest_genome_identity', 'NA'),
+            'closest_project_isolate': n.get('closest_project_isolate', 'NA'),
+            'closest_project_isolate_dataset': nearest_meta.get(str(n.get('closest_project_isolate')), {}).get('dataset', 'NA'),
+            'closest_project_isolate_identity': n.get('closest_project_isolate_identity', 'NA'),
+            'project_isolate_only_match': n.get('project_isolate_only_match', 'NA'),
             'genome_collection_matches_ge_99': n.get('genome_collection_matches_ge_99', 'NA'),
             'genome_collection_matches_ge_97': n.get('genome_collection_matches_ge_97', 'NA'),
             'genome_collection_matches_ge_95': n.get('genome_collection_matches_ge_95', 'NA'),
@@ -790,7 +809,7 @@ def build_sequence_assessment_rows(
             'pangenome_target': n.get('pangenome_target', '9'),
             'pangenome_gap': n.get('pangenome_gap', 'NA'),
             'genome_sequencing_metadata_source': n.get('genome_sequencing_metadata_source', 'NA'),
-            'placement_flags': w.get('flags', ''),
+            'placement_flags': placement_flags,
             'in_tree': in_tree,
             'cluster_representative': cluster_rep,
             'cluster_size': cluster_size,
@@ -921,6 +940,10 @@ def write_sequence_assessment_tsv(path: str | Path, rows, assessment_db_name: st
         ('SelectedForGenomeSequencing', 'selected_for_genome_sequencing'),
         ('GenomeAlreadySequenced', 'already_sequenced'),
         ('NearestGenomeHit', 'nearest_genome_hit'), ('NearestGenomeIdentity', 'nearest_genome_identity'),
+        ('ClosestProjectIsolate', 'closest_project_isolate'),
+        ('ClosestProjectIsolateDataset', 'closest_project_isolate_dataset'),
+        ('ClosestProjectIsolateIdentity', 'closest_project_isolate_identity'),
+        ('ProjectIsolateOnlyMatch', 'project_isolate_only_match'),
         ('GenomeCollectionMatchesGE99', 'genome_collection_matches_ge_99'),
         ('GenomeCollectionMatchesGE97', 'genome_collection_matches_ge_97'),
         ('GenomeCollectionMatchesGE95', 'genome_collection_matches_ge_95'),
@@ -1160,6 +1183,9 @@ def build_selection_decision(row: dict) -> dict:
 
     positive = []
     caution = []
+    if str(row.get('project_isolate_only_match') or '').strip().lower() == 'true':
+        isolate = row.get('closest_project_isolate', 'NA')
+        caution.insert(0, f'only close match is another project isolate ({isolate}), not a confirmed baseline/reference hit')
     if selected:
         caution.append('current isolate already has a genome available')
     elif pending:
@@ -1311,6 +1337,8 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
         'ProjectNearestQueryCoverage',
         'ProjectCloseNeighboursGE97',
         'ProjectNoveltyScore',
+        'ClosestProjectIsolate',
+        'ProjectIsolateOnlyMatch',
         f'{label}ReferenceContext',
         f'{label}ReferenceNearestIdentity',
         f'{label}ReferenceNearestQueryCoverage',
@@ -1406,6 +1434,8 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
                 row.get('project_nearest_query_coverage', 'NA'),
                 row.get('project_matches_ge_97', 'NA'),
                 row.get('project_novelty_score', 'NA'),
+                row.get('closest_project_isolate', 'NA'),
+                row.get('project_isolate_only_match', 'NA'),
                 support['reference_context'],
                 row.get('reference_nearest_identity', 'NA'),
                 row.get('reference_nearest_query_coverage', 'NA'),

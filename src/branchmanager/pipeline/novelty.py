@@ -416,7 +416,7 @@ def compute_db_nearest_identities(mapped_derep: str, outdir: str, db, run_datase
     try:
         with db.connect() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT id, sequence FROM sequences WHERE (dataset IS NOT ? OR dataset IS NULL) AND sequence IS NOT NULL AND sequence != ''", (run_dataset,))
+            cur.execute("SELECT id, sequence FROM sequences WHERE dataset IS NOT ? OR dataset IS NULL", (run_dataset,))
             rows = cur.fetchall()
         records = [(r[0], r[1]) for r in rows]
         if records:
@@ -877,6 +877,9 @@ def _empty_sequencing_context(qids, pangenome_target: int = DEFAULT_PANGENOME_TA
             'selected_for_wgs': 'NA',
             'nearest_genome_hit': 'None',
             'nearest_genome_identity': 0.0,
+            'closest_project_isolate': 'None',
+            'closest_project_isolate_identity': 0.0,
+            'project_isolate_only_match': 'False',
             'genome_ge_99': 0,
             'genome_ge_97': 0,
             'genome_ge_95': 0,
@@ -956,9 +959,16 @@ def _compute_sequencing_context(
     primary_metrics,
     threads: Optional[int] = None,
     pangenome_target: int = DEFAULT_PANGENOME_TARGET,
+    project_metrics=None,
+    reference_metrics=None,
+    cultured_metrics=None,
 ):
     if db is None:
         return _empty_sequencing_context(qids, pangenome_target)
+
+    project_metrics = project_metrics or {}
+    reference_metrics = reference_metrics or {}
+    cultured_metrics = cultured_metrics or {}
 
     try:
         metadata = db.get_sequencing_metadata_for_ids(qids)
@@ -978,12 +988,12 @@ def _compute_sequencing_context(
         with db.connect() as conn:
             cur = conn.cursor()
             cur.execute(
-                "SELECT s.id, s.sequence, s.dataset, s.baseline_tier, COALESCE(t.taxonomy, g.gtdb_taxonomy), "
+                "SELECT s.id, s.sequence, s.dataset, s.baseline_tier, t.taxonomy, "
                 "COALESCE(m.selected_for_wgs, 0), COALESCE(m.selected_for_sequencing, 0) "
                 "FROM sequences s "
                 "LEFT JOIN taxonomy t ON s.id = t.id AND (t.dataset = s.dataset OR t.dataset IS NULL) "
                 "LEFT JOIN sequencing_metadata m ON s.id = m.id "
-                "LEFT JOIN genome_records g ON g.sequence_id = s.id"
+                "WHERE s.sequence IS NOT NULL AND s.sequence != ''"
             )
             rows = cur.fetchall()
         by_id = {}
@@ -1010,8 +1020,11 @@ def _compute_sequencing_context(
                 tier = _infer_baseline_tier_name(dataset)
             is_hungate_baseline = is_baseline_genome and tier == 'priority'
             is_secondary_baseline = is_baseline_genome and tier == 'secondary'
-            is_partner_genome = bool(entry.get('available')) and not is_baseline_genome
-            is_pending_selection = bool(entry.get('selected')) and not is_partner_genome and not is_baseline_genome
+            # A candidate committed to genome sequencing counts as project-collection
+            # evidence whether the genome is already in hand or only selected/pending —
+            # the distinction does not matter for novelty/pangenome-gap purposes because
+            # a selected isolate WILL eventually be sequenced.
+            is_partner_genome = bool(entry.get('available') or entry.get('selected')) and not is_baseline_genome
             collection_metadata[sid] = {
                 'taxonomy': entry.get('taxonomy', ''),
                 'dataset': dataset,
@@ -1020,9 +1033,12 @@ def _compute_sequencing_context(
                 'hungate_baseline_available': is_hungate_baseline,
                 'secondary_baseline_available': is_secondary_baseline,
                 'partner_available': is_partner_genome,
-                'selected_pending': is_pending_selection,
+                # Retained for output-column compatibility; selected-but-not-yet-sequenced
+                # isolates are now folded into 'partner_available' above rather than
+                # tracked as a separate pending category.
+                'selected_pending': False,
             }
-            if (is_baseline_genome or is_partner_genome) and entry['sequence']:
+            if is_baseline_genome or is_partner_genome:
                 genome_records.append((sid, entry['sequence']))
                 genome_metadata[sid] = collection_metadata[sid]
     except Exception as e:
@@ -1097,6 +1113,29 @@ def _compute_sequencing_context(
         same_species_committed = same_species_baseline + same_species_partner_available + same_species_pending
         target_count = max(1, int(pangenome_target or DEFAULT_PANGENOME_TARGET))
         pangenome_gap = max(0, target_count - same_species_committed)
+
+        # The name of the nearest OTHER submitted isolate, regardless of whether it has
+        # been committed to genome sequencing. This is reported so a reviewer can always
+        # see exactly which project isolate a candidate resembles, not just whether a
+        # "genome collection" match exists.
+        project_row = project_metrics.get(qid) or {}
+        closest_project_isolate = project_row.get('nearest_hit') or 'None'
+        try:
+            closest_project_isolate_identity = float(project_row.get('nearest_identity'))
+        except (TypeError, ValueError):
+            closest_project_isolate_identity = 0.0
+
+        # A candidate can look "not novel" purely because it resembles another
+        # submitted isolate that has not itself been validated against any cultured
+        # baseline or external reference. Flag that scenario explicitly so it is not
+        # mistaken for genuine evidence that the organism is already known.
+        reference_row = reference_metrics.get(qid) or {}
+        cultured_row = cultured_metrics.get(qid) or {}
+        baseline_close_hit = _pool_has_close_hit(cultured_row)
+        reference_close_hit = _pool_has_close_hit(reference_row)
+        project_close_hit = _pool_has_close_hit(project_row)
+        project_isolate_only_match = bool(project_close_hit and not baseline_close_hit and not reference_close_hit)
+
         base = primary_metrics.get(qid, {})
         try:
             base_score = float(base.get('novelty_score', 0.0))
@@ -1132,6 +1171,9 @@ def _compute_sequencing_context(
             'selected_for_wgs': 'True' if current_available is True else ('False' if current_available is False else 'NA'),
             'nearest_genome_hit': nearest_hit,
             'nearest_genome_identity': nearest_pct,
+            'closest_project_isolate': closest_project_isolate,
+            'closest_project_isolate_identity': closest_project_isolate_identity,
+            'project_isolate_only_match': str(project_isolate_only_match),
             'genome_ge_99': ge_99,
             'genome_ge_97': ge_97,
             'genome_ge_95': ge_95,
@@ -1174,6 +1216,17 @@ def _pool_has_hit(row: dict) -> bool:
         return False
     source = str(row.get('density_source') or '')
     return source not in {'', 'none', 'NA'}
+
+
+def _pool_has_close_hit(row: dict, identity_threshold: float = 97.0) -> bool:
+    """Whether a pool comparison found a hit at/above the species-level identity boundary."""
+    if not _pool_has_hit(row):
+        return False
+    try:
+        identity = float(row.get('nearest_identity'))
+    except (TypeError, ValueError):
+        return False
+    return identity >= float(identity_threshold)
 
 
 def _passes_identity_coverage(row: dict, identity_threshold: float, coverage_threshold: float) -> bool:
@@ -1257,6 +1310,7 @@ def _write_novelty_metrics_table(
         'SelectedPendingGenomeCountSameAssessmentSpecies',
         'PangenomeTarget', 'PangenomeGap',
         'GenomeSequencingMetadataSource',
+        'ClosestProjectIsolate', 'ClosestProjectIsolateIdentity', 'ProjectIsolateOnlyMatch',
     ])
 
     with open(output, 'w') as fh:
@@ -1294,6 +1348,9 @@ def _write_novelty_metrics_table(
                 str(seq_ctx['pangenome_target']),
                 str(seq_ctx['pangenome_gap']),
                 seq_ctx['source'],
+                seq_ctx.get('closest_project_isolate', 'None'),
+                f"{float(seq_ctx.get('closest_project_isolate_identity') or 0.0):.2f}",
+                seq_ctx.get('project_isolate_only_match', 'False'),
             ]
             fh.write('\t'.join([qid] + primary + hungate + secondary + cultured + baseline_alias + project + reference + sequencing) + '\n')
     return str(output)
@@ -1498,6 +1555,9 @@ def build_reference_novelty_metrics(
         primary_metrics,
         threads=threads,
         pangenome_target=pangenome_target,
+        project_metrics=all_metrics,
+        reference_metrics=reference_metrics,
+        cultured_metrics=cultured_metrics,
     )
     _write_novelty_metrics_table(
         output,
