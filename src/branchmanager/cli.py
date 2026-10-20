@@ -1943,6 +1943,19 @@ def _cmd_performance_review_impl(args):
                     files.add(str(Path(source).expanduser()))
         return sorted(files)
 
+    def _write_resequencing_decisions():
+        if not resequencing_decisions:
+            return
+        decision_path = Path(outdir) / 'resequencing_conflicts.tsv'
+        with open(decision_path, 'w', newline='') as handle:
+            writer = csv.DictWriter(
+                handle, fieldnames=[
+                    'sequence_id', 'incoming_ab1_files', 'decision', 'qc_class', 'qc_reasons',
+                    'qc_review_decision', 'detail',
+                ], delimiter='\t',
+            )
+            writer.writeheader(); writer.writerows(resequencing_decisions)
+
     # If the user requested a kingdom filter, classify the QC-passing input
     # before insertion so only sequences assigned to that domain are retained.
     early_class_out = None
@@ -1997,18 +2010,22 @@ def _cmd_performance_review_impl(args):
                 except EOFError:
                     response = ''
                 approved = response in {'y', 'yes'}
-                resequencing_decisions.append({
+                decision_row = {
                     'sequence_id': existing_id,
                     'incoming_ab1_files': ';'.join(incoming_files),
                     'decision': 'YES' if approved else 'NO',
+                    'qc_class': '', 'qc_reasons': '', 'qc_review_decision': '',
                     'detail': str(e),
-                })
+                }
+                resequencing_decisions.append(decision_row)
+                _write_resequencing_decisions()
                 if approved:
                     from branchmanager.marker_provenance import load_marker_provenance
                     if existing_id not in provenance_for_replacements:
                         replacement_provenance, _qc_source = load_marker_provenance(
                             args.input,
                             qc_path=getattr(args, 'marker_qc', None),
+                            review_path=getattr(args, 'marker_review', None),
                             id_map={h: existing_id},
                             accept_unverified=bool(getattr(args, 'accept_unverified_marker_qc', False)),
                         )
@@ -2017,30 +2034,45 @@ def _cmd_performance_review_impl(args):
                             {'sequence_id': existing_id},
                         )
                     provenance_row = provenance_for_replacements[existing_id]
-                    if (str(provenance_row.get('marker_qc_class') or '').upper() != 'PASS_HIGH_CONFIDENCE'
-                            and str(provenance_row.get('manual_review_status') or '').upper() != 'APPROVED'):
-                        raise SystemExit(
-                            f'[DB] Resequencing of {existing_id} was approved, but the incoming marker does not '
-                            'have PASS_HIGH_CONFIDENCE QC or an approved manual marker review. Review the AB1 '
-                            'reads and marker-QC report, then rerun Performance Review.'
+                    qc_class = str(provenance_row.get('marker_qc_class') or 'QUALITY_UNVERIFIED').upper()
+                    qc_reasons = str(provenance_row.get('marker_qc_reasons') or 'no_marker_qc_sidecar')
+                    decision_row['qc_class'] = qc_class
+                    decision_row['qc_reasons'] = qc_reasons
+                    if qc_class != 'PASS_HIGH_CONFIDENCE':
+                        print(
+                            f'[DB] User approved resequencing for {existing_id}; retaining incoming marker '
+                            f'despite QC class {qc_class}. QC reasons: {qc_reasons}'
                         )
+                    decision_row['qc_review_decision'] = 'USER_APPROVED_RESEQUENCING_QC_RETAINED'
+                    _write_resequencing_decisions()
                     replacement = {**provenance_row, 'sequence_id': existing_id, 'sequence': s}
                     result = db.replace_selected_markers(
                         [replacement], source_manifest=str(Path(outdir) / 'run_manifest.json'),
                         source_fasta=str(args.input), allow_unselected=True,
                     )[0]
                     if result.get('status') != 'REPLACED':
-                        raise SystemExit(
-                            f'[DB] Cannot re-examine {existing_id} as a resequenced isolate: '
-                            f"{result.get('detail') or result.get('status')}"
+                        detail = result.get('detail') or result.get('status')
+                        decision_row['detail'] = f'{decision_row["detail"]}; replacement not applied: {detail}'
+                        print(f'[DB] Could not replace {existing_id}; keeping its stored sequence and continuing: {detail}')
+                        with db.connect() as conn:
+                            existing_row = conn.execute(
+                                'SELECT sequence FROM sequences WHERE id=?', (existing_id,),
+                            ).fetchone()
+                        if existing_row and existing_row[0]:
+                            mapped_records.append((existing_id, existing_row[0]))
+                        else:
+                            print(f'[DB] Stored sequence for {existing_id} is unavailable; skipping this isolate.')
+                            decision_row['detail'] += '; isolate skipped because stored sequence is unavailable'
+                    else:
+                        provenance_for_replacements[existing_id] = replacement
+                        db.upsert_sequence_provenance([replacement])
+                        db.update_isolate_status(
+                            existing_id, 'MARKER_REPLACED', detail=result.get('detail', ''),
+                            source_file=str(args.input),
                         )
-                    provenance_for_replacements[existing_id] = replacement
-                    db.upsert_sequence_provenance([replacement])
-                    db.update_isolate_status(
-                        existing_id, 'MARKER_REPLACED', detail=result.get('detail', ''),
-                        source_file=str(args.input),
-                    )
-                    mapped_records.append((existing_id, s))
+                        mapped_records.append((existing_id, s))
+                        short = existing_id
+                    _write_resequencing_decisions()
                     short = existing_id
                 else:
                     short = existing_id
@@ -2096,11 +2128,7 @@ def _cmd_performance_review_impl(args):
     write_fasta(mapped_records, str(current_dataset_fasta))
     if resequencing_decisions:
         decision_path = Path(outdir) / 'resequencing_conflicts.tsv'
-        with open(decision_path, 'w', newline='') as handle:
-            writer = csv.DictWriter(
-                handle, fieldnames=['sequence_id', 'incoming_ab1_files', 'decision', 'detail'], delimiter='\t',
-            )
-            writer.writeheader(); writer.writerows(resequencing_decisions)
+        _write_resequencing_decisions()
         logging.getLogger(__name__).info('[DB] Resequencing decisions written to %s', decision_path)
     logging.getLogger(__name__).info("[DB] Mapped %d user sequence IDs to runtime IDs and wrote %s", len(mapped_records), current_dataset_fasta)
     if not mapped_records:
@@ -2155,6 +2183,11 @@ def _cmd_performance_review_impl(args):
                 else row
                 for row in marker_provenance
                 if row['sequence_id'] not in declined_resequencing_ids or row['sequence_id'] in prior_provenance
+            ]
+        if provenance_for_replacements:
+            marker_provenance = [
+                provenance_for_replacements.get(row['sequence_id'], row)
+                for row in marker_provenance
             ]
         db.upsert_sequence_provenance(marker_provenance)
         marker_bridge_path = write_marker_qc_bridge(
