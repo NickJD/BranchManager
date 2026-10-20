@@ -125,6 +125,7 @@ class Database:
                 str(row.get('source_sequence_sha256') or ''),
                 str(row.get('source_read_ids') or ''),
                 str(row.get('source_read_files') or ''),
+                str(row.get('source_read_checksums_json') or ''),
                 str(row.get('marker_qc_class') or ''),
                 str(row.get('marker_qc_recommendation') or ''),
                 str(row.get('marker_qc_reasons') or ''),
@@ -138,13 +139,14 @@ class Database:
             conn.executemany(
                 "INSERT INTO sequence_provenance "
                 "(sequence_id, source_manifest, source_sequence_file, source_sequence_sha256, "
-                "source_read_ids, source_read_files, marker_qc_class, marker_qc_recommendation, "
+                "source_read_ids, source_read_files, source_read_checksums_json, marker_qc_class, marker_qc_recommendation, "
                 "marker_qc_reasons, manual_review_status, chimera_call, chimera_score) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(sequence_id) DO UPDATE SET source_manifest=excluded.source_manifest, "
                 "source_sequence_file=excluded.source_sequence_file, "
                 "source_sequence_sha256=excluded.source_sequence_sha256, "
                 "source_read_ids=excluded.source_read_ids, source_read_files=excluded.source_read_files, "
+                "source_read_checksums_json=excluded.source_read_checksums_json, "
                 "marker_qc_class=excluded.marker_qc_class, "
                 "marker_qc_recommendation=excluded.marker_qc_recommendation, "
                 "marker_qc_reasons=excluded.marker_qc_reasons, "
@@ -158,7 +160,8 @@ class Database:
     def get_sequence_provenance(self, sequence_ids=None):
         query = (
             "SELECT sequence_id, source_manifest, source_sequence_file, source_sequence_sha256, "
-            "source_read_ids, source_read_files, marker_qc_class, marker_qc_recommendation, "
+            "source_read_ids, source_read_files, source_read_checksums_json, "
+            "marker_qc_class, marker_qc_recommendation, "
             "marker_qc_reasons, manual_review_status, chimera_call, chimera_score, "
             "updated_at FROM sequence_provenance"
         )
@@ -172,6 +175,7 @@ class Database:
         keys = (
             'sequence_id', 'source_manifest', 'source_sequence_file', 'source_sequence_sha256',
             'source_read_ids', 'source_read_files', 'marker_qc_class', 'marker_qc_recommendation',
+            'source_read_checksums_json',
             'marker_qc_reasons', 'manual_review_status', 'chimera_call', 'chimera_score', 'updated_at',
         )
         return {str(row[0]): dict(zip(keys, row)) for row in rows}
@@ -501,6 +505,7 @@ class Database:
             for column, definition in (
                 ('chimera_call', "TEXT DEFAULT 'NOT_RUN'"),
                 ('chimera_score', 'REAL'),
+                ('source_read_checksums_json', 'TEXT'),
             ):
                 if column not in provenance_columns:
                     cur.execute(f'ALTER TABLE sequence_provenance ADD COLUMN {column} {definition}')
@@ -1275,8 +1280,8 @@ class Database:
             source_id, source_file, raw_selected_value, raw_commitment_value, project_metadata_json in rows
         }
 
-    def replace_selected_markers(self, replacements, *, source_manifest='', source_fasta=''):
-        """Atomically replace approved Sanger markers for selected, unsequenced isolates.
+    def replace_selected_markers(self, replacements, *, source_manifest='', source_fasta='', allow_unselected=False):
+        """Atomically replace approved Sanger markers for unsequenced isolates.
 
         The old marker and its provenance are retained in ``marker_replacements``.
         Derived marker analyses are removed so a later Performance Review cannot
@@ -1307,7 +1312,7 @@ class Database:
                 genome_records = cur.execute(
                     'SELECT COUNT(*) FROM genome_records WHERE sequence_id=?', (sequence_id,),
                 ).fetchone()[0]
-                if not selected:
+                if not selected and not allow_unselected:
                     result.update(status='NOT_SELECTED', detail='isolate is not currently selected for genome sequencing')
                     results.append(result)
                     continue
@@ -1321,7 +1326,7 @@ class Database:
                     continue
                 old_provenance = cur.execute(
                     'SELECT source_manifest, source_sequence_file, source_sequence_sha256, source_read_ids, '
-                    'source_read_files, marker_qc_class, marker_qc_recommendation, marker_qc_reasons, '
+                    'source_read_files, source_read_checksums_json, marker_qc_class, marker_qc_recommendation, marker_qc_reasons, '
                     'manual_review_status, chimera_call, chimera_score FROM sequence_provenance WHERE sequence_id=?',
                     (sequence_id,),
                 ).fetchone()
@@ -1329,7 +1334,7 @@ class Database:
                 new_provenance = {
                     key: replacement.get(key) for key in (
                         'source_manifest', 'source_sequence_file', 'source_sequence_sha256', 'source_read_ids',
-                        'source_read_files', 'marker_qc_class', 'marker_qc_recommendation', 'marker_qc_reasons',
+                        'source_read_files', 'source_read_checksums_json', 'marker_qc_class', 'marker_qc_recommendation', 'marker_qc_reasons',
                         'manual_review_status', 'chimera_call', 'chimera_score',
                     )
                 }

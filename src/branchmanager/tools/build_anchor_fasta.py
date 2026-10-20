@@ -12,9 +12,9 @@ Output: src/branchmanager/data/reference_anchors.fasta
 
 Usage
 -----
-    python scripts/build_anchor_fasta.py
-    python scripts/build_anchor_fasta.py --out /path/to/custom_anchors.fasta
-    python scripts/build_anchor_fasta.py --email your@email.com   # recommended by NCBI
+    branchmanager build-anchors
+    branchmanager build-anchors --out /path/to/custom_anchors.fasta
+    branchmanager build-anchors --email your@email.com   # recommended by NCBI
 
 Why this set?
 -------------
@@ -214,31 +214,26 @@ def build_anchor_fasta(out_path: Path, email: str, skip_existing: bool = False):
 
 
 
-def main():
-    default_out = Path(__file__).resolve().parent.parent / "src" / "branchmanager" / "data" / "reference_anchors.fasta"
+DEFAULT_OUT = Path(__file__).resolve().parent.parent / "data" / "reference_anchors.fasta"
 
+
+def add_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--out", default=str(DEFAULT_OUT), metavar="PATH",
+                        help=f"Output FASTA path (default: {DEFAULT_OUT})")
+    parser.add_argument("--email", default="", metavar="EMAIL",
+                        help="Your email address - recommended by NCBI for E-utilities usage")
+    parser.add_argument("--force", action="store_true", help="Overwrite existing output file")
+
+
+def run_cli(args: argparse.Namespace) -> None:
+    build_anchor_fasta(Path(args.out), email=args.email, skip_existing=not args.force)
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Download NCBI RefSeq 16S sequences to use as BranchManager tree anchors."
-    )
-    parser.add_argument(
-        "--out", default=str(default_out), metavar="PATH",
-        help=f"Output FASTA path (default: {default_out})",
-    )
-    parser.add_argument(
-        "--email", default="", metavar="EMAIL",
-        help="Your email address - recommended by NCBI for E-utilities usage",
-    )
-    parser.add_argument(
-        "--force", action="store_true",
-        help="Overwrite existing output file",
-    )
-    args = parser.parse_args()
-
-    build_anchor_fasta(
-        Path(args.out),
-        email=args.email,
-        skip_existing=not args.force,
-    )
+        description="Download NCBI RefSeq 16S sequences to use as BranchManager tree anchors.")
+    add_arguments(parser)
+    run_cli(parser.parse_args())
 
 
 if __name__ == "__main__":

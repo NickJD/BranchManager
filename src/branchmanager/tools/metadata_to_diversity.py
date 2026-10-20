@@ -1,14 +1,21 @@
-import pandas as pd
 import argparse
 import re
 import sys
+
+def _pd():
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise SystemExit("This tool requires pandas and openpyxl (pip install pandas openpyxl).") from exc
+    return pd
+
 
 def extract_bracket_content(value):
     """
     Extracts text inside brackets [ ] or ( ).
     If no brackets are found, returns the original value.
     """
-    if pd.isna(value) or not isinstance(value, str):
+    if not isinstance(value, str):
         return value
 
     # Regex to find content inside () or []
@@ -18,6 +25,7 @@ def extract_bracket_content(value):
     return value
 
 def process_excel(input_file, output_file, literal_string, sheet_name=None, skiprows=4):
+    pd = _pd()
     try:
         # Define the specific column indices:
         # A=0, B=1, DJ=113, EG=136, DW=126, EK=140
@@ -67,17 +75,24 @@ def process_excel(input_file, output_file, literal_string, sheet_name=None, skip
         sys.exit(1)
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Convert specific columns from an Excel file to a TSV with a literal string insertion.")
-
+def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--input", required=True, help="Path to the source Excel file (.xlsx, .xlsm)")
     parser.add_argument("--output", required=True, help="Path to the output TSV file")
     parser.add_argument("--col3", required=True, help="The exact string to place in the 3rd column of the TSV")
     parser.add_argument("--sheet", default=None, help="Optional: Name of the sheet to process")
-    # Added skiprows as an optional argument so you can change it easily
     parser.add_argument("--skip", type=int, default=4, help="Number of header rows to skip at the top of the Excel file")
 
-    args = parser.parse_args()
 
+def run_cli(args: argparse.Namespace) -> None:
     process_excel(args.input, args.output, args.col3, args.sheet, skiprows=args.skip)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Convert specific columns from an Excel file to a TSV with a literal string insertion.")
+    add_arguments(parser)
+    run_cli(parser.parse_args())
+
+
+if __name__ == "__main__":
+    main()

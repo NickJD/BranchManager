@@ -41,7 +41,9 @@ def _strip_ab1_suffix(value: str | Path) -> str:
 
 
 def _normalise_supplier_id(value: str | Path) -> str:
-    stem = _strip_ab1_suffix(value).strip()
+    name = Path(str(value)).name
+    stem = _strip_ab1_suffix(name).strip() if name.lower().endswith(AB1_SUFFIXES) else name.strip()
+    stem = re.sub(r'\.\s+', '.', stem)
     return re.sub(
         r'[-_](?:f|r|forward|reverse)$', '', stem, flags=re.IGNORECASE,
     ).casefold()

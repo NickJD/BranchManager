@@ -113,19 +113,26 @@ def run(input_path: str, output_path: str, k_values: list[int], bootstrap: int =
             writer.writerow(output)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--input', required=True, help='TSV/CSV ranking and adjudication table.')
     parser.add_argument('--out', required=True, help='Output summary TSV.')
     parser.add_argument('--k', type=int, nargs='+', default=[1, 5, 10], help='Selection cutoffs to evaluate.')
     parser.add_argument('--bootstrap', type=int, default=2000, help='Case-level bootstrap replicates for 95%% percentile intervals (0 disables).')
     parser.add_argument('--seed', type=int, default=1, help='Bootstrap random seed.')
-    args = parser.parse_args()
+
+
+def run_cli(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if not args.k or min(args.k) < 1:
         parser.error('all --k values must be positive')
     if args.bootstrap < 0:
         parser.error('--bootstrap must be zero or greater')
     run(args.input, args.out, sorted(set(args.k)), bootstrap=args.bootstrap, seed=args.seed)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_arguments(parser)
+    run_cli(parser.parse_args(), parser)
 
 
 if __name__ == '__main__':

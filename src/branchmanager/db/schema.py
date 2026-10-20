@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS sequence_provenance (
     source_sequence_sha256 TEXT,
     source_read_ids TEXT,
     source_read_files TEXT,
+    source_read_checksums_json TEXT,
     marker_qc_class TEXT,
     marker_qc_recommendation TEXT,
     marker_qc_reasons TEXT,

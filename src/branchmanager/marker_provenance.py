@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -90,12 +91,19 @@ def load_marker_provenance(
     manifest = Path(input_fasta).resolve().parent / 'run_manifest.json'
     read_qc = Path(input_fasta).resolve().parent / 'read_qc.tsv'
     read_files_by_sequence: dict[str, list[str]] = {}
+    read_checksums_by_sequence: dict[str, dict[str, str]] = {}
     if read_qc.is_file():
         for row in _read_table(read_qc):
             sequence_id = row.get('sequenceid') or row.get('sequence_id') or ''
             source = row.get('sourcefile') or row.get('source_file') or ''
             if sequence_id and source:
                 read_files_by_sequence.setdefault(sequence_id, []).append(source)
+                source_path = Path(source).expanduser()
+                if source_path.is_file():
+                    try:
+                        read_checksums_by_sequence.setdefault(sequence_id, {})[source] = sha256_file(source_path)
+                    except OSError:
+                        pass
 
     records = []
     if resolved:
@@ -115,6 +123,9 @@ def load_marker_provenance(
                 'source_sequence_sha256': input_hash,
                 'source_read_ids': row.get('readids') or row.get('read_ids') or '',
                 'source_read_files': ';'.join(sorted(set(read_files_by_sequence.get(source_id, [])))),
+                'source_read_checksums_json': json.dumps(
+                    read_checksums_by_sequence.get(source_id, {}), sort_keys=True,
+                ),
                 'marker_qc_class': qc_class,
                 'marker_qc_recommendation': recommendation,
                 'marker_qc_reasons': reasons,
@@ -132,6 +143,7 @@ def load_marker_provenance(
                 'source_sequence_sha256': input_hash,
                 'source_read_ids': '',
                 'source_read_files': '',
+                'source_read_checksums_json': '{}',
                 'marker_qc_class': 'QUALITY_UNVERIFIED',
                 'marker_qc_recommendation': 'ACCEPTED_BY_USER' if accept_unverified else 'MANUAL_REVIEW',
                 'marker_qc_reasons': 'no_marker_qc_sidecar',
@@ -160,7 +172,7 @@ def write_marker_qc_bridge(path: str | Path, records: list[dict]) -> str:
     fields = [
         'sequence_id', 'marker_qc_class', 'marker_qc_recommendation', 'manual_review_status',
         'marker_qc_reasons', 'source_sequence_file', 'source_sequence_sha256',
-        'source_read_ids', 'source_read_files', 'source_manifest', 'chimera_call', 'chimera_score',
+        'source_read_ids', 'source_read_files', 'source_read_checksums_json', 'source_manifest', 'chimera_call', 'chimera_score',
     ]
     with open(output, 'w', newline='') as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', extrasaction='ignore')

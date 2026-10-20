@@ -29,7 +29,7 @@ from typing import Optional
 
 from branchmanager.taxonomy import parse_reference_header_taxonomy, reference_lookup_keys
 from branchmanager.taxonomy_io import iter_taxonomy_assignment_rows
-from branchmanager.utils.fasta import read_fasta
+from branchmanager.utils.fasta import read_fasta, write_fasta
 from branchmanager.utils.subprocess import run_cmd
 from branchmanager.pipeline.tree import is_ref_anchor
 
@@ -37,6 +37,23 @@ logger = logging.getLogger(__name__)
 
 
 VSEARCH_USERFIELDS = 'query+target+id+alnlen+mism+gaps+qlo+qhi+tlo+thi+ql+tl+qcov+tcov'
+
+
+def _vsearch_safe_query(input_fasta, outdir) -> tuple[str, dict[str, str]]:
+    """Write a copy of *input_fasta* with whitespace-free IDs.
+
+    vsearch truncates query labels at the first whitespace, which breaks IDs
+    such as 'JJ A11'. Returns the temp FASTA path and a safe-ID -> original-ID map.
+    """
+    safe_path = os.path.join(str(outdir), 'vsearch_query_safe.fasta')
+    id_map: dict[str, str] = {}
+    records = []
+    for i, (header, seq) in enumerate(read_fasta(input_fasta)):
+        safe = f'q{i}'
+        id_map[safe] = header
+        records.append((safe, seq))
+    write_fasta(records, safe_path)
+    return safe_path, id_map
 
 
 def _parse_vsearch_match(parts: list[str]) -> Optional[dict]:
@@ -466,8 +483,9 @@ def run_classification(
     matches_path = os.path.join(outdir, "matches.tsv")
     thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ""
 
+    safe_query, query_id_map = _vsearch_safe_query(input_fasta, outdir)
     cmd = (
-        f"vsearch --usearch_global {shlex.quote(str(input_fasta))}"
+        f"vsearch --usearch_global {shlex.quote(str(safe_query))}"
         f" --db {shlex.quote(str(ref_to_use))}"
         f" --id 0.8"
         f" --strand both"
@@ -501,7 +519,7 @@ def run_classification(
                 if not hit:
                     continue
                 # Keep highest identity hit (should only be one since maxhits=1)
-                qid = hit['query']
+                qid = query_id_map.get(hit['query'], hit['query'])
                 if qid not in best_hits or hit['identity'] > best_hits[qid]['identity']:
                     best_hits[qid] = hit
     except FileNotFoundError:
@@ -620,8 +638,9 @@ def run_classification_single(
 
     # Run vsearch
     thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ""
+    safe_query, query_id_map = _vsearch_safe_query(input_fasta, outdir)
     cmd = (
-        f"vsearch --usearch_global {shlex.quote(str(input_fasta))}"
+        f"vsearch --usearch_global {shlex.quote(str(safe_query))}"
         f" --db {shlex.quote(str(ref_to_use))}"
         f" --id 0.8"
         f" --strand both"
@@ -649,7 +668,7 @@ def run_classification_single(
                 hit = _parse_vsearch_match(parts)
                 if not hit:
                     continue
-                qid = hit['query']
+                qid = query_id_map.get(hit['query'], hit['query'])
                 if qid not in best_hits or hit['identity'] > best_hits[qid]['identity']:
                     best_hits[qid] = hit
     except FileNotFoundError:

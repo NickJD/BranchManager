@@ -964,7 +964,7 @@ Custom anchor headers must begin with `BRANCHMANAGER_REF_`:
 
 To refresh the bundled anchors from NCBI:
 ```bash
-python scripts/build_anchor_fasta.py --email your@institution.ac.uk
+branchmanager build-anchors --email your@institution.ac.uk
 ```
 
 ---
@@ -1053,10 +1053,10 @@ Required columns are `sequence_id` and `genome_id` or `accession`. Optional fiel
 
 ## Benchmarking recommendations
 
-Before using selection output as a scientific conclusion, benchmark it against independently adjudicated outcomes on held-out cohorts. The repository includes a schema and evaluator in [`examples/benchmark_labels.template.tsv`](examples/benchmark_labels.template.tsv) and [`scripts/benchmark_selection.py`](scripts/benchmark_selection.py). Include all eligible candidates for each case, label the predeclared outcome independently of BranchManager, and include competing methods under the same `case_id` values. Evaluate multiple selection budgets (`precision@k`, `recall@k`) and overall rank quality (`mean average precision`); report cohort-level results and uncertainty, not just pooled values.
+Before using selection output as a scientific conclusion, benchmark it against independently adjudicated outcomes on held-out cohorts. The repository includes a schema and evaluator in [`examples/benchmark_labels.template.tsv`](examples/benchmark_labels.template.tsv) and `branchmanager benchmark-selection`. Include all eligible candidates for each case, label the predeclared outcome independently of BranchManager, and include competing methods under the same `case_id` values. Evaluate multiple selection budgets (`precision@k`, `recall@k`) and overall rank quality (`mean average precision`); report cohort-level results and uncertainty, not just pooled values.
 
 ```bash
-python scripts/benchmark_selection.py --input adjudicated_rankings.tsv \
+branchmanager benchmark-selection --input adjudicated_rankings.tsv \
   --out benchmark_summary.tsv --k 1 5 10
 ```
 

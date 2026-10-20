@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -36,7 +37,59 @@ TRUE_VALUES = {'1', 'true', 'yes', 'y'}
 FALSE_VALUES = {'0', 'false', 'no', 'n'}
 
 
+def _read_xlsx_table(path: str | Path) -> list[dict[str, str]]:
+    """Read the data sheet of an .xlsx file; unpivot 'Filename of primer sequence (X)' layouts."""
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise SystemExit('Reading .xlsx metadata requires openpyxl (pip install openpyxl).') from exc
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        sheets = [list(sheet.iter_rows(values_only=True)) for sheet in workbook.worksheets]
+    finally:
+        workbook.close()
+
+    def cleaned(rows):
+        return [r for r in rows if any(c is not None and str(c).strip() for c in r)]
+
+    def is_data(rows):
+        return len(rows) > 1 and sum(c is not None for c in rows[0]) > 1
+
+    candidates = [cleaned(rows) for rows in sheets]
+    candidates = [rows for rows in candidates if is_data(rows)]
+    if not candidates:
+        return []
+    rows = candidates[0]
+    header = [' '.join(str(c).split()) if c is not None else '' for c in rows[0]]
+    primer_re = re.compile(r'^filename of primer sequence \(([^)]+)\)$', re.I)
+    primer_cols = {i: m.group(1).strip() for i, h in enumerate(header) if (m := primer_re.match(h))}
+    if primer_cols:
+        out = []
+        for row in rows[1:]:
+            isolate = '' if row[0] is None else str(row[0]).strip()
+            if not isolate or isolate.lower().startswith('ensure that'):
+                continue
+            for i, primer in primer_cols.items():
+                value = row[i] if i < len(row) else None
+                if value is not None and str(value).strip():
+                    out.append(_normalise_row({
+                        'sequence_id': isolate,
+                        'supplier_read_id': str(value).strip(),
+                        'primer': primer,
+                    }))
+        return out
+    return [
+        _normalise_row({
+            name: ('' if cell is None else str(cell))
+            for name, cell in zip(header, row) if name
+        })
+        for row in rows[1:]
+    ]
+
+
 def _read_table(path: str | Path) -> list[dict[str, str]]:
+    if str(path).lower().endswith(('.xlsx', '.xlsm')):
+        return _read_xlsx_table(path)
     with _open_text(path) as handle:
         sample = handle.read(4096)
         handle.seek(0)

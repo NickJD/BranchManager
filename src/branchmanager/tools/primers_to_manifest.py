@@ -1,9 +1,10 @@
-import pandas as pd
-import os
+import re
 import shutil
 import argparse
 import csv
 from pathlib import Path
+
+from branchmanager.tools.id_sanitation import build_id_map, find_id_issues, write_id_map, write_issue_report
 
 
 AB1_SUFFIXES = ('.ab1', '.abi', '.ab1.gz', '.abi.gz')
@@ -18,6 +19,11 @@ def _strip_ab1_suffix(value):
     return Path(name).stem
 
 
+def _squash(key):
+    """Casefold and drop spaces after dots ('JJ A1. 27f' == 'JJ A1.27f')."""
+    return re.sub(r'\.\s+', '.', str(key).strip()).casefold()
+
+
 def _build_source_index(source_dir):
     index = {}
     for child in source_dir.rglob('*'):
@@ -30,7 +36,7 @@ def _build_source_index(source_dir):
             stem.casefold(),
             Path(stem).name.casefold(),
         }
-        for key in keys:
+        for key in keys | {_squash(k) for k in keys}:
             if not key:
                 continue
             index.setdefault(key, []).append(child)
@@ -58,6 +64,7 @@ def _resolve_source_file(source_dir, value, source_index):
     for suffix in AB1_SUFFIXES:
         candidates.add(f"{stem}{suffix}".casefold())
 
+    candidates |= {_squash(c) for c in candidates}
     matches = []
     seen = set()
     for key in candidates:
@@ -70,7 +77,12 @@ def _resolve_source_file(source_dir, value, source_index):
     return sorted(matches)[0] if matches else None
 
 
-def process_files(input_excel, input_dir, output_dir, manifest_name):
+def process_files(input_excel, input_dir, output_dir, manifest_name, sanitise_ids=False):
+    try:
+        import pandas as pd
+    except ImportError:
+        print("Error: this tool requires pandas and openpyxl (pip install pandas openpyxl).")
+        return 1
     # Convert strings to Path objects
     input_path = Path(input_excel)
     source_dir = Path(input_dir)
@@ -157,9 +169,27 @@ def process_files(input_excel, input_dir, output_dir, manifest_name):
                     shutil.copy2(src_file, dest_file)
 
                     # Append to manifest list: [ID, filename, direction, clean_primer_name]
-                    manifest_data.append([sample_id, src_file.name, direction, primer_name])
+                    manifest_data.append([str(sample_id).strip(), src_file.name, direction, primer_name])
                 else:
                     print(f"Warning: File not found: {filename} (Sample: {sample_id})")
+
+        # ID sanitation: always report problems; rewrite IDs only with --sanitise-ids
+        ids = [row[0] for row in manifest_data]
+        issues = find_id_issues(ids)
+        report_path = dest_dir / 'id_sanitation_report.tsv'
+        if issues:
+            write_issue_report(issues, report_path)
+            print(f"Warning: {len({i['id'] for i in issues})} unsafe/colliding sequence ID(s); see {report_path}")
+            if sanitise_ids:
+                id_map = build_id_map(ids)
+                write_id_map(id_map, dest_dir / 'id_map.tsv')
+                for row in manifest_data:
+                    row[0] = id_map[row[0]]
+                print(f"Sequence IDs sanitised; original->new map: {dest_dir / 'id_map.tsv'}")
+            else:
+                print("Re-run with --sanitise-ids to rewrite them (IDs with spaces break vsearch/Newick).")
+        elif report_path.exists():
+            report_path.unlink()
 
         # Write the manifest file as a true CSV (comma delimited)
         with open(manifest_path, mode='w', newline='', encoding='utf-8') as m_file:
@@ -174,18 +204,25 @@ def process_files(input_excel, input_dir, output_dir, manifest_name):
         print(f"An error occurred: {e}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Process .ab1 files based on 'Primer file mapping' Excel sheet.")
-
+def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-i", "--input", required=True, help="Path to the Excel (.xlsx) file")
     parser.add_argument("-s", "--source", required=True, help="Directory containing the source .ab1 files")
     parser.add_argument("-o", "--output", required=True, help="Directory to copy processed files to")
     parser.add_argument("-m", "--manifest", default="manifest.csv",
                         help="Name of the output manifest (default: manifest.csv)")
+    parser.add_argument("--sanitise-ids", "--sanitize-ids", dest="sanitise_ids", action="store_true",
+                        help="Rewrite unsafe sequence IDs (spaces, punctuation, non-ASCII) and write id_map.tsv. "
+                             "Without this flag unsafe IDs are only reported.")
 
-    args = parser.parse_args()
 
-    process_files(args.input, args.source, args.output, args.manifest)
+def run_cli(args: argparse.Namespace):
+    return process_files(args.input, args.source, args.output, args.manifest, sanitise_ids=args.sanitise_ids)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Process .ab1 files based on 'Primer file mapping' Excel sheet.")
+    add_arguments(parser)
+    run_cli(parser.parse_args())
 
 
 if __name__ == "__main__":

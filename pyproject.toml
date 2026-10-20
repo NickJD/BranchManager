@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "BranchManager"
-version = "0.1.2"
+version = "0.1.4"
 authors = [
     {name = "Nicholas Dimonaco", email = "nicholas@dimonaco.co.uk"}
 ]
@@ -19,7 +19,9 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "matplotlib>=3.10.8"
+    "matplotlib>=3.10.8",
+    "pandas",
+    "openpyxl>=3.1",
 ]
 
 [project.urls]

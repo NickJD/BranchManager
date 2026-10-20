@@ -61,7 +61,7 @@ from branchmanager.pipeline.workflow_helpers import (
 )
 from branchmanager.taxonomy import canonicalise_sequence_id, normalise_domain_query, taxonomy_matches_kingdom
 from branchmanager.partner_metadata import load_partner_sequencing_metadata
-from branchmanager.run_manifest import RunManifest, utc_now
+from branchmanager.run_manifest import RunManifest, utc_now, sha256_file
 from branchmanager.project_config import (
     apply_project_config_defaults, config_path_from_argv, load_project_config,
 )
@@ -1924,6 +1924,24 @@ def _cmd_performance_review_impl(args):
     orig_to_short = {}
     mapped_records = []
     skipped_existing = 0
+    resequencing_decisions = []
+    provenance_for_replacements = {}
+    declined_resequencing_ids = set()
+
+    def _incoming_ab1_files(sequence_id):
+        """Find raw-read paths recorded alongside the incoming marker FASTA."""
+        from branchmanager.marker_provenance import _read_table
+        files = set()
+        input_parent = Path(args.input).expanduser().resolve().parent
+        for read_qc in (input_parent / 'read_qc.tsv', Path(outdir) / 'read_qc.tsv'):
+            if not read_qc.is_file():
+                continue
+            for row in _read_table(read_qc):
+                row_id = row.get('sequenceid') or row.get('sequence_id') or ''
+                source = row.get('sourcefile') or row.get('source_file') or ''
+                if row_id == sequence_id and source and Path(source).suffix.lower() in {'.ab1', '.abi'}:
+                    files.add(str(Path(source).expanduser()))
+        return sorted(files)
 
     # If the user requested a kingdom filter, classify the QC-passing input
     # before insertion so only sequences assigned to that domain are retained.
@@ -1966,7 +1984,85 @@ def _cmd_performance_review_impl(args):
             try:
                 db.assert_sequence_compatible(existing_id, s)
             except ValueError as e:
-                raise SystemExit(f'[DB] {e}')
+                incoming_files = _incoming_ab1_files(existing_id)
+                print(f'[DB] {e}')
+                if incoming_files:
+                    print(f'[DB] Incoming AB1 files for {existing_id}:')
+                    for incoming_file in incoming_files:
+                        print(f'  {incoming_file}')
+                else:
+                    print(f'[DB] No AB1 paths were found in read_qc.tsv for {existing_id}.')
+                try:
+                    response = input(f'Treat this as a resequenced marker and re-examine isolate {existing_id}? [y/N] ').strip().lower()
+                except EOFError:
+                    response = ''
+                approved = response in {'y', 'yes'}
+                resequencing_decisions.append({
+                    'sequence_id': existing_id,
+                    'incoming_ab1_files': ';'.join(incoming_files),
+                    'decision': 'YES' if approved else 'NO',
+                    'detail': str(e),
+                })
+                if approved:
+                    from branchmanager.marker_provenance import load_marker_provenance
+                    if existing_id not in provenance_for_replacements:
+                        replacement_provenance, _qc_source = load_marker_provenance(
+                            args.input,
+                            qc_path=getattr(args, 'marker_qc', None),
+                            id_map={h: existing_id},
+                            accept_unverified=bool(getattr(args, 'accept_unverified_marker_qc', False)),
+                        )
+                        provenance_for_replacements[existing_id] = next(
+                            (row for row in replacement_provenance if row.get('sequence_id') == existing_id),
+                            {'sequence_id': existing_id},
+                        )
+                    provenance_row = provenance_for_replacements[existing_id]
+                    if (str(provenance_row.get('marker_qc_class') or '').upper() != 'PASS_HIGH_CONFIDENCE'
+                            and str(provenance_row.get('manual_review_status') or '').upper() != 'APPROVED'):
+                        raise SystemExit(
+                            f'[DB] Resequencing of {existing_id} was approved, but the incoming marker does not '
+                            'have PASS_HIGH_CONFIDENCE QC or an approved manual marker review. Review the AB1 '
+                            'reads and marker-QC report, then rerun Performance Review.'
+                        )
+                    replacement = {**provenance_row, 'sequence_id': existing_id, 'sequence': s}
+                    result = db.replace_selected_markers(
+                        [replacement], source_manifest=str(Path(outdir) / 'run_manifest.json'),
+                        source_fasta=str(args.input), allow_unselected=True,
+                    )[0]
+                    if result.get('status') != 'REPLACED':
+                        raise SystemExit(
+                            f'[DB] Cannot re-examine {existing_id} as a resequenced isolate: '
+                            f"{result.get('detail') or result.get('status')}"
+                        )
+                    provenance_for_replacements[existing_id] = replacement
+                    db.upsert_sequence_provenance([replacement])
+                    db.update_isolate_status(
+                        existing_id, 'MARKER_REPLACED', detail=result.get('detail', ''),
+                        source_file=str(args.input),
+                    )
+                    mapped_records.append((existing_id, s))
+                    short = existing_id
+                else:
+                    short = existing_id
+                    declined_resequencing_ids.add(existing_id)
+                    with db.connect() as conn:
+                        existing_row = conn.execute(
+                            'SELECT sequence FROM sequences WHERE id=?', (existing_id,),
+                        ).fetchone()
+                    existing = existing_row[0] if existing_row else None
+                    if existing:
+                        mapped_records.append((short, existing))
+                    else:
+                        raise SystemExit(f'[DB] Existing sequence {existing_id!r} could not be loaded after declining resequencing.')
+                orig_to_short[h] = short
+                try:
+                    cid = canonicalise_sequence_id(h)
+                    if cid:
+                        orig_to_short[cid] = short
+                except Exception:
+                    pass
+                skipped_existing += 1
+                continue
             skipped_existing += 1
             short = existing_id
             orig_to_short[h] = short
@@ -1998,6 +2094,14 @@ def _cmd_performance_review_impl(args):
     if skipped_existing:
         logging.getLogger(__name__).info("[DB] Found %d sequences already in DB; keeping them for tree inclusion", skipped_existing)
     write_fasta(mapped_records, str(current_dataset_fasta))
+    if resequencing_decisions:
+        decision_path = Path(outdir) / 'resequencing_conflicts.tsv'
+        with open(decision_path, 'w', newline='') as handle:
+            writer = csv.DictWriter(
+                handle, fieldnames=['sequence_id', 'incoming_ab1_files', 'decision', 'detail'], delimiter='\t',
+            )
+            writer.writeheader(); writer.writerows(resequencing_decisions)
+        logging.getLogger(__name__).info('[DB] Resequencing decisions written to %s', decision_path)
     logging.getLogger(__name__).info("[DB] Mapped %d user sequence IDs to runtime IDs and wrote %s", len(mapped_records), current_dataset_fasta)
     if not mapped_records:
         raise SystemExit(
@@ -2043,6 +2147,15 @@ def _cmd_performance_review_impl(args):
         marker_provenance = [
             row for row in marker_provenance if row.get('sequence_id') in mapped_id_set
         ]
+        if declined_resequencing_ids:
+            prior_provenance = db.get_sequence_provenance(declined_resequencing_ids)
+            marker_provenance = [
+                prior_provenance[row['sequence_id']]
+                if row['sequence_id'] in declined_resequencing_ids and row['sequence_id'] in prior_provenance
+                else row
+                for row in marker_provenance
+                if row['sequence_id'] not in declined_resequencing_ids or row['sequence_id'] in prior_provenance
+            ]
         db.upsert_sequence_provenance(marker_provenance)
         marker_bridge_path = write_marker_qc_bridge(
             Path(outdir) / 'marker_qc_provenance.tsv', marker_provenance,
@@ -4113,6 +4226,27 @@ def build_parser():
     replacement_parser.add_argument('-o', '--out', required=True,
         help='Output directory for Sanger QC, replacement audit, and replacement FASTA.')
 
+    from branchmanager.tools import (
+        benchmark_selection as _tool_benchmark, build_anchor_fasta as _tool_anchors,
+        id_sanitation as _tool_ids, metadata_to_diversity as _tool_diversity,
+        primers_to_manifest as _tool_manifest,
+    )
+    for _name, _module, _help in (
+        ('primers-to-manifest', _tool_manifest,
+         "Tool: convert a partner 'Primer file mapping' Excel sheet into an AB1 manifest.csv (with ID sanitation)."),
+        ('metadata-to-diversity', _tool_diversity,
+         'Tool: extract diversity-metadata columns from a partner Excel template into a TSV.'),
+        ('benchmark-selection', _tool_benchmark,
+         'Tool: benchmark isolate rankings against adjudicated labels (precision@k, recall@k, MAP).'),
+        ('build-anchors', _tool_anchors,
+         'Tool: download NCBI RefSeq 16S tree-anchor sequences into reference_anchors.fasta.'),
+        ('check-ids', _tool_ids,
+         'Tool: check (and optionally sanitise) sequence/isolate IDs in a CSV/TSV table or FASTA.'),
+    ):
+        _tool_parser = sub.add_parser(_name, help=_help, description=_help, formatter_class=_Fmt)
+        _module.add_arguments(_tool_parser)
+        _tool_parser.set_defaults(_tool=_module, _tool_parser=_tool_parser)
+
     mailroom_parser = sub.add_parser(
         'mailroom',
         help='Mailroom: validate a Sanger or PacBio partner delivery and build its batch map.',
@@ -4959,9 +5093,87 @@ def cmd_replace_selected_markers(args):
             raise SystemExit('[replace-selected-markers] --primer-sequence requires a name and at least 12 bases.')
         primer_sequences[name.strip().upper()] = sequence
     try:
+        primers = args.primers or _paper_trail_module.DEFAULT_PRIMERS
+        db = Database(args.db)
+        db.initialise()
+        read_meta, listed_files = _paper_trail_module._load_sample_map(args.sample_map, primers)
+        previous = db.get_sequence_provenance()
+        candidate_files = {}
+        for path in listed_files:
+            path = Path(path).expanduser().resolve()
+            if path.suffix.lower() not in {'.ab1', '.abi'}:
+                continue
+            entry = next((read_meta.get(key) for key in _paper_trail_module._metadata_key_variants(path)
+                          if read_meta.get(key)), {})
+            sequence_id = str(entry.get('sequence_id') or '').strip()
+            if sequence_id:
+                candidate_files.setdefault(sequence_id, []).append((path, entry))
+
+        changed = {}
+        for sequence_id, files in candidate_files.items():
+            old = previous.get(sequence_id, {})
+            old_paths = set()
+            for value in str(old.get('source_read_files') or '').split(';'):
+                if value.strip():
+                    try:
+                        old_paths.add(str(Path(value.strip()).expanduser().resolve()))
+                    except OSError:
+                        old_paths.add(value.strip())
+            try:
+                old_hashes = json.loads(old.get('source_read_checksums_json') or '{}')
+            except (TypeError, json.JSONDecodeError):
+                old_hashes = {}
+            for path, _entry in files:
+                path_text = str(path)
+                current_hash = sha256_file(path) if path.is_file() else ''
+                old_hash = old_hashes.get(path_text) or old_hashes.get(path.name) or ''
+                if not old_hash:
+                    old_hash = next((value for old_path, value in old_hashes.items()
+                                     if str(Path(old_path).expanduser().resolve()) == path_text), '')
+                if path_text not in old_paths or (old_hash and current_hash and old_hash != current_hash) or (path_text in old_paths and not old_hash):
+                    changed.setdefault(sequence_id, []).append((path, current_hash, 'new path' if path_text not in old_paths else ('content changed' if old_hash else 'legacy provenance; content not fingerprinted')))
+
+        review_path = root / 'resequencing_file_review.tsv'
+        reviewed_map = root / 'reviewed_replacement_sample_map.csv'
+        accepted = set()
+        review_rows = []
+        print('[replace-selected-markers] Incoming AB1 files requiring review:')
+        for sequence_id in sorted(changed):
+            print(f'  {sequence_id}')
+            for path, _fingerprint, reason in changed[sequence_id]:
+                print(f'    {path} ({reason})')
+            try:
+                response = input(f'Re-examine isolate {sequence_id}? [y/N] ').strip().lower()
+            except EOFError:
+                response = ''
+            answer = response in {'y', 'yes'}
+            for path, fingerprint, reason in changed[sequence_id]:
+                review_rows.append({'sequence_id': sequence_id, 'file': str(path), 'sha256': fingerprint,
+                                    'change': reason, 'decision': 'YES' if answer else 'NO'})
+            if answer:
+                accepted.add(sequence_id)
+
+        root.mkdir(parents=True, exist_ok=True)
+        with open(review_path, 'w', newline='') as handle:
+            writer = csv.DictWriter(handle, fieldnames=['sequence_id', 'file', 'sha256', 'change', 'decision'], delimiter='\t')
+            writer.writeheader(); writer.writerows(review_rows)
+        with open(reviewed_map, 'w', newline='') as handle:
+            writer = csv.DictWriter(handle, fieldnames=['sequence_id', 'primer', 'direction', 'ab1_file'])
+            writer.writeheader()
+            for sequence_id in sorted(accepted):
+                for path, entry in candidate_files[sequence_id]:
+                    writer.writerow({'sequence_id': sequence_id, 'primer': entry.get('primer', ''),
+                                     'direction': entry.get('direction', ''), 'ab1_file': str(path)})
+        manifest.add_output(review_path, role='resequencing_file_review')
+        manifest.add_output(reviewed_map, role='reviewed_replacement_sample_map')
+        if not accepted:
+            manifest.add_stage('resequencing_review', 'COMPLETE', detail='No isolates approved for re-examination')
+            manifest.finish('COMPLETE')
+            print(f'[replace-selected-markers] No isolates selected for re-examination. Review: {review_path}')
+            return
         qc_outputs = _paper_trail_module.run_paper_trail(
-            [], sanger_out, sample_map=args.sample_map,
-            primers=args.primers or _paper_trail_module.DEFAULT_PRIMERS,
+            [], sanger_out, sample_map=str(reviewed_map),
+            primers=primers,
             primer_sequences=primer_sequences, min_length=1300,
             min_read_length=policy.min_read_length, min_quality=policy.min_quality,
             min_mean_quality=policy.min_mean_quality, mask_quality=policy.mask_quality,
@@ -4995,8 +5207,6 @@ def cmd_replace_selected_markers(args):
                 })
                 continue
             eligible.append({**row, 'sequence': sequence_by_id[sequence_id]})
-        db = Database(args.db)
-        db.initialise()
         applied = db.replace_selected_markers(
             eligible, source_manifest=str(root / 'run_manifest.json'), source_fasta=str(assembled),
         )
@@ -5030,6 +5240,7 @@ def cmd_replace_selected_markers(args):
             (qc_outputs['assembly_tsv'], 'sanger_assembly_report'),
             (report_path, 'marker_replacement_report'), (replacement_fasta, 'replaced_markers'),
             (provenance_path, 'marker_qc_provenance'),
+            (review_path, 'resequencing_file_review'), (reviewed_map, 'reviewed_replacement_sample_map'),
         ):
             manifest.add_output(path, role=role)
         manifest.add_stage('paper_trail', 'COMPLETE', detail='1300 bp Sanger replacement QC')
@@ -5831,6 +6042,16 @@ def main(argv=None):
         cmd_it_desk(args)
     elif args.command == 'assistant':
         cmd_assistant(args)
+    elif getattr(args, '_tool', None) is not None:
+        tool = args._tool
+        if tool.__name__.endswith('id_sanitation'):
+            sys.exit(tool.run(args))
+        elif tool.__name__.endswith('benchmark_selection'):
+            tool.run_cli(args, args._tool_parser)
+        else:
+            result = tool.run_cli(args)
+            if isinstance(result, int) and result:
+                sys.exit(result)
     else:
         parser.print_help()
 
