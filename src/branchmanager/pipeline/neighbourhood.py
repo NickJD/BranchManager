@@ -228,7 +228,10 @@ def _baseline_dataset_names(rows: List[dict]) -> set[str]:
     for row in rows:
         source = str(row.get('density_source') or '')
         prefix = source.split(':', 1)[0]
-        if prefix not in {'baseline', 'cultured_rumen', 'hungate_baseline', 'secondary_baseline'}:
+        if prefix not in {
+            'baseline', 'cultured_project', 'cultured_rumen',
+            'hungate_baseline', 'secondary_baseline',
+        }:
             continue
         for name in source.split(':', 1)[1].split(','):
             if name.strip():
@@ -272,6 +275,13 @@ def _load_metadata(db, leaf_names: List[str], assessment_rows: List[dict]) -> Di
                 })
         except Exception as exc:
             logger.warning('[NEIGHBOURHOOD] Could not load genome-availability metadata: %s', exc)
+        try:
+            failed_replacements = db.get_unresolved_marker_replacement_failures(leaf_names)
+            for sid, attempt in failed_replacements.items():
+                metadata.setdefault(str(sid), {})['marker_replacement_failed'] = True
+                metadata[str(sid)]['marker_replacement_detail'] = attempt.get('detail') or ''
+        except Exception as exc:
+            logger.warning('[NEIGHBOURHOOD] Could not load marker replacement history: %s', exc)
 
     for row in assessment_rows:
         sid = str(row.get('id') or '')
@@ -378,7 +388,7 @@ def _baseline_context_for_group(group: dict, leaf_map: Dict[str, _Node]) -> Dict
     hit_specs = (
         ('priority', 'hungate_nearest_hit', 'hungate_nearest_identity'),
         ('secondary', 'secondary_baseline_nearest_hit', 'secondary_baseline_nearest_identity'),
-        ('cultured_rumen', 'nearest_hit', 'nearest_identity'),
+        ('cultured_project', 'nearest_hit', 'nearest_identity'),
     )
     for target in group['targets']:
         row = target['row']
@@ -391,7 +401,7 @@ def _baseline_context_for_group(group: dict, leaf_map: Dict[str, _Node]) -> Dict
             except (TypeError, ValueError):
                 identity = None
             entry = context.setdefault(hit, {'identity': identity, 'queries': [], 'tier': tier})
-            if entry.get('tier') == 'cultured_rumen' and tier in {'priority', 'secondary'}:
+            if entry.get('tier') == 'cultured_project' and tier in {'priority', 'secondary'}:
                 entry['tier'] = tier
             if identity is not None and (entry.get('identity') is None or identity > entry['identity']):
                 entry['identity'] = identity
@@ -659,7 +669,7 @@ def _write_group_png(
     draw.text((px(1003), px(73)), 'backup', fill='#25313d', font=label_font)
     draw.text(
         (px(28), px(101)),
-        'Selection labels: [P#] primary; [B#] backup; [D#] post-target diversity; boundary review/exclusion shown in labels',
+        'Selection labels: [P#] primary; [B#] backup; [D#] post-target diversity; red triangle = resequencing QC failed, old marker retained',
         fill='#4d5966', font=small_font,
     )
     identity_text = (
@@ -721,6 +731,12 @@ def _write_group_png(
             draw.polygon(
                 [(px(px_x), px(px_y)) for px_x, px_y in _star_points(x + 13.0, y)],
                 fill='#ffffff', outline='#8e24aa',
+            )
+        if meta.get('marker_replacement_failed'):
+            marker_x = x + 23.0
+            draw.polygon(
+                [(px(marker_x), px(y - 6)), (px(marker_x + 6), px(y + 5)), (px(marker_x - 6), px(y + 5))],
+                fill='#d32f2f', outline='#8e0000',
             )
         draw.text(
             (px(label_x), px(y - 8)),

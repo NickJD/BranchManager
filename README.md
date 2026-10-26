@@ -93,17 +93,45 @@ BranchManager replaces subjective manual picking with a transparent, evidence-ba
 
 ### Collection profiles
 
-Use a JSON project profile to keep collection-specific names, reference databases, baseline datasets, anchor FASTA, domain, and selection policy together. A profile supplies defaults; an explicit command-line option always takes precedence. Copy [`configs/project.template.json`](configs/project.template.json) and edit it for a collection. Environment substitutions use `${NAME}` or `${NAME:-fallback}`, allowing local paths to stay out of shared configuration files. Relative data paths are resolved from the profile's directory.
+Use a JSON project profile to keep collection-specific names, reference databases, baseline datasets, anchor FASTA, domain, and selection policy together. A profile supplies defaults; an explicit command-line option always takes precedence. Copy [`configs/project.template.json`](configs/project.template.json) and edit it for a collection. Set the optional top-level `project_directory` to the working directory for that project; relative data and CLI-default paths are resolved from there. If omitted, paths remain relative to the profile file's directory. Environment substitutions use `${NAME}` or `${NAME:-fallback}`, allowing local paths to stay out of shared configuration files.
 
-The checked-in [`configs/rumen_gateway.json`](configs/rumen_gateway.json) records the current Rumen Gateway assumptions: GTDB r232 primary taxonomy, Greengenes2 2024.09 cross-check, Hungate priority baseline, Rumen Gateway MWL, nine-genome target, current redundancy/extension thresholds, and the bundled Rumen Gateway-era anchor set. Its historical external paths can be overridden with the `RGW_*` environment variables shown in that file, or directly on the command line. For example:
+For an Assistant-only setup, copy [`configs/assistant.template.json`](configs/assistant.template.json). It puts the commonly reused database, partner metadata, marker reference(s), baselines, MWL, anchors, and workflow defaults under `defaults.assistant`. Then a batch run only needs its read map (or FASTA/PacBio map), dataset name, and output directory:
+
+```bash
+branchmanager assistant --config configs/my_collection_assistant.json \
+  --sample-map batch_map.tsv --dataset Collection_01 -o runs/Collection_01
+```
+
+CLI flags can still override any configured default. Keep the per-batch input and dataset on the command line so each run remains explicit. The broader `project.template.json` remains available for collections that also want defaults for other BranchManager commands.
+
+In Assistant profiles, list each cross-check reference as one object in `defaults.assistant.alt_databases`, with `name`, `ref`, and optional `taxa` (use `null` when taxonomy is embedded in the FASTA headers). This keeps each taxonomy table attached to its reference and display name. Do not combine `alt_databases` with the older parallel `alt_ref`, `alt_taxa`, and `alt_ref_name` lists in the same Assistant profile.
+
+The checked-in [`configs/rumen_gateway.json`](configs/rumen_gateway.json) is the Rumen Gateway project profile. It holds the project database and partner catalogue paths, GTDB r232 plus GG2/NCBI/SILVA cross-check databases, the Hungate priority baseline and the Rumen Gateway `Secondary` baseline, the MWL, and selection defaults. Paths resolve relative to the configured Rumen Gateway `project_directory`. It omits a custom anchor path so BranchManager uses its bundled 26-sequence rumen/gut anchors by default. Use the profile once with Filing Cabinet to initialize both baselines, then with Assistant for each partner batch:
 
 ```bash
 branchmanager assistant --config configs/rumen_gateway.json \
-  --sample-map batch_map.tsv --db project.sqlite --dataset Collection_01 \
-  --partner-id LAB_A -o runs/Collection_01
+  --sample-map batch_map.tsv --dataset QUB_01 -o runs/QUB_01
 ```
 
-The profile's `project` object is collection metadata and is copied into run manifests; `data` documents relevant files; `defaults` maps command names to CLI argument names. Each run manifest records the profile file checksum. Additional columns in the partner ledger are retained per isolate in the database's `sequencing_metadata.project_metadata_json` field, while BranchManager interprets its standard ID, partner, selection, and genome-availability columns. The Rumen Gateway anchor set is a profile default and should be replaced with vetted, domain-appropriate anchors for other collections. See [collection profiles and scope](docs/collection-profiles-and-validation.md) before interpreting results from a new marker/domain.
+The profile does not contain a batch's sample map, dataset label, or output directory. Supply those per run; command-line values override configured defaults. The `baselines` list is used by the Filing Cabinet command and is what registers the priority and secondary sequence pools in the project database.
+
+When several partner mailrooms and metadata workbooks are ready, run one joint assessment with an Assistant cohort manifest. Mailroom remains a per-partner operation. The manifest is a CSV or TSV with one row per partner batch; paths are relative to the manifest file unless absolute. `partner_workbook` is optional when that workbook has already been imported. Each batch is validated and marker-QC'd separately, then all passing markers are assessed together in one selection run, so partner order does not affect the candidate pool. QC failures are retained as markerless isolates and reported for later replacement.
+
+```tsv
+partner_id	dataset	sample_map	read_dir	partner_workbook
+QUB	QUB_01	mailroom/QUB_01/ab1_map.tsv	reads/QUB_01	metadata/QUB_01.xlsm
+UoG	UoG_02	mailroom/UoG_02/ab1_map.tsv	reads/UoG_02	metadata/UoG_02.xlsm
+```
+
+```bash
+branchmanager assistant --config configs/rumen_gateway.json \
+  --cohort-manifest cohort.tsv --dataset RGW_COHORT_2026_10 \
+  -o runs/RGW_COHORT_2026_10
+```
+
+The configured `--partner-metadata` remains the cumulative isolate catalogue used to validate ownership and prior sequencing commitments. Per-partner workbook rows in the manifest add workbook metadata to the project database before assessment. Give each partner batch a unique dataset label. The cohort run writes per-batch onboarding and Paper Trail reports under `00_cohort_preparation/`, and the single combined selection report under `01_joint_assistant/`.
+
+The profile's `project` object is collection metadata and is copied into run manifests; `data` documents relevant files and, for Assistant, supplies run defaults for `database`, `dataset`, `sample_map`, and `output_directory`; `defaults` maps command names to CLI argument names. Explicit CLI values override profile defaults. Each run manifest records the profile file checksum. Additional columns in the partner ledger are retained per isolate in the database's `sequencing_metadata.project_metadata_json` field, while BranchManager interprets its standard ID, partner, selection, and genome-availability columns. The bundled rumen/gut anchor set is used unless a project config or command-line option supplies a custom set; projects outside that biological scope should configure vetted, domain-appropriate anchors. See [collection profiles and scope](docs/collection-profiles-and-validation.md) before interpreting results from a new marker/domain.
 
 Profiles can declare multiple baselines under `baselines`, each with a unique `dataset`, `fasta`, `tier` (`priority` or `secondary`), and optional `taxonomy_assignments` or `classify`. A single Filing Cabinet invocation loads each baseline into its own dataset and tier, then builds one combined backbone from the available marker sequences:
 
@@ -184,7 +212,7 @@ The phylogenetic tree is built from three independent layers:
 
 | Layer | Source | Shown in iTOL? |
 |---|---|---|
-| 1 — Anchors | 26 NCBI RefSeq anchor sequences (bundled) | **No** — invisible topology scaffolding |
+| 1 — Anchors | 26 bundled NCBI RefSeq rumen/gut anchor sequences, unless a custom `--anchors` FASTA is supplied | **No** — invisible topology scaffolding |
 | 2 — Filing Cabinet | Your cultured baseline dataset (e.g. Hungate) | Yes |
 | 3 — Performance Review | Each new partner marker batch | Yes |
 
@@ -316,7 +344,7 @@ Do not supply the blank review template to Assistant. Add decisions only for the
 
 ### `branchmanager onboarding`
 
-Every partner dataset is onboarded from exactly one marker source. AB1 submissions use a sample map; FASTA-only submissions use the FASTA directly. Both paths validate sequence IDs against the same cumulative project metadata ledger.
+Every partner dataset is onboarded from exactly one marker source. AB1 submissions use a sample map; FASTA-only submissions use the FASTA directly. Both paths validate sequence IDs against the same cumulative project metadata ledger. The ledger can also record `addition_method` as `marker_sequence`, `maldi_tof`, or `both`; leave it blank when unknown. MALDI-only isolates retain a stable isolate ID and an empty marker slot, so a passing marker sequence can be attached to that same ID in a later batch. A failed marker submission remains as a markerless QC-failed record without classifier taxonomy when no accepted marker exists. If an accepted marker already exists, a failed replacement attempt is recorded while the accepted marker and assignment are retained.
 
 ```bash
 # AB1 or multiple primer reads
@@ -720,7 +748,7 @@ A species represented by one baseline genome therefore starts at `1/9`, leaving 
 | `current_tree.nwk` | Backbone phylogenetic tree (newick, nodes labelled `NODE####`) |
 | `current_alignment.fasta` | Full multiple sequence alignment (includes anchor sequences) |
 | `filing_cabinet_combined_taxonomy.tsv` | ID → taxonomy → confidence for all registered baseline sequences |
-| `taxonomy.tsv` | Raw classifier output (ID, best-hit, identity, taxonomy, confidence) |
+| `taxonomy.tsv` | Raw classifier output; hit, identity, taxonomy, confidence, and alignment metric headers include the reference database name (for example, `BestHit_GTDB_r232`). |
 | `itol_phylum_colours.itol` | iTOL colour strip by phylum |
 | `itol_family_colours.itol` | iTOL colour strip by family |
 | `itol_genus_colours.itol` | iTOL colour strip by genus |
@@ -751,7 +779,7 @@ A species represented by one baseline genome therefore starts at `1/9`, leaving 
 | `baseline/baseline_hits.tsv` | Nearest-hit report against Hungate or other provided baseline datasets |
 | `baseline/nearest_baseline_hits_raw.tsv` | Raw nearest-hit output used for baseline novelty scoring |
 | `taxonomy/<DB>.tsv` | Taxonomic assignment report for each reference database, e.g. `taxonomy/GTDB.tsv`, `taxonomy/GG2.tsv` |
-| `taxonomy/all_databases.tsv` | Multi-database assignment summary |
+| `taxonomy/all_databases.tsv` | Multi-database assignment summary; every database, including GTDB, has database-suffixed hit, identity, taxonomy, confidence, and alignment metric columns. |
 | `taxonomy/tree_taxonomy.tsv` | ID → taxonomy → confidence table used for tree/iTOL metadata |
 | `tree/current_tree.nwk` | Cumulative project-context tree incorporating baseline, prior partner datasets, and the current dataset |
 | `tree/current_alignment.fasta` | Cumulative MSA used to build the project-context tree |
@@ -886,6 +914,7 @@ Quarterly Review is marker-gene decision support. Once genomes are available, st
 - A sequence ID column such as `sequence_id`, `isolate_id`, `sample_id`, or `ID`. Values may match IDs in the current FASTA or partner isolates already stored in the same project SQLite database.
 - A partner acronym column such as `partner_id`, `partner`, or `partner_acronym`, with values like `QUB` or `UoG`.
 - An optional selection-commitment column such as `selected_for_genome_sequencing`. Use `yes` after the project has actually committed that isolate to sequencing.
+- An optional `addition_method` column: `marker_sequence`, `maldi_tof`, or `both`. Blank means unknown. This records how the isolate entered the catalogue; it does not itself grant a taxonomic assignment. MALDI-only isolates can receive a marker sequence later under the same durable `sequence_id`.
 - An already-sequenced/genome-available column such as `already_sequenced`, `genome_available`, or `genome_sequenced`. This column is required and must be explicit `yes` or `no`.
 
 Example:
@@ -896,6 +925,8 @@ Iso001	QUB	yes	no
 Iso002	UoG	yes	yes
 Iso003	UoG	no	no
 ```
+
+For example, set `addition_method` to `maldi_tof` for an isolate first added from MALDI-TOF. When a marker is added later, update it to `marker_sequence` or `both` as appropriate. If marker QC fails and no previously accepted marker exists, BranchManager keeps the isolate without classifier taxonomy; a later passing marker submission can fill its marker slot.
 
 Set `selected_for_genome_sequencing=yes` only after the advisory/project decision has been made. It reserves that isolate in rolling pangenome commitments but does not put it in the nearest-genome comparison pool. Set `already_sequenced=yes` only when a usable genome is genuinely available; that state does enter WGS coverage and nearest-genome calculations. `PRIMARY` and `BACKUP` are BranchManager recommendations and do not update either factual state automatically.
 
@@ -920,7 +951,7 @@ When IDs are shortened, BranchManager writes an ID map under `ids/`. When IDs ar
 
 Anchor sequences are **invisible scaffolding** constraining phylum-level topology during tree construction. They are pruned from the stored newick after each build and never appear in outputs, iTOL files, or novelty scoring.
 
-The bundled anchor set (`src/branchmanager/data/reference_anchors.fasta`) contains 26 NCBI RefSeq 16S sequences covering major gut/rumen phyla. A companion metadata table (`src/branchmanager/data/reference_anchors.tsv`) explains what each anchor represents, its rumen relevance, and whether it is a core rumen anchor or broader topology scaffold.
+By default, BranchManager uses the bundled anchor set at `src/branchmanager/data/rumen-gut_reference_anchors.fasta`: 26 NCBI RefSeq 16S sequences forming a rumen/gut topology scaffold. A companion metadata table (`src/branchmanager/data/rumen-gut_reference_anchors.tsv`) explains what each anchor represents, its rumen relevance, and whether it is a core rumen anchor or broader topology scaffold. The bundled set is used when `anchors` is `null` or omitted. Users can supply a custom FASTA with `--anchors /path/to/custom_anchors.fasta` (or configure that path in an Assistant profile) to replace the bundled set for a collection.
 
 | Phylum | Type strain | Accession |
 |---|---|---|
@@ -955,7 +986,8 @@ This is a pragmatic rumen/gut scaffold rather than a final rumen-only reference 
 
 To use a custom anchor file:
 ```bash
-branchmanager filing-cabinet --anchors /path/to/my_anchors.fasta ...
+branchmanager assistant --config configs/my_collection_assistant.json \
+  --anchors /path/to/my_anchors.fasta
 ```
 Custom anchor headers must begin with `BRANCHMANAGER_REF_`:
 ```
@@ -1050,6 +1082,26 @@ branchmanager add-external-genomes --config configs/rumen_gateway.json --db proj
 ```
 
 Required columns are `sequence_id` and `genome_id` or `accession`. Optional fields include `gtdb_taxonomy`, `genome_qc_pass`, completeness/contamination, `ani_cluster`, and per-row `dataset`/`baseline_tier`. Genome availability is recorded as confirmed. Markerless isolates contribute genome/taxonomy coverage and are omitted from 16S similarity searches and trees.
+
+### Add partner isolates identified by MALDI-TOF
+
+Use `add-maldi-identifications` when a partner isolate has a MALDI-TOF identification but no marker sequence. Required columns are `sequence_id`, `partner_id`, and `taxon_name` or `taxon_id`. Include `taxonomic_rank` (`species`, `genus`, or `family`) with `taxon_name` to enable exact-rank soft context in later marker-based reviews. Optional columns are `identification_score`, `instrument`, `library_name`, `identification_date`, and `notes`.
+
+```bash
+branchmanager add-maldi-identifications --db project.sqlite \
+  --input maldi_identifications.tsv --dataset UoG_MALDI -o imports/UoG_MALDI
+```
+
+The importer adds partner records with an empty marker slot and stores MALDI results, taxon IDs/names, and source provenance in a separate table. Matching MALDI taxon names can appear as a soft note in `SpeciesContext`; they do not become GTDB/classifier taxonomy and do not affect marker similarity, novelty, genome-coverage counts, or sequencing scores. The import report lists accepted and rejected rows.
+
+For the Rumen Gateway `.xlsm` partner submission template, use `import-partner-workbook`. It reads the `Bulk Upload Template` sheet, uses `record_id` as the isolate ID, checks the MALDI method checkbox, and imports the MALDI result, instrument/database provenance, and a whitelist of non-identifying host and sample metadata. It can also register new markerless isolate records so a later passing marker submission can use the same ID. Existing genome availability and sequencing-selection decisions are preserved. Workbook taxon values in the field labelled `Taxon ID` are treated cautiously: numeric values are retained as taxon IDs, simple genus/species names may supply soft same-taxon context, and partner culture IDs or ambiguous strings are retained as unresolved observations for review. No workbook result is inserted into classifier taxonomy or selection scores.
+
+```bash
+branchmanager import-partner-workbook --db project.sqlite \
+  --input JP_October_09.xlsm --dataset QUB_Workbook -o imports/QUB_workbook
+```
+
+The command writes `partner_workbook_import_report.tsv`; review rows marked `MALDI_RESULT_NEEDS_REVIEW`, `MALDI_SELECTED_NO_RESULT`, or `MALDI_FIELDS_WITHOUT_SELECTION` before relying on those records.
 
 ## Benchmarking recommendations
 

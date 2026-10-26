@@ -43,6 +43,7 @@ from branchmanager.utils.subprocess import run_cmd
 
 logger = logging.getLogger(__name__)
 VSEARCH_USERFIELDS = 'query+target+id+alnlen+mism+gaps+qlo+qhi+tlo+thi+ql+tl+qcov+tcov'
+MIN_NEAREST_QUERY_COVERAGE = DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE
 
 
 def _alignment_evidence(parts: list[str]) -> tuple[Optional[float], Optional[int]]:
@@ -105,6 +106,15 @@ def run_novelty(
     """
     output = f"{outdir}/novelty.tsv"
     matches_path = f"{outdir}/novelty_matches.tsv"
+    query_ids = [
+        header for header, _sequence in read_fasta(input_fasta)
+        if not tree_pipeline.is_ref_anchor(header)
+    ]
+    if not query_ids:
+        with open(output, 'w') as handle:
+            handle.write('ID\tNearestIdentity\tNearestHit\tNovel\n')
+        Path(matches_path).write_text('')
+        return output
 
     # Priority: explicit target_fasta > DB-derived submitted sequences > nothing
     db_fasta = Path(outdir) / "submitted_sequences.fasta"
@@ -176,8 +186,8 @@ def run_novelty(
             f"--strand both "
             f"--userout {shlex.quote(str(matches_path))} "
             f"--userfields {VSEARCH_USERFIELDS} "
-            f"--maxaccepts 1 --maxhits 1 "
-            f"--query_cov 0.7"                    # require 70% query coverage to avoid spurious hits
+            f"--maxaccepts 0 --maxrejects 0 --maxhits 0 "
+            f"--query_cov {MIN_NEAREST_QUERY_COVERAGE / 100.0:.2f}"
             f"{thread_flag}"
         )
         logger.info("[NOVELTY] Running vsearch against previously submitted sequences")
@@ -449,7 +459,8 @@ def compute_db_nearest_identities(mapped_derep: str, outdir: str, db, run_datase
                 f"--db {shlex.quote(str(db_preset_fasta))} --id 0.5 --strand both "
                 f"--userout {shlex.quote(str(novelty_matches))} "
                 f"--userfields {VSEARCH_USERFIELDS} "
-                f"--maxaccepts 1 --maxhits 1{thread_flag}"
+                f"--maxaccepts 0 --maxrejects 0 --maxhits 0 "
+                f"--query_cov {MIN_NEAREST_QUERY_COVERAGE / 100.0:.2f}{thread_flag}"
             )
             logger.info("[NOVELTY] Running vsearch against registered project collection to compute novelty")
             run_cmd(cmd)
@@ -460,9 +471,11 @@ def compute_db_nearest_identities(mapped_derep: str, outdir: str, db, run_datase
                         if len(parts) < 3:
                             continue
                         try:
-                            novel_results[parts[0]] = float(parts[2])
+                            identity = float(parts[2])
                         except Exception:
-                            novel_results[parts[0]] = None
+                            continue
+                        if parts[0] not in novel_results or identity > novel_results[parts[0]]:
+                            novel_results[parts[0]] = identity
         except Exception as e:
             logger.warning("[NOVELTY] vsearch novelty run failed: %s", e)
     return novel_results
@@ -665,19 +678,28 @@ def _query_db_pool(
     *,
     run_dataset: Optional[str] = None,
     include_datasets=None,
+    include_ids=None,
     exclude_datasets=None,
 ):
     include = _normalise_dataset_names(include_datasets)
+    ids = list(dict.fromkeys(str(item) for item in (include_ids or []) if str(item)))
     exclude = _normalise_dataset_names(exclude_datasets)
     clauses = ["sequence IS NOT NULL", "sequence != ''"]
     params: list[object] = []
     if run_dataset:
         clauses.append("(dataset != ? OR dataset IS NULL)")
         params.append(run_dataset)
-    if include:
-        placeholders = ','.join('?' for _ in include)
-        clauses.append(f"dataset IN ({placeholders})")
-        params.extend(include)
+    if include or ids:
+        include_clauses = []
+        if include:
+            placeholders = ','.join('?' for _ in include)
+            include_clauses.append(f"dataset IN ({placeholders})")
+            params.extend(include)
+        if ids:
+            placeholders = ','.join('?' for _ in ids)
+            include_clauses.append(f"id IN ({placeholders})")
+            params.extend(ids)
+        clauses.append('(' + ' OR '.join(include_clauses) + ')')
     if exclude:
         placeholders = ','.join('?' for _ in exclude)
         clauses.append(f"(dataset NOT IN ({placeholders}) OR dataset IS NULL)")
@@ -707,6 +729,7 @@ def _build_db_pool_fasta(
     name: str,
     run_dataset: Optional[str] = None,
     include_datasets=None,
+    include_ids=None,
     exclude_datasets=None,
 ) -> tuple[Optional[str], str, list[str], int]:
     if db is None:
@@ -716,6 +739,7 @@ def _build_db_pool_fasta(
             db,
             run_dataset=run_dataset,
             include_datasets=include_datasets,
+            include_ids=include_ids,
             exclude_datasets=exclude_datasets,
         )
     except Exception as e:
@@ -724,6 +748,58 @@ def _build_db_pool_fasta(
     if not path:
         return None, 'none', datasets, 0
     return path, name, datasets, len(records)
+
+
+def _selected_partner_sequence_ids(db) -> list[str]:
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT s.id FROM sequences s "
+            "JOIN sequencing_metadata m ON m.id = s.id "
+            "LEFT JOIN dataset_roles r ON r.dataset = s.dataset "
+            "WHERE s.sequence IS NOT NULL AND s.sequence != '' "
+            "AND COALESCE(r.role, '') != 'baseline' "
+            "AND (COALESCE(m.selected_for_sequencing, 0) = 1 "
+            "OR COALESCE(m.selected_for_wgs, 0) = 1)"
+        ).fetchall()
+    return sorted({str(row[0]) for row in rows if row[0]})
+
+
+def _combine_project_target_with_selected_partners(
+    target_fasta: str,
+    db,
+    outdir: str,
+) -> tuple[str, str, list[str], int]:
+    target_records = dict(read_fasta(target_fasta))
+    if db is None:
+        return target_fasta, 'target_fasta', [], len(target_records)
+
+    selected_ids = _selected_partner_sequence_ids(db)
+    if not selected_ids:
+        return target_fasta, 'target_fasta', [], len(target_records)
+
+    selected_records, selected_datasets = _query_db_pool(db, include_ids=selected_ids)
+    for sequence_id, sequence in selected_records:
+        prior = target_records.get(sequence_id)
+        if prior is not None and prior.upper().replace('U', 'T') != sequence.upper().replace('U', 'T'):
+            logger.warning(
+                '[NOVELTY] Selected project sequence %s differs from the same ID in target FASTA; '
+                'using the database sequence in the combined project pool',
+                sequence_id,
+            )
+        target_records[sequence_id] = sequence
+
+    merged_path = _write_pool_fasta(
+        sorted(target_records.items()),
+        Path(outdir) / 'novelty_project_collection_pool.fasta',
+    )
+    if not merged_path:
+        return target_fasta, 'target_fasta', [], len(target_records)
+    return (
+        merged_path,
+        'target_fasta+selected_project_isolates',
+        selected_datasets,
+        len(target_records),
+    )
 
 
 def _run_nearest_search(
@@ -742,26 +818,40 @@ def _run_nearest_search(
         f"--strand both "
         f"--userout {shlex.quote(str(matches_path))} "
         f"--userfields {VSEARCH_USERFIELDS} "
-        f"--maxaccepts {2 if exclude_self else 1} --maxhits {2 if exclude_self else 1} "
-        f"--query_cov 0.7{thread_flag}"
+        f"--maxaccepts 0 --maxrejects 0 --maxhits 0 "
+        f"--query_cov {MIN_NEAREST_QUERY_COVERAGE / 100.0:.2f}{thread_flag}"
     )
     run_cmd(cmd)
-    if not exclude_self:
-        return _parse_best_hits(str(matches_path))
     best = {}
     if matches_path.exists():
         with open(matches_path) as handle:
             for line in handle:
                 parts = line.rstrip('\n').split('\t')
-                if len(parts) < 3 or parts[0] == parts[1]:
+                if len(parts) < 3 or (exclude_self and parts[0] == parts[1]):
                     continue
                 try:
                     pct = float(parts[2])
                 except Exception:
                     continue
-                if parts[0] not in best or pct > best[parts[0]][0]:
-                    query_coverage, alignment_length = _alignment_evidence(parts)
-                    best[parts[0]] = (pct, parts[1], query_coverage, alignment_length)
+                query_coverage, alignment_length = _alignment_evidence(parts)
+                candidate = (pct, parts[1], query_coverage, alignment_length)
+                current = best.get(parts[0])
+                candidate_rank = (
+                    query_coverage is not None and query_coverage >= MIN_NEAREST_QUERY_COVERAGE,
+                    pct,
+                    query_coverage if query_coverage is not None else -1.0,
+                    alignment_length if alignment_length is not None else -1,
+                    parts[1],
+                )
+                current_rank = (
+                    current[2] is not None and current[2] >= MIN_NEAREST_QUERY_COVERAGE,
+                    current[0],
+                    current[2] if current[2] is not None else -1.0,
+                    current[3] if current[3] is not None else -1,
+                    current[1],
+                ) if current else None
+                if current_rank is None or candidate_rank > current_rank:
+                    best[parts[0]] = candidate
     return best
 
 
@@ -781,8 +871,8 @@ def _run_density_search(
         f"--strand both "
         f"--userout {shlex.quote(str(matches_path))} "
         f"--userfields {VSEARCH_USERFIELDS} "
-        f"--maxaccepts 0 --maxhits 0 "
-        f"--query_cov 0.7{thread_flag}"
+        f"--maxaccepts 0 --maxrejects 0 --maxhits 0 "
+        f"--query_cov {MIN_NEAREST_QUERY_COVERAGE / 100.0:.2f}{thread_flag}"
     )
     run_cmd(cmd)
 
@@ -826,16 +916,24 @@ def _metrics_from_nearest_and_density(qids, nearest_hits, density_counts, *, sou
     for qid in qids:
         hit = nearest_hits.get(qid, (0.0, 'None', None, None))
         pct_id, hit_id = hit[0], hit[1]
+        query_coverage = hit[2] if len(hit) > 2 else None
+        has_supported_coverage = (
+            query_coverage is not None
+            and query_coverage >= MIN_NEAREST_QUERY_COVERAGE
+        )
+        decision_identity = pct_id if has_supported_coverage else 0.0
         counts = density_counts.get(qid, {'ge_99': 0, 'ge_97': 0, 'ge_95': 0})
         crowding = _crowding_from_counts(counts)
-        score = _novelty_score_from_metrics(pct_id, counts['ge_99'], counts['ge_97'], counts['ge_95'])
-        priority = _novelty_priority_from_metrics(pct_id, counts['ge_99'], counts['ge_97'])
+        score = _novelty_score_from_metrics(
+            decision_identity, counts['ge_99'], counts['ge_97'], counts['ge_95'],
+        )
+        priority = _novelty_priority_from_metrics(decision_identity, counts['ge_99'], counts['ge_97'])
         rows[qid] = {
             'nearest_identity': pct_id,
             'nearest_hit': hit_id,
-            'nearest_query_coverage': hit[2] if len(hit) > 2 else None,
+            'nearest_query_coverage': query_coverage,
             'nearest_alignment_length': hit[3] if len(hit) > 3 else None,
-            'novel': str(pct_id < novel_threshold_pct),
+            'novel': str(not has_supported_coverage or decision_identity < novel_threshold_pct),
             'matches_ge_99': counts['ge_99'],
             'matches_ge_97': counts['ge_97'],
             'matches_ge_95': counts['ge_95'],
@@ -1224,9 +1322,13 @@ def _pool_has_close_hit(row: dict, identity_threshold: float = 97.0) -> bool:
         return False
     try:
         identity = float(row.get('nearest_identity'))
+        coverage = float(row.get('nearest_query_coverage'))
     except (TypeError, ValueError):
         return False
-    return identity >= float(identity_threshold)
+    return (
+        identity >= float(identity_threshold)
+        and coverage >= MIN_NEAREST_QUERY_COVERAGE
+    )
 
 
 def _passes_identity_coverage(row: dict, identity_threshold: float, coverage_threshold: float) -> bool:
@@ -1293,7 +1395,7 @@ def _write_novelty_metrics_table(
     ]
     headers = ['ID']
     headers.extend(metric_fields)
-    for prefix in ('Hungate', 'SecondaryBaseline', 'CulturedRumen', 'Baseline', 'Project', 'Reference'):
+    for prefix in ('Hungate', 'SecondaryBaseline', 'CulturedProject', 'Baseline', 'Project', 'Reference'):
         headers.extend(prefix + field for field in metric_fields)
     headers.extend([
         'BaselineEvidenceClass',
@@ -1304,7 +1406,7 @@ def _write_novelty_metrics_table(
         'CommittedGenomeCountSameAssessmentSpecies',
         'HungateGenomeCountSameAssessmentSpecies',
         'SecondaryBaselineGenomeCountSameAssessmentSpecies',
-        'CulturedRumenGenomeCountSameAssessmentSpecies',
+        'CulturedProjectGenomeCountSameAssessmentSpecies',
         'BaselineGenomeCountSameAssessmentSpecies',
         'SequencedPartnerGenomeCountSameAssessmentSpecies',
         'SelectedPendingGenomeCountSameAssessmentSpecies',
@@ -1369,15 +1471,17 @@ def build_reference_novelty_metrics(
     secondary_baseline_datasets=None,
     pangenome_target: int = DEFAULT_PANGENOME_TARGET,
 ):
-    """Write per-sequence novelty metrics comparing against user-submitted sequences.
+    """Write per-sequence novelty metrics comparing against project and baseline sequences.
 
-    Project density is computed against the rolling partner-candidate
-    collection, including the current batch but excluding each query's self-hit.
-    Cultured baselines and the external GTDB reference remain separate pools.
+        Project density is computed against the rolling partner-candidate collection,
+        including selected partner isolates and the current batch but excluding each
+        query's self-hit. Nearest-hit searches require at least 95% query coverage and
+        rank eligible matches by percent identity. Cultured-project baselines and the
+        external GTDB reference remain separate pools.
 
-    If ``target_fasta`` is provided it overrides both the DB lookup and the
-    ``ref_fasta`` fallback — only those sequences are used as the density
-    comparison pool.
+    If ``target_fasta`` is provided it replaces the DB candidate pool and the
+    ``ref_fasta`` fallback. Selected partner isolates are added from the DB so
+    committed project isolates remain visible in project-neighbour comparisons.
 
     Falls back to ``ref_fasta`` only when no DB sequences and no
     ``target_fasta`` are available.
@@ -1390,7 +1494,7 @@ def build_reference_novelty_metrics(
     threads      : VSEARCH thread count.
     db           : Database instance (used to pull previously submitted seqs).
     run_dataset  : Current run dataset name (excluded from density DB).
-    target_fasta : Explicit FASTA of sequences to compare against; overrides DB/ref.
+    target_fasta : Explicit project comparison FASTA; selected partner isolates are added when available.
     baseline_datasets : DB dataset label(s) to treat as the cultured/reference
                         baseline pool, e.g. Hungate. Can be a string,
                         comma-separated string, or iterable.
@@ -1406,6 +1510,11 @@ def build_reference_novelty_metrics(
         h for h, _ in read_fasta(input_fasta)
         if not tree_pipeline.is_ref_anchor(h)
     ]
+    if not qids:
+        _write_novelty_metrics_table(
+            output, [], {}, {}, {}, {}, {}, {}, sequencing_context={},
+        )
+        return str(output)
 
     hungate_names, secondary_names, baseline_names = _discover_tiered_baseline_datasets(
         db,
@@ -1419,19 +1528,26 @@ def build_reference_novelty_metrics(
     all_datasets: list[str] = []
     all_count = 0
     if target_fasta and Path(target_fasta).exists():
-        all_pool_path = target_fasta
-        all_source = 'target_fasta'
-        logger.info('[NOVELTY] Using target FASTA for project novelty metrics: %s', target_fasta)
+        all_pool_path, all_source, all_datasets, all_count = _combine_project_target_with_selected_partners(
+            target_fasta, db, outdir,
+        )
+        logger.info(
+            '[NOVELTY] Using explicit target FASTA%s for project novelty metrics: %s',
+            ' plus selected partner isolates' if all_source != 'target_fasta' else '',
+            target_fasta,
+        )
     elif db is not None:
         try:
             candidate_datasets = db.get_dataset_names_by_role('candidate')
         except Exception:
             candidate_datasets = []
+        selected_partner_ids = _selected_partner_sequence_ids(db) if candidate_datasets else []
         all_pool_path, all_source, all_datasets, all_count = _build_db_pool_fasta(
             db=db,
             outdir=outdir,
             name='project_collection',
             include_datasets=candidate_datasets or None,
+            include_ids=selected_partner_ids,
             exclude_datasets=None if candidate_datasets else baseline_names,
         )
         all_source = 'project_collection' if all_pool_path else all_source
@@ -1538,7 +1654,7 @@ def build_reference_novelty_metrics(
         run_dataset=run_dataset,
         datasets=baseline_names,
         pool_name='baseline',
-        source_prefix='cultured_rumen',
+        source_prefix='cultured_project',
         threads=threads,
     )
     if baseline_names and db is not None and not cultured_pool_path:
@@ -1573,7 +1689,7 @@ def build_reference_novelty_metrics(
     logger.info(
         '[NOVELTY] Wrote novelty metrics to %s (primary=%s; hungate=%s; secondary=%s; cultured=%s; project=%s; reference=%s)',
         output,
-        'cultured_rumen' if cultured_pool_path else all_source,
+        'cultured_project' if cultured_pool_path else all_source,
         hungate_source,
         secondary_source,
         cultured_source,

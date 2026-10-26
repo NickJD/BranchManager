@@ -74,6 +74,24 @@ CREATE TABLE IF NOT EXISTS sequencing_metadata (
     manual_review_status TEXT DEFAULT 'NOT_REVIEWED'
 );
 
+CREATE TABLE IF NOT EXISTS maldi_identifications (
+    identification_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sequence_id TEXT NOT NULL,
+    taxon_id TEXT,
+    taxon_name TEXT,
+    taxonomic_rank TEXT,
+    identification_score TEXT,
+    instrument TEXT,
+    library_name TEXT,
+    identification_date TEXT,
+    notes TEXT,
+    source_file TEXT,
+    source_row INTEGER,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_maldi_identifications_sequence
+    ON maldi_identifications(sequence_id, identification_id);
+
 CREATE TABLE IF NOT EXISTS dataset_roles (
     dataset TEXT PRIMARY KEY,
     role TEXT NOT NULL,
@@ -130,6 +148,7 @@ CREATE TABLE IF NOT EXISTS sequence_provenance (
     source_sequence_file TEXT,
     source_sequence_sha256 TEXT,
     source_read_ids TEXT,
+    source_used_read_ids TEXT,
     source_read_files TEXT,
     source_read_checksums_json TEXT,
     marker_qc_class TEXT,
@@ -206,8 +225,24 @@ CREATE TABLE IF NOT EXISTS marker_replacements (
     replaced_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS marker_replacement_attempts (
+    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sequence_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    detail TEXT,
+    old_sequence_sha256 TEXT,
+    incoming_sequence_sha256 TEXT,
+    incoming_length INTEGER,
+    incoming_qc_class TEXT,
+    incoming_qc_reasons TEXT,
+    source_manifest TEXT,
+    source_fasta TEXT,
+    attempted_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_genome_records_sequence ON genome_records(sequence_id);
 CREATE INDEX IF NOT EXISTS idx_isolate_status_events_sequence ON isolate_status_events(sequence_id);
 CREATE INDEX IF NOT EXISTS idx_sequence_removals_sequence ON sequence_removals(sequence_id);
 CREATE INDEX IF NOT EXISTS idx_marker_replacements_sequence ON marker_replacements(sequence_id);
+CREATE INDEX IF NOT EXISTS idx_marker_replacement_attempts_sequence ON marker_replacement_attempts(sequence_id);
 """

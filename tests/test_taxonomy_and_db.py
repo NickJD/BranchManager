@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 import gzip
 import csv
+import json
 import os
 import re
 import struct
@@ -17,7 +18,7 @@ SRC = ROOT / 'src'
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from branchmanager.cli import _find_preferred_id_map, _load_partner_metadata_for_run, _load_performance_review_baseline, _resolve_mailroom_interview_input, _resolve_reference_inputs, _write_output_explanations, build_parser, cmd_filing_cabinet, cmd_interview, cmd_performance_review
+from branchmanager.cli import _find_preferred_id_map, _load_partner_metadata_for_run, _load_performance_review_baseline, _marker_replacement_report_row, _merge_identical_marker_provenance, _resolve_mailroom_interview_input, _resolve_reference_inputs, _write_output_explanations, build_parser, cmd_filing_cabinet, cmd_interview, cmd_performance_review
 from branchmanager.db.interface import Database
 from branchmanager import mailroom as mailroom_module
 from branchmanager.pipeline import classify as classify_pipeline
@@ -35,6 +36,7 @@ from branchmanager.pipeline.collapse import collapse_fasta_within_taxa
 from branchmanager.pipeline.itol import generate_itol_colours, write_dataset_membership_strip
 from branchmanager.pipeline.novelty import build_reference_novelty_metrics
 from branchmanager.pipeline.tree import (
+    _database_sequences_changed_in_alignment,
     _new_sequences_only,
     _orient_tree_input_fasta,
     _label_internal_nodes,
@@ -778,6 +780,152 @@ class DatabaseBehaviourTests(unittest.TestCase):
                 rows = cur.fetchall()
             self.assertEqual(rows, [('d__Bacteria; p__Firmicutes',)])
 
+    def test_performance_review_logs_failed_resequence_and_continues_with_old_marker_flagged(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            input_fasta = tmp / 'input.fasta'
+            input_fasta.write_text('>OldIso\n' + ('C' * 799) + '\n')
+            (tmp / 'assembly_report.tsv').write_text(
+                'SequenceID\tQCClass\tRecommendation\tReasons\n'
+                'OldIso\tPASS_WITH_WARNINGS\tMANUAL_REVIEW\tone_primer_read_failed\n'
+            )
+            ref_fasta = tmp / 'ref.fasta'
+            ref_fasta.write_text('>REF1 d__Bacteria;p__Bacillota\n' + ('A' * 1400) + '\n')
+            outdir = tmp / 'out'
+            db_path = tmp / 'test.sqlite'
+            db = Database(str(db_path))
+            db.initialise()
+            old_sequence = 'A' * 1400
+            db.insert_sequences([('OldIso', old_sequence)], dataset='PartnerA')
+            db.upsert_sequence_provenance([{
+                'sequence_id': 'OldIso',
+                'source_sequence_file': 'previous.fasta',
+                'marker_qc_class': 'PASS_HIGH_CONFIDENCE',
+            }])
+
+            args = Namespace(
+                input=str(input_fasta),
+                db=str(db_path),
+                out=str(outdir),
+                ref=str(ref_fasta),
+                taxa=None,
+                dataset='run1',
+                min_len=1,
+                max_n_percent=100.0,
+                sequence_domain='all',
+                threads=1,
+                marker_qc=None,
+                marker_review=None,
+                accept_unverified_marker_qc=False,
+                skip_chimera_check=True,
+            )
+
+            with mock.patch('branchmanager.cli.qc.run_qc', return_value=str(input_fasta)), \
+                 mock.patch('builtins.input', return_value='yes'), \
+                 mock.patch(
+                     'branchmanager.cli.classify.run_classification',
+                     side_effect=RuntimeError('reached downstream classification'),
+                 ):
+                with self.assertRaisesRegex(RuntimeError, 'reached downstream classification'):
+                    cmd_performance_review(args)
+
+            with db.connect() as conn:
+                self.assertEqual(
+                    conn.execute('SELECT sequence FROM sequences WHERE id=?', ('OldIso',)).fetchone()[0],
+                    old_sequence,
+                )
+                self.assertEqual(
+                    conn.execute(
+                        'SELECT source_sequence_file, marker_qc_class FROM sequence_provenance WHERE sequence_id=?',
+                        ('OldIso',),
+                    ).fetchone(),
+                    ('previous.fasta', 'PASS_HIGH_CONFIDENCE'),
+                )
+                self.assertEqual(
+                    conn.execute('SELECT COUNT(*) FROM marker_replacements').fetchone()[0],
+                    0,
+                )
+                attempts = conn.execute(
+                    'SELECT status, detail, incoming_qc_class FROM marker_replacement_attempts '
+                    'WHERE sequence_id=? ORDER BY attempt_id DESC LIMIT 1',
+                    ('OldIso',),
+                ).fetchone()
+            self.assertEqual(
+                attempts,
+                ('TOO_SHORT', 'replacement consensus is shorter than 800 bp', 'PASS_WITH_WARNINGS'),
+            )
+            self.assertEqual(
+                dict(read_fasta(outdir / 'current_dataset_sequences.fasta'))['OldIso'],
+                old_sequence,
+            )
+            conflicts = (outdir / 'resequencing_conflicts.tsv').read_text()
+            self.assertIn('replacement not applied: replacement consensus is shorter than 800 bp', conflicts)
+            report = (outdir / 'marker_replacement_report.tsv').read_text()
+            self.assertIn('OldIso\tTOO_SHORT\tEXISTING', report)
+
+    def test_performance_review_asks_before_using_lower_qc_replacement(self):
+        for qc_response, expected_sequence, expected_outcome in (
+            ('no', 'A' * 1400, 'LOWER_QC_DECLINED'),
+            ('yes', 'C' * 1000, 'REPLACED'),
+        ):
+            with self.subTest(qc_response=qc_response), tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                input_fasta = tmp / 'input.fasta'
+                input_fasta.write_text('>OldIso\n' + ('C' * 1000) + '\n')
+                (tmp / 'assembly_report.tsv').write_text(
+                    'SequenceID\tQCClass\tRecommendation\tReasons\n'
+                    'OldIso\tPASS_WITH_WARNINGS\tMANUAL_REVIEW\tone_primer_read_failed\n'
+                )
+                ref_fasta = tmp / 'ref.fasta'
+                ref_fasta.write_text('>REF1 d__Bacteria;p__Bacillota\n' + ('A' * 1400) + '\n')
+                outdir = tmp / 'out'
+                db_path = tmp / 'test.sqlite'
+                db = Database(str(db_path))
+                db.initialise()
+                db.insert_sequences([('OldIso', 'A' * 1400)], dataset='PartnerA')
+                db.upsert_sequence_provenance([{
+                    'sequence_id': 'OldIso',
+                    'marker_qc_class': 'PASS_HIGH_CONFIDENCE',
+                }])
+
+                args = Namespace(
+                    input=str(input_fasta),
+                    db=str(db_path),
+                    out=str(outdir),
+                    ref=str(ref_fasta),
+                    taxa=None,
+                    dataset='run1',
+                    min_len=1,
+                    max_n_percent=100.0,
+                    sequence_domain='all',
+                    threads=1,
+                    marker_qc=None,
+                    marker_review=None,
+                    accept_unverified_marker_qc=False,
+                    skip_chimera_check=True,
+                )
+
+                with mock.patch('branchmanager.cli.qc.run_qc', return_value=str(input_fasta)), \
+                     mock.patch('builtins.input', side_effect=['yes', qc_response]), \
+                     mock.patch(
+                         'branchmanager.cli.classify.run_classification',
+                         side_effect=RuntimeError('reached downstream classification'),
+                     ):
+                    with self.assertRaisesRegex(RuntimeError, 'reached downstream classification'):
+                        cmd_performance_review(args)
+
+                with db.connect() as conn:
+                    stored_sequence = conn.execute(
+                        'SELECT sequence FROM sequences WHERE id=?', ('OldIso',),
+                    ).fetchone()[0]
+                self.assertEqual(stored_sequence, expected_sequence)
+                report = (outdir / 'marker_replacement_report.tsv').read_text()
+                self.assertIn(f'OldIso\t{expected_outcome}\t', report)
+                if qc_response == 'no':
+                    attempt = db.get_marker_replacement_attempts(['OldIso'])[-1]
+                    self.assertEqual(attempt['status'], 'LOWER_QC_DECLINED')
+                    self.assertIn('USER_DECLINED_LOWER_QC_REPLACEMENT', (outdir / 'resequencing_conflicts.tsv').read_text())
+
     def test_performance_review_silos_current_dataset_and_preserves_ids(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -1320,6 +1468,40 @@ class DatabaseBehaviourTests(unittest.TestCase):
             self.assertTrue(stored['selected_for_sequencing'])
             self.assertFalse(stored['genome_available'])
 
+    def test_rejected_resequence_for_existing_isolate_is_carried_as_resequence_placeholder(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            review_dir = root / '03_performance_review_hiring_panel'
+            review_dir.mkdir()
+            failed_manifest = root / '02_paper_trail_merge_meeting' / 'failed_qc_sequences' / 'failed_qc_manifest.tsv'
+            failed_manifest.parent.mkdir(parents=True)
+            failed_manifest.write_text(
+                'SequenceID\tStatus\tRecommendation\tReasons\n'
+                'OldIso\tfiltered_output_length_lt_1300\tRESEQUENCE\toutput_too_short\n'
+            )
+            metadata = root / 'partner_metadata.tsv'
+            metadata.write_text(
+                'sequence_id\tpartner_id\tselected_for_genome_sequencing\talready_sequenced\n'
+                'OldIso\tUoG\tyes\tno\n'
+            )
+            db = Database(str(root / 'project.sqlite'))
+            db.initialise()
+            db.insert_sequences([('OldIso', 'A' * 1400)], dataset='Prior_01')
+            args = Namespace(partner_metadata=str(metadata), dataset='Current_01', command='performance-review')
+
+            result = _load_partner_metadata_for_run(args, db, str(review_dir), {}, [])
+
+            self.assertEqual(result, {})
+            rejected = review_dir / 'rejected_before_assembly.tsv'
+            self.assertTrue(rejected.exists())
+            with rejected.open() as handle:
+                row = next(csv.DictReader(handle, delimiter='\t'))
+            self.assertEqual(row['SourceID'], 'OldIso')
+            self.assertEqual(row['PartnerID'], 'UoG')
+            self.assertEqual(row['SelectedForSequencing'], 'True')
+            self.assertEqual(row['AlreadySequenced'], 'False')
+            self.assertIn('output_too_short', row['Reason'])
+
     def test_database_rejects_reused_id_with_changed_sequence(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db = Database(str(Path(tmpdir) / 'test.sqlite'))
@@ -1329,6 +1511,250 @@ class DatabaseBehaviourTests(unittest.TestCase):
             self.assertEqual(db.assert_sequence_compatible('StableIso', 'ACGT'), 'StableIso')
             with self.assertRaisesRegex(ValueError, 'Rolling sequence IDs are immutable'):
                 db.assert_sequence_compatible('StableIso', 'ACGA')
+
+    def test_marker_replacement_history_records_success_and_clears_failed_status(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(str(Path(tmpdir) / 'test.sqlite'))
+            db.initialise()
+            db.insert_sequences([('ReplaceIso', 'A' * 1400)], dataset='PartnerA')
+            failed = db.replace_selected_markers(
+                [{
+                    'sequence_id': 'ReplaceIso',
+                    'sequence': 'C' * 799,
+                    'marker_qc_class': 'PASS_WITH_WARNINGS',
+                    'marker_qc_reasons': 'output_too_short',
+                }],
+                allow_unselected=True,
+            )[0]
+            self.assertEqual(failed['status'], 'TOO_SHORT')
+            self.assertEqual(failed['detail'], 'replacement consensus is shorter than 800 bp')
+            self.assertIn('ReplaceIso', db.get_unresolved_marker_replacement_failures())
+
+            success = db.replace_selected_markers(
+                [{
+                    'sequence_id': 'ReplaceIso',
+                    'sequence': 'C' * 1400,
+                    'marker_qc_class': 'PASS_HIGH_CONFIDENCE',
+                }],
+                allow_unselected=True,
+            )[0]
+
+            self.assertEqual(success['status'], 'REPLACED')
+            self.assertNotIn('ReplaceIso', db.get_unresolved_marker_replacement_failures())
+            history = db.get_marker_replacement_history()
+            self.assertEqual([row['status'] for row in history], ['TOO_SHORT', 'REPLACED'])
+            with db.connect() as conn:
+                self.assertEqual(
+                    conn.execute('SELECT sequence FROM sequences WHERE id=?', ('ReplaceIso',)).fetchone()[0],
+                    'C' * 1400,
+                )
+
+    def test_marker_replacement_uses_800bp_two_primer_consensus_over_one_primer_marker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(str(Path(tmpdir) / 'test.sqlite'))
+            db.initialise()
+            old_sequence = 'A' * 1200
+            incoming_sequence = 'C' * 850
+            db.insert_sequences([('PairIso', old_sequence)], dataset='PartnerA')
+            db.upsert_sequence_provenance([{
+                'sequence_id': 'PairIso',
+                'marker_qc_class': 'PASS_WITH_WARNINGS',
+                'marker_qc_reasons': 'only_one_primer_read_passed_qc;failed_reads_1',
+                'source_read_ids': 'old_forward',
+            }])
+
+            result = db.replace_selected_markers([{
+                'sequence_id': 'PairIso',
+                'sequence': incoming_sequence,
+                'marker_qc_class': 'PASS_WITH_WARNINGS',
+                'marker_qc_reasons': '',
+                'source_read_ids': 'old_forward;new_reverse',
+                'source_read_files': 'old_forward.ab1;new_reverse.ab1',
+            }], allow_unselected=True)[0]
+
+            self.assertEqual(result['status'], 'REPLACED')
+            self.assertEqual(result['comparison'], 'SEQUENCE_CHANGED')
+            self.assertEqual(result['previous_length'], 1200)
+            self.assertEqual(result['incoming_length'], 850)
+            self.assertEqual(result['previous_read_count'], 1)
+            self.assertEqual(result['incoming_read_count'], 2)
+            report_row = _marker_replacement_report_row('PairIso', result)
+            self.assertEqual(report_row['outcome'], 'REPLACED')
+            self.assertEqual(report_row['qc_comparison'], 'SAME_QC_CLASS')
+            self.assertEqual(report_row['primer_read_change'], 'ADDITIONAL_PRIMER_READS_ASSEMBLED')
+            with db.connect() as conn:
+                self.assertEqual(
+                    conn.execute('SELECT sequence FROM sequences WHERE id=?', ('PairIso',)).fetchone()[0],
+                    incoming_sequence,
+                )
+
+    def test_marker_replacement_report_counts_reads_used_not_reads_submitted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(str(Path(tmpdir) / 'test.sqlite'))
+            db.initialise()
+            db.insert_sequences([('SingleReadIso', 'A' * 1000)], dataset='PartnerA')
+            db.upsert_sequence_provenance([{
+                'sequence_id': 'SingleReadIso',
+                'marker_qc_class': 'PASS_WITH_WARNINGS',
+                'marker_qc_reasons': 'only_one_primer_read_passed_qc;failed_reads_1',
+                'source_read_ids': 'old_forward;old_reverse',
+                'source_used_read_ids': 'old_forward',
+            }])
+
+            result = db.replace_selected_markers([{
+                'sequence_id': 'SingleReadIso',
+                'sequence': 'C' * 1000,
+                'marker_qc_class': 'PASS_WITH_WARNINGS',
+                'marker_qc_reasons': 'only_one_primer_read_passed_qc;failed_reads_1',
+                'source_read_ids': 'new_forward;new_reverse',
+                'source_used_read_ids': 'new_forward',
+            }])[0]
+
+            self.assertEqual(result['previous_read_count'], 1)
+            self.assertEqual(result['incoming_read_count'], 1)
+            report_row = _marker_replacement_report_row('SingleReadIso', result)
+            self.assertEqual(report_row['primer_read_change'], 'SINGLE_PRIMER_MARKER')
+            self.assertEqual(report_row['incoming_used_read_ids'], 'new_forward')
+
+    def test_identical_marker_provenance_does_not_downgrade_stored_qc(self):
+        previous = {
+            'source_manifest': 'prior-manifest.json',
+            'source_sequence_file': 'prior.fasta',
+            'source_sequence_sha256': 'prior-sequence-hash',
+            'source_read_ids': 'old_forward',
+            'source_used_read_ids': 'old_forward',
+            'source_read_files': 'old_forward.ab1',
+            'source_read_checksums_json': '{"old_forward.ab1":"old-checksum"}',
+            'marker_qc_class': 'PASS_HIGH_CONFIDENCE',
+            'marker_qc_recommendation': 'ACCEPT',
+            'marker_qc_reasons': '',
+            'manual_review_status': 'APPROVED',
+            'chimera_call': 'PASS',
+            'chimera_score': 0.0,
+        }
+        incoming = {
+            'source_manifest': 'incoming-manifest.json',
+            'source_sequence_file': 'incoming.fasta',
+            'source_sequence_sha256': 'incoming-sequence-hash',
+            'source_read_ids': 'new_forward;new_reverse',
+            'source_used_read_ids': 'new_forward',
+            'source_read_files': 'new_forward.ab1;new_reverse.ab1',
+            'source_read_checksums_json': '{"new_forward.ab1":"new-checksum"}',
+            'marker_qc_class': 'PASS_WITH_WARNINGS',
+            'marker_qc_recommendation': 'MANUAL_REVIEW',
+            'marker_qc_reasons': 'only_one_primer_read_passed_qc',
+            'manual_review_status': 'NOT_REVIEWED',
+            'chimera_call': 'NOT_RUN',
+            'chimera_score': None,
+        }
+
+        merged = _merge_identical_marker_provenance(previous, incoming)
+
+        self.assertEqual(merged['marker_qc_class'], 'PASS_HIGH_CONFIDENCE')
+        self.assertEqual(merged['marker_qc_recommendation'], 'ACCEPT')
+        self.assertEqual(merged['marker_qc_reasons'], '')
+        self.assertEqual(merged['manual_review_status'], 'APPROVED')
+        self.assertEqual(merged['source_sequence_file'], 'prior.fasta')
+        self.assertEqual(merged['source_read_ids'], 'old_forward;new_forward;new_reverse')
+        self.assertEqual(merged['source_used_read_ids'], 'old_forward;new_forward')
+        self.assertEqual(merged['source_read_files'], 'old_forward.ab1;new_forward.ab1;new_reverse.ab1')
+        self.assertEqual(
+            json.loads(merged['source_read_checksums_json']),
+            {'old_forward.ab1': 'old-checksum', 'new_forward.ab1': 'new-checksum'},
+        )
+
+    def test_marker_provenance_loads_reads_actually_used_from_qc_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fasta = root / 'assembled.fasta'
+            fasta.write_text('>SingleReadIso\n' + ('A' * 1000) + '\n')
+            (root / 'assembly_report.tsv').write_text(
+                'SequenceID\tReadIDs\tUsedReadIDs\tQCClass\tReasons\n'
+                'SingleReadIso\tforward;reverse\tforward\tPASS_WITH_WARNINGS\t'
+                'only_one_primer_read_passed_qc\n'
+            )
+
+            from branchmanager.marker_provenance import load_marker_provenance
+
+            provenance, _ = load_marker_provenance(fasta)
+
+            self.assertEqual(provenance[0]['source_read_ids'], 'forward;reverse')
+            self.assertEqual(provenance[0]['source_used_read_ids'], 'forward')
+
+    def test_marker_replacement_uses_approved_800bp_sequence_despite_lower_qc_class(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(str(Path(tmpdir) / 'test.sqlite'))
+            db.initialise()
+            old_sequence = 'A' * 1200
+            db.insert_sequences([('BetterIso', old_sequence)], dataset='PartnerA')
+            db.upsert_sequence_provenance([{
+                'sequence_id': 'BetterIso',
+                'marker_qc_class': 'PASS_HIGH_CONFIDENCE',
+                'source_read_ids': 'old_forward;old_reverse',
+            }])
+
+            result = db.replace_selected_markers([{
+                'sequence_id': 'BetterIso',
+                'sequence': 'C' * 850,
+                'marker_qc_class': 'PASS_WITH_WARNINGS',
+                'marker_qc_reasons': 'primer_read_taxonomic_conflict_at_genus',
+                'source_read_ids': 'new_forward;new_reverse',
+            }], allow_unselected=True)[0]
+
+            self.assertEqual(result['status'], 'REPLACED')
+            self.assertEqual(result['comparison'], 'SEQUENCE_CHANGED')
+            self.assertEqual(result['incoming_length'], 850)
+            with db.connect() as conn:
+                self.assertEqual(
+                    conn.execute('SELECT sequence FROM sequences WHERE id=?', ('BetterIso',)).fetchone()[0],
+                    'C' * 850,
+                )
+
+    def test_approved_800bp_replacement_is_not_rejected_by_marker_qc_label(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(str(Path(tmpdir) / 'test.sqlite'))
+            db.initialise()
+            old_sequence = 'A' * 1400
+            db.insert_sequences([('FailIso', old_sequence)], dataset='PartnerA')
+
+            result = db.replace_selected_markers([{
+                'sequence_id': 'FailIso',
+                'sequence': 'C' * 1000,
+                'marker_qc_class': 'FAIL_QC',
+                'marker_qc_reasons': 'mixed_peak_percent_gt_15',
+            }], allow_unselected=True)[0]
+
+            self.assertEqual(result['status'], 'REPLACED')
+            with db.connect() as conn:
+                self.assertEqual(
+                    conn.execute('SELECT sequence FROM sequences WHERE id=?', ('FailIso',)).fetchone()[0],
+                    'C' * 1000,
+                )
+
+    def test_approved_replacement_is_not_blocked_by_sequencing_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(str(Path(tmpdir) / 'test.sqlite'))
+            db.initialise()
+            db.insert_sequences([('ResequencedIso', 'A' * 1200)], dataset='PartnerA')
+            db.upsert_sequencing_metadata([{
+                'id': 'ResequencedIso',
+                'selected_for_sequencing': False,
+                'selected_for_wgs': True,
+            }])
+
+            result = db.replace_selected_markers([{
+                'sequence_id': 'ResequencedIso',
+                'sequence': 'C' * 800,
+            }])[0]
+
+            self.assertEqual(result['status'], 'REPLACED')
+            with db.connect() as conn:
+                self.assertEqual(
+                    conn.execute(
+                        'SELECT sequence FROM sequences WHERE id=?', ('ResequencedIso',),
+                    ).fetchone()[0],
+                    'C' * 800,
+                )
 
     def test_partner_metadata_requires_partner_acronym_column(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2194,6 +2620,62 @@ class OutputHelperTests(unittest.TestCase):
                 ['Partner isolate_2', 'prefix|Partner isolate_1'],
             )
 
+    def test_tree_rebuilds_when_database_sequence_changed_since_cached_alignment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            outdir = tmp / 'tree_out'
+            outdir.mkdir()
+            (outdir / 'current_alignment.fasta').write_text('>ReplacedIso\n' + ('A' * 40) + '\n')
+            user = tmp / 'user.fasta'
+            user.write_text('')
+            db = Database(str(tmp / 'project.sqlite'))
+            db.initialise()
+            replacement_sequence = 'C' * 40
+            db.insert_sequences([('ReplacedIso', replacement_sequence)], dataset='PartnerA')
+
+            self.assertEqual(
+                _database_sequences_changed_in_alignment(db, outdir / 'current_alignment.fasta'),
+                ['ReplacedIso'],
+            )
+            (outdir / 'current_alignment.fasta').write_text(
+                '>ReplacedIso\n' + reverse_complement(replacement_sequence) + '\n'
+            )
+            self.assertEqual(
+                _database_sequences_changed_in_alignment(db, outdir / 'current_alignment.fasta'),
+                [],
+            )
+            (outdir / 'current_alignment.fasta').write_text('>ReplacedIso\n' + ('A' * 40) + '\n')
+            combined_path = outdir / 'combined_input.fasta'
+
+            def fake_build_combined_fasta(*_args, **_kwargs):
+                combined_path.write_text(f'>ReplacedIso\n{replacement_sequence}\n')
+                return combined_path
+
+            def fake_mafft_full(input_path, output_path, _threads):
+                Path(output_path).write_text(Path(input_path).read_text())
+                return True
+
+            with mock.patch('branchmanager.pipeline.tree.preflight_tree_tools'), \
+                 mock.patch('branchmanager.pipeline.tree.build_combined_fasta', side_effect=fake_build_combined_fasta), \
+                 mock.patch('branchmanager.pipeline.tree._run_mafft_full', side_effect=fake_mafft_full) as full_mock, \
+                 mock.patch('branchmanager.pipeline.tree._run_mafft_add') as add_mock, \
+                 mock.patch('branchmanager.pipeline.tree._build_tree', return_value=True), \
+                 mock.patch('branchmanager.pipeline.tree._finalise_tree'):
+                initialise_or_update_tree(
+                    ref_fasta='',
+                    user_fasta=str(user),
+                    outdir=str(outdir),
+                    db=db,
+                    threads=1,
+                )
+
+            self.assertTrue(full_mock.called)
+            self.assertFalse(add_mock.called)
+            self.assertEqual(
+                dict(read_fasta(str(outdir / 'current_alignment.fasta')))['ReplacedIso'],
+                replacement_sequence,
+            )
+
     def test_initialise_or_update_tree_seeds_previous_review_alignment_and_uses_mafft_add_for_full_length_sequences(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -2498,7 +2980,12 @@ class OutputHelperTests(unittest.TestCase):
             def fake_run_cmd(cmd):
                 parts = cmd.split()
                 density = Path(parts[parts.index('--userout') + 1])
-                density.write_text('Q1\tR1\t99.2\nQ1\tR2\t97.4\nQ1\tR3\t95.1\n')
+                if 'nearest_matches' in density.name:
+                    density.write_text(
+                        'Q1\tR1\t99.2\t4\t0\t0\t1\t4\t1\t4\t4\t4\t100\t100\n'
+                    )
+                else:
+                    density.write_text('Q1\tR1\t99.2\nQ1\tR2\t97.4\nQ1\tR3\t95.1\n')
 
             with mock.patch('branchmanager.pipeline.novelty.run_cmd', side_effect=fake_run_cmd):
                 out = build_reference_novelty_metrics(str(input_fasta), str(ref_fasta), str(tmp))
@@ -2529,15 +3016,15 @@ class OutputHelperTests(unittest.TestCase):
                 parts = cmd.split()
                 out = Path(parts[parts.index('--userout') + 1])
                 if 'baseline_nearest' in out.name:
-                    out.write_text('Q1\tHungateHit\t96.2\n')
+                    out.write_text('Q1\tHungateHit\t96.2\t4\t0\t0\t1\t4\t1\t4\t4\t4\t100\t100\n')
                 elif 'baseline_density' in out.name:
                     out.write_text('Q1\tHungateHit\t96.2\n')
                 elif 'project_nearest' in out.name:
-                    out.write_text('Q1\tPartnerHit\t99.4\n')
+                    out.write_text('Q1\tPartnerHit\t99.4\t4\t0\t0\t1\t4\t1\t4\t4\t4\t100\t100\n')
                 elif 'project_density' in out.name:
                     out.write_text('Q1\tPartnerHit\t99.4\n')
                 elif 'reference_nearest' in out.name:
-                    out.write_text('Q1\tGTDB_REF\t98.8\n')
+                    out.write_text('Q1\tGTDB_REF\t98.8\t4\t0\t0\t1\t4\t1\t4\t4\t4\t100\t100\n')
                 elif 'reference_density' in out.name:
                     out.write_text('Q1\tGTDB_REF\t98.8\n')
                 else:
@@ -2557,13 +3044,97 @@ class OutputHelperTests(unittest.TestCase):
             self.assertIn('BaselineNoveltyScore', text)
             self.assertIn('HungateNearestHit', text)
             self.assertIn('SecondaryBaselineNearestHit', text)
-            self.assertIn('CulturedRumenNearestHit', text)
+            self.assertIn('CulturedProjectNearestHit', text)
+            self.assertNotIn('CulturedRumenNearestHit', text)
             self.assertIn('BaselineEvidenceClass', text)
             self.assertIn('ProjectNoveltyScore', text)
             self.assertIn('ReferenceNoveltyScore', text)
             self.assertIn('Q1\t96.20\tHungateHit\tTrue', text)
             self.assertIn('\t99.40\tPartnerHit\tFalse\t1\t1\t1\t', text)
             self.assertIn('\t98.80\tGTDB_REF\tFalse\t0\t1\t1\t', text)
+
+    def test_nearest_search_ranks_identity_after_high_coverage_gate(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            matches = Path(tmpdir) / 'nearest.tsv'
+
+            def fake_run_cmd(command):
+                self.assertIn('--maxaccepts 0 --maxrejects 0 --maxhits 0', command)
+                self.assertIn('--query_cov 0.95', command)
+                matches.write_text(
+                    'Q1\tHUN407\t88.50\t1187\t137\t0\t1\t1187\t1\t1187\t1190\t1500\t99.40\t79.13\n'
+                    'Q1\tHUN087\t90.70\t1129\t105\t0\t1\t1129\t1\t1129\t1190\t1500\t95.00\t75.27\n'
+                    'Q1\tPARTIAL\t99.90\t700\t1\t0\t1\t700\t1\t700\t1190\t1500\t58.82\t46.67\n'
+                    'Q2\tPARTIAL\t99.90\t700\t1\t0\t1\t700\t1\t700\t1190\t1500\t58.82\t46.67\n'
+                    'Qsingle\tSINGLE\t97.00\t810\t24\t0\t1\t810\t1\t810\t850\t1500\t95.29\t54.00\n'
+                    'Qpaired\tPAIRED\t97.00\t1380\t41\t0\t1\t1380\t1\t1380\t1450\t1500\t95.17\t92.00\n'
+                )
+
+            with mock.patch('branchmanager.pipeline.novelty.run_cmd', side_effect=fake_run_cmd):
+                hits = novelty_pipeline._run_nearest_search(
+                    'queries.fasta', 'pool.fasta', matches,
+                )
+
+            self.assertEqual(hits['Q1'], (90.7, 'HUN087', 95.0, 1129))
+            self.assertEqual(hits['Q2'], (99.9, 'PARTIAL', 58.82, 700))
+            self.assertEqual(hits['Qsingle'], (97.0, 'SINGLE', 95.29, 810))
+            self.assertEqual(hits['Qpaired'], (97.0, 'PAIRED', 95.17, 1380))
+            metrics = novelty_pipeline._metrics_from_nearest_and_density(
+                ['Q2'], hits, {}, source='test', id_threshold=0.97,
+            )
+            self.assertEqual(metrics['Q2']['nearest_identity'], 99.9)
+            self.assertEqual(metrics['Q2']['novel'], 'True')
+            self.assertFalse(novelty_pipeline._pool_has_close_hit(metrics['Q2']))
+            self.assertFalse(selection_sets_pipeline._novel_looking([{
+                'nearest_identity': '95.0',
+                'nearest_query_coverage': '58.82',
+                'reference_nearest_identity': '95.0',
+                'reference_nearest_query_coverage': '58.82',
+            }]))
+            self.assertTrue(selection_sets_pipeline._novel_looking([{
+                'nearest_identity': '95.0',
+                'nearest_query_coverage': '95.0',
+                'reference_nearest_identity': 'NA',
+                'reference_nearest_query_coverage': 'NA',
+            }]))
+
+    def test_project_nearest_pool_includes_selected_partner_isolates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            db = Database(str(tmp / 'test.sqlite'))
+            db.initialise()
+            db.insert_sequences([('CandidateHit', 'ACGT')], dataset='CandidateDataset')
+            db.insert_sequences([('SelectedPartner', 'TGCA')], dataset='SelectedPartnerDataset')
+            db.insert_sequences([('UnselectedOther', 'AAAA')], dataset='OtherDataset')
+            db.upsert_dataset_role('CandidateDataset', 'candidate')
+            db.upsert_sequencing_metadata([
+                {
+                    'id': 'SelectedPartner',
+                    'partner_id': 'PartnerA',
+                    'dataset': 'SelectedPartnerDataset',
+                    'selected_for_sequencing': True,
+                },
+            ])
+
+            pool_path, _, _, _ = novelty_pipeline._build_db_pool_fasta(
+                db=db,
+                outdir=str(tmp),
+                name='project_collection',
+                include_datasets=db.get_dataset_names_by_role('candidate'),
+                include_ids=novelty_pipeline._selected_partner_sequence_ids(db),
+            )
+
+            self.assertIsNotNone(pool_path)
+            pool_ids = {header for header, _ in read_fasta(pool_path)}
+            self.assertEqual(pool_ids, {'CandidateHit', 'SelectedPartner'})
+
+            target_fasta = tmp / 'explicit_target.fasta'
+            target_fasta.write_text('>ExplicitTarget\nCCCC\n')
+            merged_pool, source, _, _ = novelty_pipeline._combine_project_target_with_selected_partners(
+                str(target_fasta), db, str(tmp),
+            )
+            merged_ids = {header for header, _ in read_fasta(merged_pool)}
+            self.assertEqual(merged_ids, {'ExplicitTarget', 'SelectedPartner'})
+            self.assertEqual(source, 'target_fasta+selected_project_isolates')
 
     def test_build_reference_novelty_metrics_reports_selected_wgs_clade_context(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3500,6 +4071,10 @@ class OutputHelperTests(unittest.TestCase):
             db.insert_sequences([('Q1', 'ACGT'), ('Q2', 'ACGT')], dataset='Current')
             db.insert_sequences([('H1', 'ACGT')], dataset='Hungate')
             db.insert_sequences([('P1', 'ACGT'), ('P2', 'ACGT')], dataset='Prior')
+            db.record_marker_replacement_attempt(
+                'H1', 'FAILED_QC', 'replacement consensus failed QC',
+                incoming_qc_class='FAIL_QC',
+            )
             db.upsert_sequencing_metadata([{
                 'id': 'P1',
                 'partner_id': 'QUB',
@@ -3531,6 +4106,8 @@ class OutputHelperTests(unittest.TestCase):
                 image_format='png',
             )
 
+            metadata = neighbourhood_pipeline._load_metadata(db, ['H1'], rows)
+            self.assertTrue(metadata['H1']['marker_replacement_failed'])
             self.assertEqual(len(result['figures']), 1)
             self.assertEqual(rows[0]['local_neighbourhood_figure'], rows[1]['local_neighbourhood_figure'])
             png_path = Path(result['figures'][0])
@@ -3543,6 +4120,20 @@ class OutputHelperTests(unittest.TestCase):
             self.assertEqual(manifest_rows[0]['TreeLeavesShown'], '3')
             self.assertEqual(manifest_rows[0]['BaselineLeavesShown'], '1')
             self.assertEqual(manifest_rows[0]['SequencedGenomeLeavesShown'], '0')
+
+    def test_marker_replacement_status_itol_strip_marks_only_flagged_tree_leaf(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from branchmanager.pipeline.itol import write_marker_replacement_strip
+
+            output = Path(tmpdir) / 'marker_status.itol'
+            write_marker_replacement_strip(
+                str(output), ['OldIso', 'CleanIso'], {'OldIso'},
+            )
+
+            text = output.read_text()
+            self.assertIn('Resequencing QC failed; old marker retained', text)
+            self.assertIn('OldIso,#d32f2f', text)
+            self.assertNotIn('CleanIso,#d32f2f', text)
 
     def test_local_neighbourhood_forces_nearest_baseline_and_labels_rank_and_pident(self):
         with tempfile.TemporaryDirectory() as tmpdir:

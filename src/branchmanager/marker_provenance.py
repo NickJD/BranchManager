@@ -122,6 +122,7 @@ def load_marker_provenance(
                 'source_sequence_file': str(Path(input_fasta).resolve()),
                 'source_sequence_sha256': input_hash,
                 'source_read_ids': row.get('readids') or row.get('read_ids') or '',
+                'source_used_read_ids': row.get('usedreadids') or row.get('used_read_ids') or '',
                 'source_read_files': ';'.join(sorted(set(read_files_by_sequence.get(source_id, [])))),
                 'source_read_checksums_json': json.dumps(
                     read_checksums_by_sequence.get(source_id, {}), sort_keys=True,
@@ -142,6 +143,7 @@ def load_marker_provenance(
                 'source_sequence_file': str(Path(input_fasta).resolve()),
                 'source_sequence_sha256': input_hash,
                 'source_read_ids': '',
+                'source_used_read_ids': '',
                 'source_read_files': '',
                 'source_read_checksums_json': '{}',
                 'marker_qc_class': 'QUALITY_UNVERIFIED',
@@ -172,7 +174,8 @@ def write_marker_qc_bridge(path: str | Path, records: list[dict]) -> str:
     fields = [
         'sequence_id', 'marker_qc_class', 'marker_qc_recommendation', 'manual_review_status',
         'marker_qc_reasons', 'source_sequence_file', 'source_sequence_sha256',
-        'source_read_ids', 'source_read_files', 'source_read_checksums_json', 'source_manifest', 'chimera_call', 'chimera_score',
+        'source_read_ids', 'source_used_read_ids', 'source_read_files',
+        'source_read_checksums_json', 'source_manifest', 'chimera_call', 'chimera_score',
     ]
     with open(output, 'w', newline='') as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', extrasaction='ignore')

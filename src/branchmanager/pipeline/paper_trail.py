@@ -2205,6 +2205,7 @@ def _screen_primer_read_taxonomy(
     taxonomy_path = classify.run_classification(
         str(trimmed_fasta), str(screen_dir), ref_fasta=str(ref_fasta),
         taxa_tsv=str(taxa_tsv) if taxa_tsv else None, threads=threads,
+        db_name=classify._derive_db_name(str(ref_fasta)),
     )
     by_read = {}
     with open(taxonomy_path) as handle:
@@ -2212,7 +2213,11 @@ def _screen_primer_read_taxonomy(
             by_read[str(row.get('ID') or '')] = row
     for read in reads:
         row = by_read.get(read.read_id, {})
-        read.taxonomy_screen = str(row.get('Taxon') or 'NA')
+        taxon_value = row.get('Taxon') or next(
+            (value for key, value in row.items() if key.startswith('Taxon_')),
+            None,
+        )
+        read.taxonomy_screen = str(taxon_value or 'NA')
 
     results: dict[str, dict[str, object]] = {}
     groups: dict[str, list[SangerRead]] = {}

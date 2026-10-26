@@ -9,6 +9,7 @@ from branchmanager.taxonomy import canonicalise_sequence_id, parse_taxon_string
 
 
 BASELINE_TIERS = {'priority', 'secondary'}
+MARKER_MIN_LENGTH = 800
 
 
 def _infer_baseline_tier(dataset: str, explicit: str | None = None) -> str | None:
@@ -25,6 +26,23 @@ def _infer_baseline_tier(dataset: str, explicit: str | None = None) -> str | Non
     return 'priority' if 'hungate' in dataset_name else 'secondary'
 
 
+def _used_read_count(used_read_ids, read_ids, qc_reasons):
+    used = [value.strip() for value in str(used_read_ids or '').split(';') if value.strip()]
+    if used:
+        return len(used)
+    if 'only_one_primer_read_passed_qc' in str(qc_reasons or ''):
+        return 1
+    return len([value for value in str(read_ids or '').split(';') if value.strip()])
+
+
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 class Database:
     logger = logging.getLogger(__name__)
 
@@ -37,9 +55,9 @@ class Database:
             parent = db_path.parent
             if parent and str(parent) not in ('', '.'):
                 parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(str(db_path), timeout=60.0)
+            conn = sqlite3.connect(str(db_path), timeout=60.0, factory=_ClosingConnection)
         else:
-            conn = sqlite3.connect(self.path, timeout=60.0)
+            conn = sqlite3.connect(self.path, timeout=60.0, factory=_ClosingConnection)
         conn.execute('PRAGMA foreign_keys = ON')
         conn.execute('PRAGMA busy_timeout = 60000')
         return conn
@@ -124,6 +142,7 @@ class Database:
                 str(row.get('source_sequence_file') or ''),
                 str(row.get('source_sequence_sha256') or ''),
                 str(row.get('source_read_ids') or ''),
+                str(row.get('source_used_read_ids') or ''),
                 str(row.get('source_read_files') or ''),
                 str(row.get('source_read_checksums_json') or ''),
                 str(row.get('marker_qc_class') or ''),
@@ -139,13 +158,14 @@ class Database:
             conn.executemany(
                 "INSERT INTO sequence_provenance "
                 "(sequence_id, source_manifest, source_sequence_file, source_sequence_sha256, "
-                "source_read_ids, source_read_files, source_read_checksums_json, marker_qc_class, marker_qc_recommendation, "
+                "source_read_ids, source_used_read_ids, source_read_files, source_read_checksums_json, marker_qc_class, marker_qc_recommendation, "
                 "marker_qc_reasons, manual_review_status, chimera_call, chimera_score) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(sequence_id) DO UPDATE SET source_manifest=excluded.source_manifest, "
                 "source_sequence_file=excluded.source_sequence_file, "
                 "source_sequence_sha256=excluded.source_sequence_sha256, "
                 "source_read_ids=excluded.source_read_ids, source_read_files=excluded.source_read_files, "
+                "source_used_read_ids=excluded.source_used_read_ids, "
                 "source_read_checksums_json=excluded.source_read_checksums_json, "
                 "marker_qc_class=excluded.marker_qc_class, "
                 "marker_qc_recommendation=excluded.marker_qc_recommendation, "
@@ -160,7 +180,7 @@ class Database:
     def get_sequence_provenance(self, sequence_ids=None):
         query = (
             "SELECT sequence_id, source_manifest, source_sequence_file, source_sequence_sha256, "
-            "source_read_ids, source_read_files, source_read_checksums_json, "
+            "source_read_ids, source_used_read_ids, source_read_files, source_read_checksums_json, "
             "marker_qc_class, marker_qc_recommendation, "
             "marker_qc_reasons, manual_review_status, chimera_call, chimera_score, "
             "updated_at FROM sequence_provenance"
@@ -174,9 +194,9 @@ class Database:
             rows = conn.execute(query, params).fetchall()
         keys = (
             'sequence_id', 'source_manifest', 'source_sequence_file', 'source_sequence_sha256',
-            'source_read_ids', 'source_read_files', 'marker_qc_class', 'marker_qc_recommendation',
-            'source_read_checksums_json',
-            'marker_qc_reasons', 'manual_review_status', 'chimera_call', 'chimera_score', 'updated_at',
+            'source_read_ids', 'source_used_read_ids', 'source_read_files', 'source_read_checksums_json',
+            'marker_qc_class', 'marker_qc_recommendation', 'marker_qc_reasons',
+            'manual_review_status', 'chimera_call', 'chimera_score', 'updated_at',
         )
         return {str(row[0]): dict(zip(keys, row)) for row in rows}
 
@@ -506,6 +526,7 @@ class Database:
                 ('chimera_call', "TEXT DEFAULT 'NOT_RUN'"),
                 ('chimera_score', 'REAL'),
                 ('source_read_checksums_json', 'TEXT'),
+                ('source_used_read_ids', 'TEXT'),
             ):
                 if column not in provenance_columns:
                     cur.execute(f'ALTER TABLE sequence_provenance ADD COLUMN {column} {definition}')
@@ -1093,6 +1114,26 @@ class Database:
             # store alias mappings
             self.insert_aliases(alias_entries)
 
+    def attach_initial_marker_sequence(self, sequence_id, sequence):
+        """Attach the first marker to a registered isolate with no marker yet."""
+        sid = str(sequence_id or '').strip()
+        seq = ''.join(str(sequence or '').split()).upper().replace('U', 'T')
+        if not sid or not seq:
+            raise ValueError('sequence_id and a non-empty marker sequence are required')
+        with self.connect() as conn:
+            cur = conn.cursor()
+            key = self._resolve_sequence_id_with_cursor(cur, sid)
+            if not key:
+                raise ValueError(f'Isolate {sid!r} is not registered in the project database')
+            row = cur.execute('SELECT sequence FROM sequences WHERE id=?', (key,)).fetchone()
+            if not row:
+                raise ValueError(f'Isolate {key!r} is not registered in the project database')
+            if str(row[0] or '').strip():
+                raise ValueError(f'Isolate {key!r} already has a marker sequence; use marker replacement review')
+            cur.execute('UPDATE sequences SET sequence=?, length=? WHERE id=?', (seq, len(seq), key))
+            conn.commit()
+        return key
+
     def insert_taxonomy(self, tax_entries):
         """Insert taxonomy entries.
 
@@ -1238,6 +1279,53 @@ class Database:
             conn.commit()
         return len(rows)
 
+    def insert_maldi_identifications(self, identification_rows):
+        """Append source-labeled MALDI-TOF identifications, separate from classifier taxonomy."""
+        rows = []
+        for row in identification_rows or []:
+            sequence_id = str(row.get('sequence_id') or '').strip()
+            if not sequence_id:
+                continue
+            rows.append((
+                sequence_id, row.get('taxon_id'), row.get('taxon_name'),
+                row.get('taxonomic_rank'), row.get('identification_score'),
+                row.get('instrument'), row.get('library_name'),
+                row.get('identification_date'), row.get('notes'),
+                row.get('source_file'), row.get('source_row'),
+            ))
+        if not rows:
+            return 0
+        with self.connect() as conn:
+            conn.executemany(
+                'INSERT INTO maldi_identifications '
+                '(sequence_id, taxon_id, taxon_name, taxonomic_rank, identification_score, '
+                'instrument, library_name, identification_date, notes, source_file, source_row) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                rows,
+            )
+        return len(rows)
+
+    def get_maldi_identifications(self, sequence_ids=None):
+        query = (
+            'SELECT identification_id, sequence_id, taxon_id, taxon_name, taxonomic_rank, '
+            'identification_score, instrument, library_name, identification_date, notes, '
+            'source_file, source_row, created_at FROM maldi_identifications'
+        )
+        params = ()
+        if sequence_ids:
+            ids = [str(value) for value in sequence_ids]
+            query += ' WHERE sequence_id IN (' + ','.join('?' for _ in ids) + ')'
+            params = tuple(ids)
+        query += ' ORDER BY identification_id'
+        with self.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        keys = (
+            'identification_id', 'sequence_id', 'taxon_id', 'taxon_name', 'taxonomic_rank',
+            'identification_score', 'instrument', 'library_name', 'identification_date',
+            'notes', 'source_file', 'source_row', 'created_at',
+        )
+        return [dict(zip(keys, row)) for row in rows]
+
     def get_sequencing_metadata_for_ids(self, ids=None):
         with self.connect() as conn:
             cur = conn.cursor()
@@ -1281,11 +1369,13 @@ class Database:
         }
 
     def replace_selected_markers(self, replacements, *, source_manifest='', source_fasta='', allow_unselected=False):
-        """Atomically replace approved Sanger markers for unsequenced isolates.
+        """Atomically apply approved, QC-eligible Sanger marker replacements.
 
         The old marker and its provenance are retained in ``marker_replacements``.
         Derived marker analyses are removed so a later Performance Review cannot
         accidentally present taxonomy or novelty calculated from the old sequence.
+        Selection and genome-availability metadata do not override an explicit
+        replacement approval.
         """
         prepared = []
         for row in replacements or []:
@@ -1304,36 +1394,73 @@ class Database:
                     results.append(result)
                     continue
                 row = cur.execute(
-                    'SELECT s.sequence, s.length, COALESCE(m.selected_for_sequencing, 0), '
-                    'COALESCE(m.selected_for_wgs, 0) FROM sequences s '
-                    'LEFT JOIN sequencing_metadata m ON m.id=s.id WHERE s.id=?', (sequence_id,),
+                    'SELECT s.sequence, s.length FROM sequences s WHERE s.id=?', (sequence_id,),
                 ).fetchone()
-                old_sequence, old_length, selected, genome_available = row
-                genome_records = cur.execute(
-                    'SELECT COUNT(*) FROM genome_records WHERE sequence_id=?', (sequence_id,),
-                ).fetchone()[0]
-                if not selected and not allow_unselected:
-                    result.update(status='NOT_SELECTED', detail='isolate is not currently selected for genome sequencing')
-                    results.append(result)
-                    continue
-                if genome_available or genome_records:
-                    result.update(status='GENOME_ALREADY_AVAILABLE', detail='marker replacement is restricted to future genome selections')
-                    results.append(result)
-                    continue
-                if len(sequence) < 1300:
-                    result.update(status='TOO_SHORT', detail='replacement consensus is shorter than 1300 bp')
+                old_sequence, old_length = row
+                old_provenance_row = cur.execute(
+                    'SELECT source_read_ids, source_used_read_ids, source_read_files, marker_qc_class, marker_qc_reasons '
+                    'FROM sequence_provenance WHERE sequence_id=?', (sequence_id,),
+                ).fetchone()
+                old_provenance_summary = {
+                    'source_read_ids': old_provenance_row[0] or '',
+                    'source_used_read_ids': old_provenance_row[1] or '',
+                    'source_read_files': old_provenance_row[2] or '',
+                    'marker_qc_class': old_provenance_row[3] or '',
+                    'marker_qc_reasons': old_provenance_row[4] or '',
+                } if old_provenance_row else {}
+                incoming_provenance_summary = {
+                    'source_read_ids': replacement.get('source_read_ids') or '',
+                    'source_used_read_ids': replacement.get('source_used_read_ids') or '',
+                    'marker_qc_class': replacement.get('marker_qc_class') or '',
+                    'marker_qc_reasons': replacement.get('marker_qc_reasons') or '',
+                }
+                old_qc = str(old_provenance_summary.get('marker_qc_class') or '').upper()
+                incoming_qc = str(incoming_provenance_summary.get('marker_qc_class') or '').upper()
+                result.update(
+                    previous_length=int(old_length or len(str(old_sequence))),
+                    incoming_length=len(sequence),
+                    previous_qc_class=old_qc,
+                    incoming_qc_class=incoming_qc,
+                    previous_qc_reasons=old_provenance_summary.get('marker_qc_reasons', ''),
+                    incoming_qc_reasons=incoming_provenance_summary.get('marker_qc_reasons', ''),
+                    previous_read_count=_used_read_count(
+                        old_provenance_summary.get('source_used_read_ids'),
+                        old_provenance_summary.get('source_read_ids'),
+                        old_provenance_summary.get('marker_qc_reasons'),
+                    ),
+                    incoming_read_count=_used_read_count(
+                        incoming_provenance_summary.get('source_used_read_ids'),
+                        incoming_provenance_summary.get('source_read_ids'),
+                        incoming_provenance_summary.get('marker_qc_reasons'),
+                    ),
+                    previous_read_ids=old_provenance_summary.get('source_read_ids', ''),
+                    incoming_read_ids=incoming_provenance_summary.get('source_read_ids', ''),
+                    previous_used_read_ids=old_provenance_summary.get('source_used_read_ids', ''),
+                    incoming_used_read_ids=incoming_provenance_summary.get('source_used_read_ids', ''),
+                    previous_read_files=old_provenance_summary.get('source_read_files', ''),
+                    incoming_read_files=replacement.get('source_read_files') or '',
+                )
+                if len(sequence) < MARKER_MIN_LENGTH:
+                    result.update(
+                        status='TOO_SHORT',
+                        detail=f'replacement consensus is shorter than {MARKER_MIN_LENGTH} bp',
+                        comparison='INCOMING_BELOW_MINIMUM_LENGTH',
+                    )
+                    self._record_marker_replacement_attempt_with_cursor(
+                        cur, sequence_id, result, old_sequence, sequence, replacement, source_manifest, source_fasta,
+                    )
                     results.append(result)
                     continue
                 old_provenance = cur.execute(
                     'SELECT source_manifest, source_sequence_file, source_sequence_sha256, source_read_ids, '
-                    'source_read_files, source_read_checksums_json, marker_qc_class, marker_qc_recommendation, marker_qc_reasons, '
+                    'source_used_read_ids, source_read_files, source_read_checksums_json, marker_qc_class, marker_qc_recommendation, marker_qc_reasons, '
                     'manual_review_status, chimera_call, chimera_score FROM sequence_provenance WHERE sequence_id=?',
                     (sequence_id,),
                 ).fetchone()
                 old_provenance_json = json.dumps(old_provenance or (), separators=(',', ':'))
                 new_provenance = {
                     key: replacement.get(key) for key in (
-                        'source_manifest', 'source_sequence_file', 'source_sequence_sha256', 'source_read_ids',
+                        'source_manifest', 'source_sequence_file', 'source_sequence_sha256', 'source_read_ids', 'source_used_read_ids',
                         'source_read_files', 'source_read_checksums_json', 'marker_qc_class', 'marker_qc_recommendation', 'marker_qc_reasons',
                         'manual_review_status', 'chimera_call', 'chimera_score',
                     )
@@ -1355,10 +1482,136 @@ class Database:
                 cur.execute('DELETE FROM distances WHERE id=?', (sequence_id,))
                 cur.execute('DELETE FROM classification_evidence WHERE sequence_id=?', (sequence_id,))
                 cur.execute('DELETE FROM assessment_snapshots WHERE sequence_id=?', (sequence_id,))
-                result.update(status='REPLACED', detail=f'{int(old_length or len(str(old_sequence)))} bp → {len(sequence)} bp')
+                comparison = 'SEQUENCE_CHANGED' if str(old_sequence or '').upper().replace('U', 'T') != sequence else 'SEQUENCE_IDENTICAL'
+                result.update(
+                    status='REPLACED',
+                    detail=f'{int(old_length or len(str(old_sequence)))} bp → {len(sequence)} bp',
+                    comparison=comparison,
+                    previous_sequence_sha256=hashlib.sha256(str(old_sequence or '').encode()).hexdigest(),
+                    incoming_sequence_sha256=hashlib.sha256(sequence.encode()).hexdigest(),
+                )
+                self._record_marker_replacement_attempt_with_cursor(
+                    cur, sequence_id, result, old_sequence, sequence, replacement, source_manifest, source_fasta,
+                )
                 results.append(result)
             conn.commit()
         return results
+
+    @staticmethod
+    def _record_marker_replacement_attempt_with_cursor(
+        cur, sequence_id, result, old_sequence, incoming_sequence, provenance, source_manifest, source_fasta,
+    ):
+        cur.execute(
+            'INSERT INTO marker_replacement_attempts '
+            '(sequence_id, status, detail, old_sequence_sha256, incoming_sequence_sha256, incoming_length, '
+            'incoming_qc_class, incoming_qc_reasons, source_manifest, source_fasta) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                sequence_id,
+                result.get('status') or '',
+                result.get('detail') or '',
+                hashlib.sha256(str(old_sequence or '').encode()).hexdigest() if old_sequence else '',
+                hashlib.sha256(str(incoming_sequence or '').encode()).hexdigest() if incoming_sequence else '',
+                len(str(incoming_sequence or '')),
+                str(provenance.get('marker_qc_class') or ''),
+                str(provenance.get('marker_qc_reasons') or ''),
+                str(source_manifest or ''),
+                str(source_fasta or ''),
+            ),
+        )
+
+    def get_marker_replacement_attempts(self, sequence_ids=None):
+        query = (
+            'SELECT attempt_id, sequence_id, status, detail, old_sequence_sha256, incoming_sequence_sha256, '
+            'incoming_length, incoming_qc_class, incoming_qc_reasons, source_manifest, source_fasta, attempted_at '
+            'FROM marker_replacement_attempts'
+        )
+        params = ()
+        if sequence_ids:
+            ids = [str(value) for value in sequence_ids]
+            query += ' WHERE sequence_id IN (' + ','.join('?' for _ in ids) + ')'
+            params = tuple(ids)
+        query += ' ORDER BY attempt_id'
+        with self.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        keys = (
+            'attempt_id', 'sequence_id', 'status', 'detail', 'old_sequence_sha256',
+            'incoming_sequence_sha256', 'incoming_length', 'incoming_qc_class',
+            'incoming_qc_reasons', 'source_manifest', 'source_fasta', 'attempted_at',
+        )
+        return [dict(zip(keys, row)) for row in rows]
+
+    def get_marker_replacement_history(self):
+        attempts = self.get_marker_replacement_attempts()
+        seen_successes = {
+            (row['sequence_id'], row['incoming_sequence_sha256'])
+            for row in attempts if row['status'] == 'REPLACED'
+        }
+        with self.connect() as conn:
+            rows = conn.execute(
+                'SELECT sequence_id, old_sequence_sha256, new_sequence_sha256, new_length, '
+                'source_manifest, source_fasta, replaced_at FROM marker_replacements ORDER BY replacement_id'
+            ).fetchall()
+        for sequence_id, old_hash, new_hash, new_length, manifest, fasta, replaced_at in rows:
+            if (sequence_id, new_hash) in seen_successes:
+                continue
+            attempts.append({
+                'attempt_id': '',
+                'sequence_id': sequence_id,
+                'status': 'REPLACED',
+                'detail': 'historical replacement',
+                'old_sequence_sha256': old_hash,
+                'incoming_sequence_sha256': new_hash,
+                'incoming_length': new_length,
+                'incoming_qc_class': '',
+                'incoming_qc_reasons': '',
+                'source_manifest': manifest or '',
+                'source_fasta': fasta or '',
+                'attempted_at': replaced_at or '',
+            })
+        return attempts
+
+    def get_unresolved_marker_replacement_failures(self, sequence_ids=None):
+        attempts = self.get_marker_replacement_attempts(sequence_ids)
+        latest_replacement = {}
+        failures = {}
+        for row in attempts:
+            sequence_id = row['sequence_id']
+            if row['status'] == 'REPLACED':
+                latest_replacement[sequence_id] = row['attempt_id']
+            elif row['status'] in {'TOO_SHORT', 'FAILED_QC'}:
+                failures[sequence_id] = row
+        return {
+            sequence_id: row for sequence_id, row in failures.items()
+            if row['attempt_id'] > latest_replacement.get(sequence_id, 0)
+        }
+
+    def record_marker_replacement_attempt(
+        self, sequence_id, status, detail='', *, source_manifest='', source_fasta='',
+        incoming_qc_class='', incoming_qc_reasons='', incoming_sequence='',
+    ):
+        with self.connect() as conn:
+            cur = conn.cursor()
+            resolved_id = self._resolve_sequence_id_with_cursor(cur, sequence_id)
+            if not resolved_id:
+                return False
+            old_row = cur.execute(
+                'SELECT sequence FROM sequences WHERE id=?', (resolved_id,),
+            ).fetchone()
+            result = {'status': status, 'detail': detail}
+            self._record_marker_replacement_attempt_with_cursor(
+                cur, resolved_id, result,
+                old_row[0] if old_row else '',
+                incoming_sequence,
+                {
+                    'marker_qc_class': incoming_qc_class,
+                    'marker_qc_reasons': incoming_qc_reasons,
+                },
+                source_manifest,
+                source_fasta,
+            )
+            conn.commit()
+        return True
 
     def save_assessment_snapshot(self, snapshot_id, assessment_rows, *, dataset='', source_path=''):
         """Persist one complete performance review without mutating genome status."""

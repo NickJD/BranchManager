@@ -5,7 +5,7 @@ Architecture
 ------------
 The tree is built from THREE layers of sequences:
 
-  1. Reference anchors  (reference_anchors.fasta, bundled with BranchManager)
+  1. Reference anchors  (rumen-gut_reference_anchors.fasta, bundled with BranchManager)
      Curated NCBI RefSeq 16S sequences spanning major rumen/gut phyla.
      These constrain the topology so the tree reflects real taxonomy.
      They are NEVER shown in outputs - they are scaffolding only.
@@ -23,13 +23,15 @@ Tree building strategy
   - Initial build: align all three layers together with mafft --auto
   - Incremental update: add new run sequences via mafft --addfragments
     against the existing combined alignment (which already contains anchors)
+  - Rebuild from scratch when a stored database sequence no longer matches
+    its cached alignment leaf, as happens after an approved marker replacement
   - Every build labels internal nodes as NODE0000, NODE0001, ...
     (bootstrap values are stripped from node names to keep them clean)
 
 Reference anchor FASTA
 ----------------------
 The bundled anchor file lives at:
-    <package_root>/data/reference_anchors.fasta
+    <package_root>/data/rumen-gut_reference_anchors.fasta
 
 Each sequence header must be:
     >BRANCHMANAGER_REF_<PhylumName> accession=<ACC> source=<SOURCE>
@@ -48,6 +50,7 @@ import re
 import shutil
 import shutil as _shutil
 import sys as _sys
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional
@@ -63,7 +66,7 @@ REF_ANCHOR_PREFIX = "BRANCHMANAGER_REF_"
 
 # Path to the bundled anchor file, relative to this module's location
 _MODULE_DIR = Path(__file__).resolve().parent
-BUILTIN_ANCHOR_FILE = _MODULE_DIR.parent / "data" / "reference_anchors.fasta"
+BUILTIN_ANCHOR_FILE = _MODULE_DIR.parent / "data" / "rumen-gut_reference_anchors.fasta"
 
 
 # Public helpers
@@ -359,6 +362,34 @@ def _new_sequences_only(
             new_records.append((h, s))
 
     return new_records
+
+
+def _database_sequences_changed_in_alignment(db, alignment_path: Path, dataset: Optional[str] = None) -> list[str]:
+    """Return DB IDs whose stored bases differ from the cached tree alignment."""
+    if db is None or not alignment_path.is_file():
+        return []
+
+    aligned_sequences = dict(read_fasta(str(alignment_path)))
+    if not aligned_sequences:
+        return []
+
+    def normalise(sequence):
+        return ''.join(str(sequence or '').split()).upper().replace('-', '').replace('U', 'T')
+
+    with tempfile.TemporaryDirectory(prefix='branchmanager-tree-db-') as temporary:
+        db_fasta = Path(temporary) / 'sequences.fasta'
+        if not db.get_sequences_fasta(str(db_fasta), dataset=dataset):
+            return []
+        changed = []
+        for sequence_id, sequence in read_fasta(str(db_fasta)):
+            aligned = aligned_sequences.get(sequence_id)
+            if aligned is None:
+                continue
+            stored_bases = normalise(sequence)
+            aligned_bases = normalise(aligned)
+            if stored_bases != aligned_bases and reverse_complement(stored_bases) != aligned_bases:
+                changed.append(sequence_id)
+    return changed
 
 
 def _ensure_uncompressed_reference(ref_fasta: Optional[str], outdir: Path) -> Optional[str]:
@@ -971,7 +1002,7 @@ def initialise_or_update_tree(
     db_dataset     : If set, only pull this dataset from the DB.
     threads        : Number of threads for MAFFT and the tree builder.
     anchor_file    : Path to custom reference anchor FASTA.
-                     Falls back to the bundled data/reference_anchors.fasta.
+                     Falls back to the bundled data/rumen-gut_reference_anchors.fasta.
     force_rebuild  : If True, rebuild the entire tree from scratch even if
                      current_alignment.fasta already exists.
     tree_method    : Tree-building backend to use.
@@ -1027,6 +1058,16 @@ def initialise_or_update_tree(
             # end of a run. Reuse that backbone automatically when the same
             # output directory is supplied again.
             _seed_backbone_from_previous_review(str(out), out)
+
+    changed_db_sequences = _database_sequences_changed_in_alignment(db, current_aln, db_dataset)
+    if changed_db_sequences and not force_rebuild:
+        logger.warning(
+            "[TREE] Stored sequence bases changed for %d existing tree leaf/leaves; rebuilding the alignment "
+            "to replace cached sequence content (first IDs: %s)",
+            len(changed_db_sequences),
+            ', '.join(changed_db_sequences[:10]),
+        )
+        force_rebuild = True
 
     if not current_aln.exists() or force_rebuild:
         logger.info("[TREE] %s — building from scratch",

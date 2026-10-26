@@ -333,13 +333,38 @@ def write_baseline_tier_strip(output_path: str, ids_in_order, tier_map, dataset_
         'LEGEND_TITLE,Baseline tier legend',
         'LEGEND_SHAPES,1,2',
         'LEGEND_COLORS,#2e7d32,#00838f',
-        'LEGEND_LABELS,Hungate baseline (priority),Secondary rumen baseline',
+        'LEGEND_LABELS,Hungate baseline (priority),Secondary project baseline',
         'DATA',
     ]
     for iid in ids_in_order:
         tier = str(tier_map.get(iid) or '').strip().lower()
         if tier in colours:
             lines.append(f'{iid},{colours[tier]}')
+    p = Path(output_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text('\n'.join(lines) + '\n')
+    return str(p)
+
+
+def write_marker_replacement_strip(output_path: str, ids_in_order, flagged_ids):
+    """Mark tree leaves whose prior marker was retained after resequencing QC failed."""
+    flagged = set(flagged_ids or ())
+    lines = [
+        'DATASET_COLORSTRIP',
+        'SEPARATOR COMMA',
+        'DATASET_LABEL,Resequencing QC status',
+        'COLOR,#b71c1c',
+        'MARGIN,5',
+        'SHOW_INTERNAL,0',
+        'LEGEND_TITLE,Marker sequence status',
+        'LEGEND_SHAPES,1',
+        'LEGEND_COLORS,#d32f2f',
+        'LEGEND_LABELS,Resequencing QC failed; old marker retained',
+        'DATA',
+    ]
+    for sequence_id in ids_in_order:
+        if sequence_id in flagged:
+            lines.append(f'{sequence_id},#d32f2f')
     p = Path(output_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text('\n'.join(lines) + '\n')

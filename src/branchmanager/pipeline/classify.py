@@ -11,7 +11,7 @@ Key design decisions
 - vsearch is run at --id 0.8 minimum identity — this is for taxonomy only.
   Novelty detection (novelty.py) runs its own separate vsearch at a lower
   threshold to compute true nearest-neighbour distances.
-- Output columns: ID  BestHit  Identity  Taxon  Confidence
+- Output columns are database-labeled, e.g. ID  BestHit_GTDB_r232  Identity_GTDB_r232  Taxon_GTDB_r232  Confidence_GTDB_r232
   Confidence comes from the taxa TSV/CSV when provided (e.g. QIIME2 classifier
   score, 0–1 scale). When taxonomy is read directly from reference FASTA headers
   (no --taxa flag), Confidence is derived from the VSEARCH alignment identity
@@ -427,6 +427,7 @@ def run_classification(
     ref_fasta: Optional[str] = None,
     taxa_tsv: Optional[str] = None,
     threads: Optional[int] = None,
+    db_name: Optional[str] = None,
 ) -> str:
     """
     Classify sequences in input_fasta against ref_fasta using VSEARCH.
@@ -442,8 +443,8 @@ def run_classification(
 
     Output
     ------
-    outdir/taxonomy.tsv  — TSV with columns:
-        ID  BestHit  Identity  Taxon  Confidence
+    outdir/taxonomy.tsv  — TSV with database-labeled columns, e.g.:
+        ID  BestHit_GTDB_r232  Identity_GTDB_r232  Taxon_GTDB_r232  Confidence_GTDB_r232
 
     Reference anchor sequences (BRANCHMANAGER_REF_*) are excluded from output.
 
@@ -529,7 +530,7 @@ def run_classification(
     written = 0
     no_hit = 0
     with open(output, "w") as out_fh:
-        out_fh.write("ID\tBestHit\tIdentity\tTaxon\tConfidence\tQueryCoverage\tTargetCoverage\tAlignmentLength\tQueryLength\tTargetLength\tMismatches\tGaps\n")
+        out_fh.write('\t'.join(_classification_header(db_name or _derive_db_name(ref_fasta))) + '\n')
         for qid in all_query_ids:
             if qid not in best_hits:
                 out_fh.write(f"{qid}\tNA\t0.0\tNA\tNA\t" + '\t'.join(_alignment_columns(None)) + "\n")
@@ -571,6 +572,20 @@ def _derive_db_name(fasta_path: str) -> str:
     return safe if safe else Path(fasta_path).stem[:16]
 
 
+def _classification_header(db_name: str) -> list[str]:
+    """Build database-labeled classifier columns for a taxonomy TSV."""
+    import re as _re
+    safe = _re.sub(r'[^A-Za-z0-9]+', '_', str(db_name)).strip('_') or 'primary'
+    metrics = [
+        'QueryCoverage', 'TargetCoverage', 'AlignmentLength', 'QueryLength',
+        'TargetLength', 'Mismatches', 'Gaps',
+    ]
+    return [
+        'ID', f'BestHit_{safe}', f'Identity_{safe}', f'Taxon_{safe}',
+        f'Confidence_{safe}', *[f'{metric}_{safe}' for metric in metrics],
+    ]
+
+
 def run_classification_single(
     input_fasta: str,
     outdir: str,
@@ -578,6 +593,7 @@ def run_classification_single(
     taxa_tsv: Optional[str] = None,
     threads: Optional[int] = None,
     db_name: str = 'main',
+    column_db_name: Optional[str] = None,
 ) -> tuple[str, dict]:
     """Classify *input_fasta* against a single reference database.
 
@@ -678,7 +694,7 @@ def run_classification_single(
     written = 0
     no_hit = 0
     with open(output, "w") as out_fh:
-        out_fh.write("ID\tBestHit\tIdentity\tTaxon\tConfidence\tQueryCoverage\tTargetCoverage\tAlignmentLength\tQueryLength\tTargetLength\tMismatches\tGaps\n")
+        out_fh.write('\t'.join(_classification_header(column_db_name or (db_name if db_name != 'main' else 'primary'))) + '\n')
         for qid in all_query_ids:
             if qid not in best_hits:
                 out_fh.write(f"{qid}\tNA\t0.0\tNA\tNA\t" + '\t'.join(_alignment_columns(None)) + "\n")
@@ -749,7 +765,9 @@ def run_all_classifications(
     for ref, taxa, name in all_dbs:
         # The database whose name matches effective_main writes to taxonomy.tsv
         db_label = 'main' if name == effective_main else name
-        _, results = run_classification_single(input_fasta, outdir, ref, taxa, threads, db_label)
+        _, results = run_classification_single(
+            input_fasta, outdir, ref, taxa, threads, db_label, column_db_name=name,
+        )
         all_results[name] = results
 
     # Write wide merged taxonomy when more than one database was used
@@ -769,9 +787,9 @@ def _write_merged_taxonomy(
 ) -> str:
     """Write ``taxonomy_all_dbs.tsv`` — a wide table with one set of columns per DB.
 
-    The primary database's columns appear first (``BestHit``, ``Identity``,
-    ``Taxon``, ``Confidence``).  Each additional database adds a suffixed set
-    (``BestHit_<DB>``, ``Identity_<DB>``, ``Taxon_<DB>``, ``Confidence_<DB>``).
+    Every database, including the primary reference, has a suffixed set of
+    columns (``BestHit_<DB>``, ``Identity_<DB>``, ``Taxon_<DB>``,
+    ``Confidence_<DB>``) so assignments remain identifiable in merged tables.
     """
     import re as _re
     output = os.path.join(outdir, 'taxonomy_all_dbs.tsv')
@@ -780,8 +798,8 @@ def _write_merged_taxonomy(
 
     with open(output, 'w') as fh:
         metric_names = ['QueryCoverage', 'TargetCoverage', 'AlignmentLength', 'QueryLength', 'TargetLength', 'Mismatches', 'Gaps']
-        header = ['ID', 'BestHit', 'Identity', 'Taxon', 'Confidence', *metric_names]
-        for name in db_names[1:]:
+        header = ['ID']
+        for name in db_names:
             safe = _re.sub(r'[^A-Za-z0-9]+', '_', name).strip('_')
             header += [f'BestHit_{safe}', f'Identity_{safe}', f'Taxon_{safe}', f'Confidence_{safe}']
             header += [f'{metric}_{safe}' for metric in metric_names]

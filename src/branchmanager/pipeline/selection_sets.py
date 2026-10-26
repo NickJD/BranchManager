@@ -33,6 +33,7 @@ SELECTION_BLOCKING_PLACEMENT_FLAGS = frozenset({
     'CHIMERA_INDETERMINATE', 'CHIMERA_CHECK_SKIPPED', 'CHIMERA_NOT_RUN',
     'VERY_SHORT', 'HIGH_N_CONTENT', 'MARKER_QC_FAILED',
     'MARKER_QC_REVIEW_REQUIRED', 'MARKER_QC_UNVERIFIED',
+    'MARKER_REPLACEMENT_QC_FAILED',
 })
 
 
@@ -130,10 +131,20 @@ def _novel_looking(rows: Iterable[dict]) -> bool:
         }:
             return True
         baseline = _float(row.get('nearest_identity'))
+        baseline_coverage = _float(row.get('nearest_query_coverage'))
         reference = _float(row.get('reference_nearest_identity'))
-        if baseline is not None and baseline < 98.65:
+        reference_coverage = _float(row.get('reference_nearest_query_coverage'))
+        if (
+            baseline is not None and baseline < 98.65
+            and baseline_coverage is not None
+            and baseline_coverage >= DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE
+        ):
             return True
-        if reference is not None and reference < 98.65:
+        if (
+            reference is not None and reference < 98.65
+            and reference_coverage is not None
+            and reference_coverage >= DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE
+        ):
             return True
     return False
 
@@ -168,13 +179,13 @@ def _baseline_hit_records(row: dict, *, include_combined: bool = True) -> list[d
     ]
     if include_combined:
         records.append({
-            'tier': 'cultured_rumen',
-            'label': 'CulturedRumen',
-            'hit': _first_present(row.get('cultured_rumen_nearest_hit'), row.get('nearest_hit')),
-            'identity': _float(_first_present(row.get('cultured_rumen_nearest_identity'), row.get('nearest_identity'))),
-            'coverage': _float(_first_present(row.get('cultured_rumen_nearest_query_coverage'), row.get('nearest_query_coverage'))),
-            'taxonomy': _first_present(row.get('cultured_rumen_nearest_hit_taxonomy'), row.get('nearest_hit_taxonomy')),
-            'dataset': _first_present(row.get('cultured_rumen_nearest_hit_dataset'), row.get('nearest_hit_dataset')),
+            'tier': 'cultured_project',
+            'label': 'CulturedProject',
+            'hit': _first_present(row.get('cultured_project_nearest_hit'), row.get('cultured_rumen_nearest_hit'), row.get('nearest_hit')),
+            'identity': _float(_first_present(row.get('cultured_project_nearest_identity'), row.get('cultured_rumen_nearest_identity'), row.get('nearest_identity'))),
+            'coverage': _float(_first_present(row.get('cultured_project_nearest_query_coverage'), row.get('cultured_rumen_nearest_query_coverage'), row.get('nearest_query_coverage'))),
+            'taxonomy': _first_present(row.get('cultured_project_nearest_hit_taxonomy'), row.get('cultured_rumen_nearest_hit_taxonomy'), row.get('nearest_hit_taxonomy')),
+            'dataset': _first_present(row.get('cultured_project_nearest_hit_dataset'), row.get('cultured_rumen_nearest_hit_dataset'), row.get('nearest_hit_dataset')),
         })
     deduped = []
     seen = set()
@@ -208,7 +219,11 @@ def _baseline_evidence_rank(row: dict) -> int:
     coverage = _float(row.get('nearest_query_coverage'))
     if identity is not None and coverage is not None and identity >= DEFAULT_BASELINE_REDUNDANCY_IDENTITY and coverage >= DEFAULT_BASELINE_REDUNDANCY_QUERY_COVERAGE:
         return 0
-    if identity is not None and identity < DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY:
+    if (
+        identity is not None and coverage is not None
+        and identity < DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY
+        and coverage >= DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE
+    ):
         return 4
     return 1
 
@@ -218,13 +233,13 @@ def baseline_redundancy_evidence(
     identity_threshold: float = DEFAULT_BASELINE_REDUNDANCY_IDENTITY,
     min_query_coverage: float = DEFAULT_BASELINE_REDUNDANCY_QUERY_COVERAGE,
 ) -> tuple[bool, Optional[float], Optional[float]]:
-    """Return whether a candidate is near-identical to either cultured baseline tier."""
+    """Return whether a candidate is near-identical to either cultured-project baseline tier."""
     hits = _baseline_hit_records(row, include_combined=False)
     if not hits:
         hits = _baseline_hit_records(row, include_combined=True)
     if not hits:
-        identity = _float(_first_present(row.get('cultured_rumen_nearest_identity'), row.get('nearest_identity')))
-        coverage = _float(_first_present(row.get('cultured_rumen_nearest_query_coverage'), row.get('nearest_query_coverage')))
+        identity = _float(_first_present(row.get('cultured_project_nearest_identity'), row.get('cultured_rumen_nearest_identity'), row.get('nearest_identity')))
+        coverage = _float(_first_present(row.get('cultured_project_nearest_query_coverage'), row.get('cultured_rumen_nearest_query_coverage'), row.get('nearest_query_coverage')))
         redundant = bool(
             identity is not None and coverage is not None
             and identity >= float(identity_threshold)
@@ -251,7 +266,7 @@ def baseline_extension_evidence(
     min_identity: float = DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY,
     min_query_coverage: float = DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE,
 ) -> tuple[bool, str, str]:
-    """Test whether a candidate can extend either cultured-rumen baseline tier."""
+    """Test whether a candidate can extend either cultured-project baseline tier."""
     candidate_species = _species(row.get('taxonomy'))
     if not candidate_species:
         return False, 'CANDIDATE_SPECIES_UNRESOLVED', 'candidate GTDB species is unresolved'
@@ -269,12 +284,12 @@ def baseline_extension_evidence(
         status_prefix = {
             'Hungate': 'HUNGATE_BASELINE',
             'SecondaryBaseline': 'SECONDARY_BASELINE',
-            'CulturedRumen': 'BASELINE',
+            'CulturedProject': 'BASELINE',
         }.get(label, 'BASELINE')
         eligible_status = {
             'Hungate': 'ELIGIBLE_HUNGATE_BASELINE_EXTENSION',
             'SecondaryBaseline': 'ELIGIBLE_SECONDARY_BASELINE_EXTENSION',
-            'CulturedRumen': 'ELIGIBLE_BASELINE_PANGENOME_EXTENSION',
+            'CulturedProject': 'ELIGIBLE_BASELINE_PANGENOME_EXTENSION',
         }.get(label, 'ELIGIBLE_BASELINE_PANGENOME_EXTENSION')
         if not baseline_species:
             failures.append((
@@ -500,7 +515,7 @@ def build_sequencing_sets(
             set_prefix = 'BMEXT'
         elif species and secondary_count > 0:
             group_type = 'SECONDARY_BASELINE_EXTENSION'
-            basis = 'secondary cultured-rumen baseline extension: exact species + close full-length marker'
+            basis = 'secondary cultured-project baseline extension: exact species + close full-length marker'
             set_prefix = 'BMEXT'
         else:
             group_type = 'CANDIDATE_ONLY_GROUP'
@@ -643,7 +658,7 @@ def build_sequencing_sets(
                 'NovelLookingClade': 'Yes' if novel_clade else 'No',
                 'HungateBaselineGenomes': hungate_count,
                 'SecondaryBaselineGenomes': secondary_count,
-                'CulturedRumenBaselineGenomes': baseline_count,
+                'CulturedProjectBaselineGenomes': baseline_count,
                 'BaselineGenomes': baseline_count,
                 'SequencedPartnerGenomes': selected_count,
                 'SelectedPendingGenomes': pending_count,
@@ -666,8 +681,8 @@ def build_sequencing_sets(
                 'HungateNearestQueryCoverage': row.get('hungate_nearest_query_coverage', 'NA'),
                 'SecondaryBaselineNearestIdentity': row.get('secondary_baseline_nearest_identity', 'NA'),
                 'SecondaryBaselineNearestQueryCoverage': row.get('secondary_baseline_nearest_query_coverage', 'NA'),
-                'CulturedRumenNearestIdentity': row.get('cultured_rumen_nearest_identity', row.get('nearest_identity', 'NA')),
-                'CulturedRumenNearestQueryCoverage': row.get('cultured_rumen_nearest_query_coverage', row.get('nearest_query_coverage', 'NA')),
+                'CulturedProjectNearestIdentity': row.get('cultured_project_nearest_identity', row.get('nearest_identity', 'NA')),
+                'CulturedProjectNearestQueryCoverage': row.get('cultured_project_nearest_query_coverage', row.get('nearest_query_coverage', 'NA')),
                 'BaselineNearestIdentity': row.get('nearest_identity', 'NA'),
                 'BaselineNearestQueryCoverage': row.get('nearest_query_coverage', 'NA'),
                 'BaselineRedundancyStatus': row.get('baseline_redundancy_status', 'NA'),
@@ -698,14 +713,14 @@ def build_sequencing_sets(
         'SetID', 'GroupType', 'GroupBasis', 'AssessmentTaxon', 'BaselineAnchorIDs',
         'HungateAnchorIDs', 'SecondaryBaselineAnchorIDs',
         'NovelLookingClade', 'HungateBaselineGenomes', 'SecondaryBaselineGenomes',
-        'CulturedRumenBaselineGenomes', 'BaselineGenomes',
+        'CulturedProjectBaselineGenomes', 'BaselineGenomes',
         'SequencedPartnerGenomes', 'SelectedPendingGenomes', 'CommittedGenomeCount', 'CommittedGenomeIDs',
         'PangenomeTarget', 'PangenomeGap', 'DiversityPanelSize', 'EligibleCandidateCount',
         'RankedCandidateCount', 'BaselineRedundantCount', 'UnfilledPanelRanks',
         'CandidateID', 'PartnerID', 'SetRole', 'SetRank', 'EvidenceQuality',
         'BaselineEvidenceClass', 'HungateNearestIdentity', 'HungateNearestQueryCoverage',
         'SecondaryBaselineNearestIdentity', 'SecondaryBaselineNearestQueryCoverage',
-        'CulturedRumenNearestIdentity', 'CulturedRumenNearestQueryCoverage',
+        'CulturedProjectNearestIdentity', 'CulturedProjectNearestQueryCoverage',
         'BaselineNearestIdentity', 'BaselineNearestQueryCoverage', 'BaselineRedundancyStatus',
         'BaselineRedundancyIdentityThreshold', 'BaselineRedundancyMinQueryCoverage',
         'BaselineExtensionStatus', 'BaselineExtensionMinIdentity',

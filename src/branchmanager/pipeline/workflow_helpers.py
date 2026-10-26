@@ -475,16 +475,22 @@ def build_sequence_assessment_rows(
                     source = val(*names, default='')
                     return source not in ('', 'none', 'NA')
 
-                cultured_available = source_available('CulturedRumenDensitySource', 'BaselineDensitySource')
+                cultured_available = source_available(
+                    'CulturedProjectDensitySource', 'CulturedRumenDensitySource', 'BaselineDensitySource',
+                )
                 hungate_available = source_available('HungateDensitySource')
                 secondary_available = source_available('SecondaryBaselineDensitySource')
 
-                def pool_val(prefix: str, field: str, *, available: bool, fallback_prefix: str | None = None, default='NA'):
+                def pool_val(prefix: str, field: str, *, available: bool, fallback_prefix=None, default='NA'):
                     if not available:
                         return default
                     names = [prefix + field]
                     if fallback_prefix:
-                        names.append(fallback_prefix + field)
+                        prefixes = (
+                            [fallback_prefix] if isinstance(fallback_prefix, str)
+                            else list(fallback_prefix)
+                        )
+                        names.extend(item + field for item in prefixes)
                     return val(*names, default=default)
 
                 novelty_by_id[qid] = {
@@ -501,24 +507,54 @@ def build_sequence_assessment_rows(
                     'secondary_baseline_nearest_alignment_length': pool_val('SecondaryBaseline', 'NearestAlignmentLength', available=secondary_available),
                     'secondary_baseline_novelty_score': pool_val('SecondaryBaseline', 'NoveltyScore', available=secondary_available),
                     'secondary_baseline_density_source': pool_val('SecondaryBaseline', 'DensitySource', available=secondary_available),
-                    'cultured_rumen_nearest_identity': pool_val('CulturedRumen', 'NearestIdentity', available=cultured_available, fallback_prefix='Baseline'),
-                    'cultured_rumen_nearest_hit': pool_val('CulturedRumen', 'NearestHit', available=cultured_available, fallback_prefix='Baseline'),
-                    'cultured_rumen_nearest_query_coverage': pool_val('CulturedRumen', 'NearestQueryCoverage', available=cultured_available, fallback_prefix='Baseline'),
-                    'cultured_rumen_nearest_alignment_length': pool_val('CulturedRumen', 'NearestAlignmentLength', available=cultured_available, fallback_prefix='Baseline'),
-                    'cultured_rumen_novelty_score': pool_val('CulturedRumen', 'NoveltyScore', available=cultured_available, fallback_prefix='Baseline'),
-                    'cultured_rumen_density_source': pool_val('CulturedRumen', 'DensitySource', available=cultured_available, fallback_prefix='Baseline'),
-                    'nearest_identity': pool_val('CulturedRumen', 'NearestIdentity', available=cultured_available, fallback_prefix='Baseline'),
-                    'nearest_hit': pool_val('CulturedRumen', 'NearestHit', available=cultured_available, fallback_prefix='Baseline'),
-                    'nearest_query_coverage': pool_val('CulturedRumen', 'NearestQueryCoverage', available=cultured_available, fallback_prefix='Baseline'),
-                    'nearest_alignment_length': pool_val('CulturedRumen', 'NearestAlignmentLength', available=cultured_available, fallback_prefix='Baseline'),
-                    'novel': pool_val('CulturedRumen', 'Novel', available=cultured_available, fallback_prefix='Baseline'),
-                    'matches_ge_99': pool_val('CulturedRumen', 'MatchesGE99', available=cultured_available, fallback_prefix='Baseline'),
-                    'matches_ge_97': pool_val('CulturedRumen', 'MatchesGE97', available=cultured_available, fallback_prefix='Baseline'),
-                    'matches_ge_95': pool_val('CulturedRumen', 'MatchesGE95', available=cultured_available, fallback_prefix='Baseline'),
-                    'novelty_score': pool_val('CulturedRumen', 'NoveltyScore', available=cultured_available, fallback_prefix='Baseline'),
-                    'crowding': pool_val('CulturedRumen', 'Crowding', available=cultured_available, fallback_prefix='Baseline'),
-                    'sequencing_priority': pool_val('CulturedRumen', 'SequencingPriority', available=cultured_available, fallback_prefix='Baseline'),
-                    'density_source': pool_val('CulturedRumen', 'DensitySource', available=cultured_available, fallback_prefix='Baseline'),
+                    'cultured_project_nearest_identity': pool_val(
+                        'CulturedProject', 'NearestIdentity', available=cultured_available,
+                        fallback_prefix=('CulturedRumen', 'Baseline'),
+                    ),
+                    'cultured_project_nearest_hit': pool_val(
+                        'CulturedProject', 'NearestHit', available=cultured_available,
+                        fallback_prefix=('CulturedRumen', 'Baseline'),
+                    ),
+                    'cultured_project_nearest_query_coverage': pool_val(
+                        'CulturedProject', 'NearestQueryCoverage', available=cultured_available,
+                        fallback_prefix=('CulturedRumen', 'Baseline'),
+                    ),
+                    'cultured_project_nearest_alignment_length': pool_val(
+                        'CulturedProject', 'NearestAlignmentLength', available=cultured_available,
+                        fallback_prefix=('CulturedRumen', 'Baseline'),
+                    ),
+                    'cultured_project_novelty_score': pool_val(
+                        'CulturedProject', 'NoveltyScore', available=cultured_available,
+                        fallback_prefix=('CulturedRumen', 'Baseline'),
+                    ),
+                    'cultured_project_density_source': pool_val(
+                        'CulturedProject', 'DensitySource', available=cultured_available,
+                        fallback_prefix=('CulturedRumen', 'Baseline'),
+                    ),
+                    'nearest_identity': pool_val(
+                        'CulturedProject', 'NearestIdentity', available=cultured_available,
+                        fallback_prefix=('CulturedRumen', 'Baseline'),
+                    ),
+                    'nearest_hit': pool_val(
+                        'CulturedProject', 'NearestHit', available=cultured_available,
+                        fallback_prefix=('CulturedRumen', 'Baseline'),
+                    ),
+                    'nearest_query_coverage': pool_val(
+                        'CulturedProject', 'NearestQueryCoverage', available=cultured_available,
+                        fallback_prefix=('CulturedRumen', 'Baseline'),
+                    ),
+                    'nearest_alignment_length': pool_val(
+                        'CulturedProject', 'NearestAlignmentLength', available=cultured_available,
+                        fallback_prefix=('CulturedRumen', 'Baseline'),
+                    ),
+                    'novel': pool_val('CulturedProject', 'Novel', available=cultured_available, fallback_prefix=('CulturedRumen', 'Baseline')),
+                    'matches_ge_99': pool_val('CulturedProject', 'MatchesGE99', available=cultured_available, fallback_prefix=('CulturedRumen', 'Baseline')),
+                    'matches_ge_97': pool_val('CulturedProject', 'MatchesGE97', available=cultured_available, fallback_prefix=('CulturedRumen', 'Baseline')),
+                    'matches_ge_95': pool_val('CulturedProject', 'MatchesGE95', available=cultured_available, fallback_prefix=('CulturedRumen', 'Baseline')),
+                    'novelty_score': pool_val('CulturedProject', 'NoveltyScore', available=cultured_available, fallback_prefix=('CulturedRumen', 'Baseline')),
+                    'crowding': pool_val('CulturedProject', 'Crowding', available=cultured_available, fallback_prefix=('CulturedRumen', 'Baseline')),
+                    'sequencing_priority': pool_val('CulturedProject', 'SequencingPriority', available=cultured_available, fallback_prefix=('CulturedRumen', 'Baseline')),
+                    'density_source': pool_val('CulturedProject', 'DensitySource', available=cultured_available, fallback_prefix=('CulturedRumen', 'Baseline')),
                     'project_nearest_identity': val('ProjectNearestIdentity'),
                     'project_nearest_hit': val('ProjectNearestHit'),
                     'project_nearest_query_coverage': val('ProjectNearestQueryCoverage'),
@@ -554,8 +590,8 @@ def build_sequence_assessment_rows(
                     'related_genome_clade_ge_97': val('RelatedGenomeCladeGE97'),
                     'hungate_genome_count_same_species': val('HungateGenomeCountSameAssessmentSpecies', default='0'),
                     'secondary_baseline_genome_count_same_species': val('SecondaryBaselineGenomeCountSameAssessmentSpecies', default='0'),
-                    'cultured_rumen_genome_count_same_species': val(
-                        'CulturedRumenGenomeCountSameAssessmentSpecies',
+                    'cultured_project_genome_count_same_species': val(
+                        'CulturedProjectGenomeCountSameAssessmentSpecies',
                         default=val('BaselineGenomeCountSameAssessmentSpecies', default='0'),
                     ),
                     'genome_committed_count_same_species': val(
@@ -564,7 +600,7 @@ def build_sequence_assessment_rows(
                                     default=val('GenomeCommittedCountSameAssessmentSpecies')),
                     ),
                     'genome_available_count_same_species': val(
-                        'CulturedRumenGenomeCountSameAssessmentSpecies',
+                        'CulturedProjectGenomeCountSameAssessmentSpecies',
                         default=val('BaselineGenomeCountSameAssessmentSpecies',
                                     default=val('GenomeAvailableCountSameAssessmentSpecies')),
                     ),
@@ -595,7 +631,7 @@ def build_sequence_assessment_rows(
     for row in novelty_by_id.values():
         for key in (
             'nearest_hit', 'hungate_nearest_hit', 'secondary_baseline_nearest_hit',
-            'cultured_rumen_nearest_hit', 'project_nearest_hit', 'reference_nearest_hit',
+            'cultured_project_nearest_hit', 'project_nearest_hit', 'reference_nearest_hit',
             'closest_project_isolate',
         ):
             hit = row.get(key)
@@ -682,7 +718,7 @@ def build_sequence_assessment_rows(
 
         hungate_hit = n.get('hungate_nearest_hit', 'NA')
         secondary_hit = n.get('secondary_baseline_nearest_hit', 'NA')
-        cultured_hit = n.get('cultured_rumen_nearest_hit', n.get('nearest_hit', 'NA'))
+        cultured_hit = n.get('cultured_project_nearest_hit', n.get('nearest_hit', 'NA'))
         hungate_hit_taxonomy = nearest_meta.get(str(hungate_hit), {}).get('taxonomy', 'NA')
         secondary_hit_taxonomy = nearest_meta.get(str(secondary_hit), {}).get('taxonomy', 'NA')
         cultured_hit_taxonomy = nearest_meta.get(str(cultured_hit), {}).get('taxonomy', 'NA')
@@ -734,15 +770,15 @@ def build_sequence_assessment_rows(
             'secondary_baseline_nearest_alignment_length': n.get('secondary_baseline_nearest_alignment_length', 'NA'),
             'secondary_baseline_novelty_score': n.get('secondary_baseline_novelty_score', 'NA'),
             'secondary_baseline_density_source': n.get('secondary_baseline_density_source', 'NA'),
-            'cultured_rumen_nearest_hit': cultured_hit,
-            'cultured_rumen_nearest_hit_dataset': nearest_meta.get(str(cultured_hit), {}).get('dataset', 'NA'),
-            'cultured_rumen_nearest_hit_taxonomy': cultured_hit_taxonomy,
-            'cultured_rumen_nearest_identity': n.get('cultured_rumen_nearest_identity', 'NA'),
-            'cultured_rumen_nearest_query_coverage': n.get('cultured_rumen_nearest_query_coverage', 'NA'),
-            'cultured_rumen_nearest_alignment_length': n.get('cultured_rumen_nearest_alignment_length', 'NA'),
-            'cultured_rumen_novelty_score': n.get('cultured_rumen_novelty_score', 'NA'),
-            'cultured_rumen_density_source': n.get('cultured_rumen_density_source', 'NA'),
-            # Older Baseline* output aliases mirror the combined cultured-rumen pool.
+            'cultured_project_nearest_hit': cultured_hit,
+            'cultured_project_nearest_hit_dataset': nearest_meta.get(str(cultured_hit), {}).get('dataset', 'NA'),
+            'cultured_project_nearest_hit_taxonomy': cultured_hit_taxonomy,
+            'cultured_project_nearest_identity': n.get('cultured_project_nearest_identity', 'NA'),
+            'cultured_project_nearest_query_coverage': n.get('cultured_project_nearest_query_coverage', 'NA'),
+            'cultured_project_nearest_alignment_length': n.get('cultured_project_nearest_alignment_length', 'NA'),
+            'cultured_project_novelty_score': n.get('cultured_project_novelty_score', 'NA'),
+            'cultured_project_density_source': n.get('cultured_project_density_source', 'NA'),
+            # Older Baseline* output aliases mirror the combined cultured-project pool.
             'nearest_hit': n.get('nearest_hit', 'NA'),
             'nearest_hit_dataset': nearest_meta.get(str(n.get('nearest_hit')), {}).get('dataset', 'NA'),
             'nearest_hit_taxonomy': baseline_hit_taxonomy,
@@ -802,7 +838,7 @@ def build_sequence_assessment_rows(
             'genome_committed_count_same_species': n.get('genome_committed_count_same_species', 'NA'),
             'hungate_genome_count_same_species': n.get('hungate_genome_count_same_species', 'NA'),
             'secondary_baseline_genome_count_same_species': n.get('secondary_baseline_genome_count_same_species', 'NA'),
-            'cultured_rumen_genome_count_same_species': n.get('cultured_rumen_genome_count_same_species', 'NA'),
+            'cultured_project_genome_count_same_species': n.get('cultured_project_genome_count_same_species', 'NA'),
             'genome_available_count_same_species': n.get('genome_available_count_same_species', 'NA'),
             'genome_selected_count_same_species': n.get('genome_selected_count_same_species', 'NA'),
             'genome_pending_count_same_species': n.get('genome_pending_count_same_species', 'NA'),
@@ -821,6 +857,51 @@ def build_sequence_assessment_rows(
             # Alt-db taxonomy (keys: 'alt_tax_<refdb>', 'alt_class_hit_<refdb>', etc.)
             **_build_alt_tax_cols(iid, alt_taxonomies or {}, alt_ref_dbs or []),
         })
+    try:
+        maldi_rows = db.get_maldi_identifications()
+    except Exception:
+        maldi_rows = []
+    by_rank_and_name = {}
+    for maldi in maldi_rows:
+        rank = str(maldi.get('taxonomic_rank') or '').strip().lower()
+        taxon_name = str(maldi.get('taxon_name') or '').strip()
+        sequence_id = str(maldi.get('sequence_id') or '').strip()
+        key = normalise_taxon_name(taxon_name)
+        if rank in {'s', 'g', 'f'} and key and sequence_id:
+            by_rank_and_name.setdefault((rank, key), set()).add(sequence_id)
+    rank_names = {'s': 'species', 'g': 'genus', 'f': 'family'}
+    for row in assessment_rows:
+        taxonomy = parse_taxon_string(str(row.get('taxonomy') or ''))
+        context = ''
+        for rank in ('s', 'g', 'f'):
+            rank_value = taxonomy.get(rank)
+            if not rank_value:
+                continue
+            ids = by_rank_and_name.get((rank, normalise_taxon_name(rank_value)), set())
+            ids = ids - {str(row.get('id') or '').strip()}
+            if ids:
+                visible_ids = sorted(ids)[:5]
+                suffix = f'; +{len(ids) - 5} more' if len(ids) > 5 else ''
+                context = (
+                    f'MALDI-TOF soft context: {len(ids)} partner isolate(s) reported as '
+                    f'{rank_value} ({rank_names[rank]}; IDs {", ".join(visible_ids)}{suffix}); '
+                    'not marker-confirmed or genome evidence'
+                )
+                break
+        row['maldi_taxon_context'] = context
+    try:
+        sequencing_metadata = db.get_sequencing_metadata_for_ids(run_ids)
+    except Exception:
+        sequencing_metadata = {}
+    selection_context_fields = (
+        'addition_method', 'host_species', 'host_breed', 'host_age_weeks',
+        'production_type', 'sample_location', 'ruminant_diet', 'maldi_instrument',
+        'maldi_library', 'maldi_taxon_raw',
+    )
+    for row in assessment_rows:
+        metadata = sequencing_metadata.get(str(row.get('id') or ''), {}).get('project_metadata', {})
+        for field in selection_context_fields:
+            row[field] = metadata.get(field) or 'NA'
     return assessment_rows
 
 
@@ -871,6 +952,11 @@ def write_sequence_assessment_tsv(path: str | Path, rows, assessment_db_name: st
         break
     fields = [
         ('ID', 'id'), ('PartnerID', 'partner_id'),
+        ('AdditionMethod', 'addition_method'), ('HostSpecies', 'host_species'),
+        ('HostBreed', 'host_breed'), ('HostAgeWeeks', 'host_age_weeks'),
+        ('ProductionType', 'production_type'), ('SampleLocation', 'sample_location'),
+        ('RuminantDiet', 'ruminant_diet'), ('MALDIInstrument', 'maldi_instrument'),
+        ('MALDIDatabase', 'maldi_library'), ('MALDITaxonRaw', 'maldi_taxon_raw'),
         (f'{label}Taxonomy', 'taxonomy'), (f'{label}ClassificationHit', 'classification_hit'),
         (f'{label}ClassificationIdentity', 'classification_identity'),
         (f'{label}ClassificationConfidence', 'classification_confidence'),
@@ -881,6 +967,7 @@ def write_sequence_assessment_tsv(path: str | Path, rows, assessment_db_name: st
         (f'{label}TargetLength', 'classification_target_length'),
         (f'{label}Mismatches', 'classification_mismatches'),
         (f'{label}Gaps', 'classification_gaps'),
+        ('MALDITaxonContext', 'maldi_taxon_context'),
         ('BaselineEvidenceClass', 'baseline_evidence_class'),
         ('HungateNearestHit', 'hungate_nearest_hit'), ('HungateNearestHitDataset', 'hungate_nearest_hit_dataset'),
         ('HungateNearestHitTaxonomy', 'hungate_nearest_hit_taxonomy'),
@@ -896,14 +983,14 @@ def write_sequence_assessment_tsv(path: str | Path, rows, assessment_db_name: st
         ('SecondaryBaselineNearestAlignmentLength', 'secondary_baseline_nearest_alignment_length'),
         ('SecondaryBaselineNoveltyScore', 'secondary_baseline_novelty_score'),
         ('SecondaryBaselineSource', 'secondary_baseline_density_source'),
-        ('CulturedRumenNearestHit', 'cultured_rumen_nearest_hit'),
-        ('CulturedRumenNearestHitDataset', 'cultured_rumen_nearest_hit_dataset'),
-        ('CulturedRumenNearestHitTaxonomy', 'cultured_rumen_nearest_hit_taxonomy'),
-        ('CulturedRumenNearestIdentity', 'cultured_rumen_nearest_identity'),
-        ('CulturedRumenNearestQueryCoverage', 'cultured_rumen_nearest_query_coverage'),
-        ('CulturedRumenNearestAlignmentLength', 'cultured_rumen_nearest_alignment_length'),
-        ('CulturedRumenNoveltyScore', 'cultured_rumen_novelty_score'),
-        ('CulturedRumenSource', 'cultured_rumen_density_source'),
+        ('CulturedProjectNearestHit', 'cultured_project_nearest_hit'),
+        ('CulturedProjectNearestHitDataset', 'cultured_project_nearest_hit_dataset'),
+        ('CulturedProjectNearestHitTaxonomy', 'cultured_project_nearest_hit_taxonomy'),
+        ('CulturedProjectNearestIdentity', 'cultured_project_nearest_identity'),
+        ('CulturedProjectNearestQueryCoverage', 'cultured_project_nearest_query_coverage'),
+        ('CulturedProjectNearestAlignmentLength', 'cultured_project_nearest_alignment_length'),
+        ('CulturedProjectNoveltyScore', 'cultured_project_novelty_score'),
+        ('CulturedProjectSource', 'cultured_project_density_source'),
         ('BaselineNearestHit', 'nearest_hit'), ('BaselineNearestHitDataset', 'nearest_hit_dataset'),
         ('BaselineNearestHitTaxonomy', 'nearest_hit_taxonomy'),
         ('BaselineTaxonomyAgreementRank', 'baseline_taxonomy_agreement_rank'),
@@ -950,7 +1037,7 @@ def write_sequence_assessment_tsv(path: str | Path, rows, assessment_db_name: st
         ('RelatedGenomeCladeGE97', 'related_genome_clade_ge_97'),
         ('HungateGenomesSameAssessmentSpecies', 'hungate_genome_count_same_species'),
         ('SecondaryBaselineGenomesSameAssessmentSpecies', 'secondary_baseline_genome_count_same_species'),
-        ('CulturedRumenGenomesSameAssessmentSpecies', 'cultured_rumen_genome_count_same_species'),
+        ('CulturedProjectGenomesSameAssessmentSpecies', 'cultured_project_genome_count_same_species'),
         ('BaselineGenomesSameAssessmentSpecies', 'genome_available_count_same_species'),
         ('SequencedPartnerGenomesSameAssessmentSpecies', 'genome_selected_count_same_species'),
         ('SelectedPendingGenomesSameAssessmentSpecies', 'genome_pending_count_same_species'),
@@ -1162,7 +1249,11 @@ def build_selection_decision(row: dict) -> dict:
     project_coverage = _project_coverage(row)
     reference_context = _reference_context(row)
     genome_coverage = _genome_coverage(row)
-    species_context = _species_context(row)
+    species_context_parts = [
+        value for value in (_species_context(row), str(row.get('maldi_taxon_context') or '').strip())
+        if value
+    ]
+    species_context = '; '.join(species_context_parts)
     evidence_quality = _evidence_quality(row)
     selected = genome_coverage == 'CURRENT ISOLATE ALREADY SEQUENCED'
     pending = genome_coverage == 'CURRENT ISOLATE SELECTED - GENOME PENDING'
@@ -1299,6 +1390,16 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
     headers = [
         'SequenceID',
         'PartnerID',
+        'AdditionMethod',
+        'HostSpecies',
+        'HostBreed',
+        'HostAgeWeeks',
+        'ProductionType',
+        'SampleLocation',
+        'RuminantDiet',
+        'MALDIInstrument',
+        'MALDIDatabase',
+        'MALDITaxonRaw',
         'SelectedForGenomeSequencing',
         'GenomeAlreadySequenced',
         'Recommendation',
@@ -1321,9 +1422,9 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
         'SecondaryBaselineNearestHit',
         'SecondaryBaselineNearestIdentity',
         'SecondaryBaselineNearestQueryCoverage',
-        'CulturedRumenNearestHit',
-        'CulturedRumenNearestIdentity',
-        'CulturedRumenNearestQueryCoverage',
+        'CulturedProjectNearestHit',
+        'CulturedProjectNearestIdentity',
+        'CulturedProjectNearestQueryCoverage',
         'BaselineNearestHit',
         'BaselineNearestIdentity',
         'BaselineNearestQueryCoverage',
@@ -1357,7 +1458,7 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
         'DiversityMetadataReason',
         'HungateGenomesSameSpecies',
         'SecondaryBaselineGenomesSameSpecies',
-        'CulturedRumenGenomesSameSpecies',
+        'CulturedProjectGenomesSameSpecies',
         'BaselineGenomesSameSpecies',
         'SequencedPartnerGenomesSameSpecies',
         'SelectedPendingGenomesSameSpecies',
@@ -1396,6 +1497,16 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
             values = [
                 row.get('id', 'NA'),
                 row.get('partner_id', 'NA'),
+                row.get('addition_method', 'NA'),
+                row.get('host_species', 'NA'),
+                row.get('host_breed', 'NA'),
+                row.get('host_age_weeks', 'NA'),
+                row.get('production_type', 'NA'),
+                row.get('sample_location', 'NA'),
+                row.get('ruminant_diet', 'NA'),
+                row.get('maldi_instrument', 'NA'),
+                row.get('maldi_library', 'NA'),
+                row.get('maldi_taxon_raw', 'NA'),
                 row.get('selected_for_genome_sequencing', 'NA'),
                 row.get('already_sequenced', 'NA'),
                 support['decision'],
@@ -1418,9 +1529,9 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
                 row.get('secondary_baseline_nearest_hit', 'NA'),
                 row.get('secondary_baseline_nearest_identity', 'NA'),
                 row.get('secondary_baseline_nearest_query_coverage', 'NA'),
-                row.get('cultured_rumen_nearest_hit', row.get('nearest_hit', 'NA')),
-                row.get('cultured_rumen_nearest_identity', row.get('nearest_identity', 'NA')),
-                row.get('cultured_rumen_nearest_query_coverage', row.get('nearest_query_coverage', 'NA')),
+                row.get('cultured_project_nearest_hit', row.get('nearest_hit', 'NA')),
+                row.get('cultured_project_nearest_identity', row.get('nearest_identity', 'NA')),
+                row.get('cultured_project_nearest_query_coverage', row.get('nearest_query_coverage', 'NA')),
                 row.get('nearest_hit', 'NA'),
                 row.get('nearest_identity', 'NA'),
                 row.get('nearest_query_coverage', 'NA'),
@@ -1454,7 +1565,7 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
                 row.get('diversity_metadata_reason', 'NA'),
                 row.get('hungate_genome_count_same_species', 'NA'),
                 row.get('secondary_baseline_genome_count_same_species', 'NA'),
-                row.get('cultured_rumen_genome_count_same_species', row.get('genome_available_count_same_species', 'NA')),
+                row.get('cultured_project_genome_count_same_species', row.get('genome_available_count_same_species', 'NA')),
                 row.get('genome_available_count_same_species', 'NA'),
                 row.get('genome_selected_count_same_species', 'NA'),
                 row.get('genome_pending_count_same_species', 'NA'),
@@ -1481,13 +1592,13 @@ def write_baseline_hits_tsv(path: str | Path, rows):
         'HungateNearestQueryCoverage', 'HungateNearestTaxonomy', 'HungateNoveltyScore',
         'SecondaryBaselineNearestHit', 'SecondaryBaselineDataset', 'SecondaryBaselineNearestIdentity',
         'SecondaryBaselineNearestQueryCoverage', 'SecondaryBaselineNearestTaxonomy', 'SecondaryBaselineNoveltyScore',
-        'CulturedRumenNearestHit', 'CulturedRumenDataset', 'CulturedRumenNearestIdentity',
-        'CulturedRumenNearestQueryCoverage', 'CulturedRumenNearestTaxonomy', 'CulturedRumenNoveltyScore',
+        'CulturedProjectNearestHit', 'CulturedProjectDataset', 'CulturedProjectNearestIdentity',
+        'CulturedProjectNearestQueryCoverage', 'CulturedProjectNearestTaxonomy', 'CulturedProjectNoveltyScore',
     ]
     with open(p, 'w') as fh:
         fh.write('\t'.join(fields) + '\n')
         for row in rows:
-            cultured_hit = row.get('cultured_rumen_nearest_hit') or row.get('nearest_hit', 'NA')
+            cultured_hit = row.get('cultured_project_nearest_hit') or row.get('nearest_hit', 'NA')
             if cultured_hit in (None, '', 'NA', 'None'):
                 continue
             values = [
@@ -1498,11 +1609,11 @@ def write_baseline_hits_tsv(path: str | Path, rows):
                 row.get('secondary_baseline_nearest_hit', 'NA'), row.get('secondary_baseline_nearest_hit_dataset', 'NA'),
                 row.get('secondary_baseline_nearest_identity', 'NA'), row.get('secondary_baseline_nearest_query_coverage', 'NA'),
                 row.get('secondary_baseline_nearest_hit_taxonomy', 'NA'), row.get('secondary_baseline_novelty_score', 'NA'),
-                cultured_hit, row.get('cultured_rumen_nearest_hit_dataset', row.get('nearest_hit_dataset', 'NA')),
-                row.get('cultured_rumen_nearest_identity', row.get('nearest_identity', 'NA')),
-                row.get('cultured_rumen_nearest_query_coverage', row.get('nearest_query_coverage', 'NA')),
-                row.get('cultured_rumen_nearest_hit_taxonomy', row.get('nearest_hit_taxonomy', 'NA')),
-                row.get('cultured_rumen_novelty_score', row.get('novelty_score', 'NA')),
+                cultured_hit, row.get('cultured_project_nearest_hit_dataset', row.get('nearest_hit_dataset', 'NA')),
+                row.get('cultured_project_nearest_identity', row.get('nearest_identity', 'NA')),
+                row.get('cultured_project_nearest_query_coverage', row.get('nearest_query_coverage', 'NA')),
+                row.get('cultured_project_nearest_hit_taxonomy', row.get('nearest_hit_taxonomy', 'NA')),
+                row.get('cultured_project_novelty_score', row.get('novelty_score', 'NA')),
             ]
             safe = [str(value if value is not None else 'NA').replace('\t', ' ').replace('\n', ' ') for value in values]
             fh.write('\t'.join(safe) + '\n')

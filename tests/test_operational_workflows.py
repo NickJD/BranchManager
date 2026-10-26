@@ -34,6 +34,17 @@ from branchmanager.utils.subprocess import run_cmd
 
 
 class OperationalWorkflowTests(unittest.TestCase):
+    def test_database_context_closes_connection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(str(Path(tmpdir) / 'project.sqlite'))
+            db.initialise()
+
+            with db.connect() as conn:
+                conn.execute('SELECT 1')
+
+            with self.assertRaises(sqlite3.ProgrammingError):
+                conn.execute('SELECT 1')
+
     def test_mailroom_reports_fastq_as_unsupported_instead_of_crashing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

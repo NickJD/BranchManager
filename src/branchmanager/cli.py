@@ -146,7 +146,7 @@ def _filter_fasta_to_ids(src: str | Path, dst: str | Path, allowed_ids: set[str]
     return len(records)
 
 
-def _load_qc_rejection_reasons(outdir: str | Path) -> dict:
+def _load_qc_rejection_reasons(outdir: str | Path, extra_manifest: str | Path | None = None) -> dict:
     """Look up why a sequence ID never made it into the current run's accepted
     ID set, using the paper-trail/merge-meeting QC manifest one stage up from
     `outdir` (typically `<root>/02_paper_trail_merge_meeting/failed_qc_sequences/
@@ -162,28 +162,55 @@ def _load_qc_rejection_reasons(outdir: str | Path) -> dict:
         Path(outdir) / 'failed_qc_sequences' / 'failed_qc_manifest.tsv',
     ]
     manifest_path = next((c for c in candidates if c.exists()), None)
-    if manifest_path is None:
-        return reasons
-    try:
-        with open(manifest_path, newline='') as handle:
-            for row in csv.DictReader(handle, delimiter='\t'):
-                seq_id = str(row.get('SequenceID') or '').strip()
-                if not seq_id:
-                    continue
-                status = str(row.get('Status') or '').strip()
-                rec = str(row.get('Recommendation') or '').strip()
-                seq_reasons = str(row.get('Reasons') or '').strip()
-                detail = status or 'failed_qc'
-                if rec:
-                    detail = f'{detail}_recommend_{rec.lower()}'
-                if seq_reasons:
-                    detail = f'{detail}:{seq_reasons}'
-                reasons[seq_id] = detail
-    except Exception:
-        logging.getLogger(__name__).warning(
-            "[PERFORMANCE REVIEW] Could not read QC rejection manifest %s to annotate partner metadata warnings",
-            manifest_path,
-        )
+    if manifest_path is not None:
+        try:
+            with open(manifest_path, newline='') as handle:
+                for row in csv.DictReader(handle, delimiter='\t'):
+                    seq_id = str(row.get('SequenceID') or '').strip()
+                    if not seq_id:
+                        continue
+                    status = str(row.get('Status') or '').strip()
+                    rec = str(row.get('Recommendation') or '').strip()
+                    seq_reasons = str(row.get('Reasons') or '').strip()
+                    detail = status or 'failed_qc'
+                    if rec:
+                        detail = f'{detail}_recommend_{rec.lower()}'
+                    if seq_reasons:
+                        detail = f'{detail}:{seq_reasons}'
+                    reasons[seq_id] = detail
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "[PERFORMANCE REVIEW] Could not read QC rejection manifest %s to annotate partner metadata warnings",
+                manifest_path,
+            )
+    direct_qc_path = Path(outdir) / 'qc_rejections.tsv'
+    if direct_qc_path.is_file():
+        try:
+            with open(direct_qc_path, newline='') as handle:
+                for row in csv.DictReader(handle, delimiter='\t'):
+                    seq_id = str(row.get('ID') or '').strip().split()[0]
+                    if not seq_id:
+                        continue
+                    detail = str(row.get('Reasons') or 'failed_qc').strip()
+                    reasons[seq_id] = f'{reasons[seq_id]}; {detail}' if seq_id in reasons else detail
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "[PERFORMANCE REVIEW] Could not read QC rejection table %s to register failed isolates",
+                direct_qc_path,
+            )
+    if extra_manifest and Path(extra_manifest).is_file():
+        try:
+            with open(extra_manifest, newline='') as handle:
+                for row in csv.DictReader(handle, delimiter='\t'):
+                    seq_id = str(row.get('ID') or row.get('SequenceID') or '').strip()
+                    if not seq_id:
+                        continue
+                    detail = str(row.get('Reasons') or row.get('Reason') or 'failed_qc').strip()
+                    reasons[seq_id] = f'{reasons[seq_id]}; {detail}' if seq_id in reasons else detail
+        except Exception:
+            logging.getLogger(__name__).warning(
+                '[PERFORMANCE REVIEW] Could not read cohort QC failures from %s', extra_manifest,
+            )
     return reasons
 
 
@@ -210,6 +237,139 @@ def _write_rejected_before_assembly(path: str | Path, rejected_rows):
         for source_id, partner_id, already_sequenced, selected_for_sequencing, reason in rejected_rows:
             handle.write(f'{source_id}\t{partner_id}\t{already_sequenced}\t{selected_for_sequencing}\t{reason}\n')
     return str(p)
+
+
+_MARKER_REPLACEMENT_REPORT_FIELDS = [
+    'sequence_id', 'outcome', 'retained_marker', 'comparison', 'qc_comparison',
+    'previous_length', 'incoming_length', 'previous_qc_class', 'incoming_qc_class',
+    'previous_qc_reasons', 'incoming_qc_reasons',
+    'previous_read_count', 'incoming_read_count', 'primer_read_change',
+    'previous_read_ids', 'incoming_read_ids', 'previous_used_read_ids',
+    'incoming_used_read_ids', 'previous_read_files',
+    'incoming_read_files', 'previous_sequence_sha256', 'incoming_sequence_sha256',
+    'details',
+]
+
+_MARKER_QC_RANK = {
+    'FAIL_QC': 0,
+    'QUALITY_UNVERIFIED': 1,
+    'PASS_WITH_WARNINGS': 2,
+    'PASS_HIGH_CONFIDENCE': 3,
+}
+
+
+def _used_marker_read_count(used_read_ids, read_ids, qc_reasons):
+    used = [value.strip() for value in str(used_read_ids or '').split(';') if value.strip()]
+    if used:
+        return len(used)
+    if 'only_one_primer_read_passed_qc' in str(qc_reasons or ''):
+        return 1
+    return len([value for value in str(read_ids or '').split(';') if value.strip()])
+
+
+def _merge_identical_marker_provenance(previous, incoming):
+    """Record new reads for identical bases without downgrading accepted QC."""
+    merged = dict(incoming)
+    for key in ('source_read_ids', 'source_used_read_ids', 'source_read_files'):
+        values = []
+        for item in (previous.get(key), incoming.get(key)):
+            values.extend(value.strip() for value in str(item or '').split(';') if value.strip())
+        merged[key] = ';'.join(dict.fromkeys(values))
+
+    try:
+        checksums = json.loads(previous.get('source_read_checksums_json') or '{}')
+        checksums.update(json.loads(incoming.get('source_read_checksums_json') or '{}'))
+        merged['source_read_checksums_json'] = json.dumps(checksums, sort_keys=True)
+    except (TypeError, ValueError):
+        merged['source_read_checksums_json'] = incoming.get('source_read_checksums_json') or (
+            previous.get('source_read_checksums_json') or '{}'
+        )
+
+    previous_qc = str(previous.get('marker_qc_class') or '').upper()
+    incoming_qc = str(incoming.get('marker_qc_class') or '').upper()
+    if (
+        previous_qc in _MARKER_QC_RANK
+        and incoming_qc in _MARKER_QC_RANK
+        and _MARKER_QC_RANK[incoming_qc] < _MARKER_QC_RANK[previous_qc]
+    ):
+        for key in (
+            'source_manifest', 'source_sequence_file', 'source_sequence_sha256',
+            'marker_qc_class', 'marker_qc_recommendation', 'marker_qc_reasons',
+            'manual_review_status', 'chimera_call', 'chimera_score',
+        ):
+            merged[key] = previous.get(key)
+    return merged
+
+
+def _marker_replacement_report_row(sequence_id, result=None, **overrides):
+    result = dict(result or {})
+    result.update(overrides)
+    previous_qc = str(result.get('previous_qc_class') or '').upper()
+    incoming_qc = str(result.get('incoming_qc_class') or '').upper()
+    if previous_qc and incoming_qc:
+        old_rank = _MARKER_QC_RANK.get(previous_qc, 0)
+        new_rank = _MARKER_QC_RANK.get(incoming_qc, 0)
+        qc_comparison = 'INCOMING_QC_HIGHER' if new_rank > old_rank else (
+            'EXISTING_QC_HIGHER' if old_rank > new_rank else 'SAME_QC_CLASS'
+        )
+    else:
+        qc_comparison = 'QC_COMPARISON_UNAVAILABLE'
+    old_reads = int(result.get('previous_read_count') or 0)
+    new_reads = int(result.get('incoming_read_count') or 0)
+    if old_reads == 1 and new_reads >= 2:
+        primer_change = 'ADDITIONAL_PRIMER_READS_ASSEMBLED'
+    elif new_reads >= 2:
+        primer_change = 'TWO_PRIMER_MARKER'
+    elif new_reads == 1:
+        primer_change = 'SINGLE_PRIMER_MARKER'
+    else:
+        primer_change = 'NO_INCOMING_MARKER'
+    status = str(result.get('status') or result.get('outcome') or 'NOT_PROCESSED')
+    retained = (
+        'INCOMING' if status == 'REPLACED'
+        else 'EXISTING' if status in {
+            'TOO_SHORT', 'FAILED_QC', 'NO_INCOMING_CONSENSUS', 'LOWER_QC_DECLINED',
+        } or status == 'NO'
+        else 'NONE'
+    )
+    return {
+        'sequence_id': str(sequence_id),
+        'outcome': status,
+        'retained_marker': result.get('retained_marker') or retained,
+        'comparison': result.get('comparison') or '',
+        'qc_comparison': result.get('qc_comparison') or qc_comparison,
+        'previous_length': result.get('previous_length', ''),
+        'incoming_length': result.get('incoming_length', ''),
+        'previous_qc_class': previous_qc,
+        'incoming_qc_class': incoming_qc,
+        'previous_qc_reasons': result.get('previous_qc_reasons') or '',
+        'incoming_qc_reasons': result.get('incoming_qc_reasons') or '',
+        'previous_read_count': old_reads,
+        'incoming_read_count': new_reads,
+        'primer_read_change': result.get('primer_read_change') or primer_change,
+        'previous_read_ids': result.get('previous_read_ids') or '',
+        'incoming_read_ids': result.get('incoming_read_ids') or '',
+        'previous_used_read_ids': result.get('previous_used_read_ids') or '',
+        'incoming_used_read_ids': result.get('incoming_used_read_ids') or '',
+        'previous_read_files': result.get('previous_read_files') or '',
+        'incoming_read_files': result.get('incoming_read_files') or '',
+        'previous_sequence_sha256': result.get('previous_sequence_sha256') or '',
+        'incoming_sequence_sha256': result.get('incoming_sequence_sha256') or '',
+        'details': result.get('detail') or result.get('details') or '',
+    }
+
+
+def _write_marker_replacement_report(path: str | Path, rows):
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with open(output, 'w', newline='') as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=_MARKER_REPLACEMENT_REPORT_FIELDS,
+            delimiter='\t', extrasaction='ignore',
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    return str(output)
 
 
 def _load_rejected_before_assembly(path: str | Path) -> list[dict]:
@@ -255,21 +415,74 @@ def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_shor
         raise SystemExit(f'[PERFORMANCE REVIEW] Failed to read partner metadata {metadata_path}: {e}')
 
     run_id_set = {str(x) for x in run_ids}
-    qc_rejection_reasons = _load_qc_rejection_reasons(outdir)
+    qc_rejection_reasons = _load_qc_rejection_reasons(
+        outdir, getattr(args, 'cohort_qc_failures', None),
+    )
     with db.connect() as conn:
         sequence_datasets = {
             str(sequence_id): str(dataset or '')
             for sequence_id, dataset in conn.execute('SELECT id, dataset FROM sequences')
         }
     dataset_roles = db.get_dataset_roles()
+    maldi_sequence_ids = {
+        str(item.get('sequence_id') or '')
+        for item in db.get_maldi_identifications()
+        if item.get('sequence_id')
+    }
     resolved_rows = []
     warnings = []
     rejected_before_assembly = []
+    markerless_qc_failures = {}
     matched_sources = set()
     for row in metadata_rows:
         source_id = str(row.get('source_id') or '').strip()
         if not source_id:
             continue
+        qc_reason = qc_rejection_reasons.get(source_id)
+        if qc_reason and source_id not in run_id_set:
+            existing = db.resolve_sequence_id(source_id)
+            if existing:
+                with db.connect() as conn:
+                    sequence_row = conn.execute(
+                        'SELECT sequence FROM sequences WHERE id=?', (existing,),
+                    ).fetchone()
+                has_marker = bool(sequence_row and str(sequence_row[0] or '').strip())
+                if has_marker:
+                    db.record_marker_replacement_attempt(
+                        existing, 'FAILED_QC', qc_reason,
+                        source_manifest=str(Path(outdir).parent / '02_paper_trail_merge_meeting' / 'run_manifest.json'),
+                        source_fasta=str(Path(outdir).parent / '02_paper_trail_merge_meeting' / 'assembled.fasta'),
+                        incoming_qc_class='FAIL_QC',
+                        incoming_qc_reasons=qc_reason,
+                    )
+                    warnings.append((source_id, f'incoming_marker_failed_qc_existing_marker_retained:{qc_reason}'))
+                else:
+                    markerless_qc_failures[existing] = qc_reason
+                rejected_before_assembly.append((
+                    source_id,
+                    row.get('partner_id') or source_id,
+                    bool(row.get('selected_for_wgs')),
+                    bool(row.get('selected_for_sequencing')),
+                    qc_reason,
+                ))
+                if has_marker:
+                    # Keep the accepted marker and its taxonomy; the failed
+                    # incoming attempt is recorded separately below.
+                    pass
+            else:
+                run_dataset = getattr(args, 'dataset', 'user')
+                db.upsert_dataset_role(run_dataset, 'candidate', genomes_available=False)
+                db.insert_sequences([(source_id, '')], dataset=run_dataset)
+                sequence_datasets[source_id] = run_dataset
+                dataset_roles[run_dataset] = {'role': 'candidate'}
+                markerless_qc_failures[source_id] = qc_reason
+                rejected_before_assembly.append((
+                    source_id,
+                    row.get('partner_id') or source_id,
+                    bool(row.get('selected_for_wgs')),
+                    bool(row.get('selected_for_sequencing')),
+                    qc_reason,
+                ))
         mapped = orig_to_short.get(source_id)
         if not mapped:
             try:
@@ -285,19 +498,25 @@ def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_shor
             if existing:
                 mapped = existing
         if not mapped:
-            qc_reason = qc_rejection_reasons.get(source_id)
             if qc_reason:
-                warnings.append((source_id, f'metadata_id_rejected_before_assembly:{qc_reason}'))
+                # The failed isolate is still a database entity. Store an
+                # empty marker row so a later submission can attach its first
+                # passing marker using the same isolate ID.
+                run_dataset = getattr(args, 'dataset', 'user')
+                db.upsert_dataset_role(run_dataset, 'candidate', genomes_available=False)
+                db.insert_sequences([(source_id, '')], dataset=run_dataset)
+                sequence_datasets[source_id] = run_dataset
+                dataset_roles[run_dataset] = {'role': 'candidate'}
+                mapped = source_id
+                markerless_qc_failures[mapped] = qc_reason
                 rejected_before_assembly.append((
-                    source_id,
-                    row.get('partner_id') or source_id,
+                    source_id, row.get('partner_id') or source_id,
                     bool(row.get('selected_for_wgs')),
-                    bool(row.get('selected_for_sequencing')),
-                    qc_reason,
+                    bool(row.get('selected_for_sequencing')), qc_reason,
                 ))
             else:
                 warnings.append((source_id, 'metadata_id_not_found_in_project_database_or_current_run'))
-            continue
+                continue
 
         mapped_dataset = sequence_datasets.get(str(mapped), '')
         if dataset_roles.get(mapped_dataset, {}).get('role') == 'baseline':
@@ -305,6 +524,14 @@ def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_shor
             continue
 
         matched_sources.add(str(mapped))
+        existing_metadata = db.get_sequencing_metadata_for_ids([mapped]).get(str(mapped), {})
+        project_metadata = dict(existing_metadata.get('project_metadata') or {})
+        project_metadata.update(row.get('project_metadata') or {})
+        addition_method = row.get('addition_method')
+        if str(mapped) in run_id_set and str(mapped) in maldi_sequence_ids:
+            addition_method = 'both'
+        if addition_method:
+            project_metadata['addition_method'] = addition_method
         resolved_rows.append({
             'id': mapped,
             'partner_id': row.get('partner_id') or source_id,
@@ -317,13 +544,44 @@ def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_shor
             'source_file': str(metadata_path),
             'raw_selected_value': row.get('raw_selected_value', ''),
             'raw_commitment_value': row.get('raw_commitment_value', ''),
-            'project_metadata': row.get('project_metadata', {}),
+            'project_metadata': project_metadata,
         })
 
     for run_id in sorted(run_id_set - matched_sources):
         warnings.append((run_id, 'run_sequence_missing_from_partner_metadata'))
 
     inserted = db.upsert_sequencing_metadata(resolved_rows)
+    if markerless_qc_failures:
+        provenance_rows = []
+        for sequence_id, reason in markerless_qc_failures.items():
+            provenance_rows.append({
+                'sequence_id': sequence_id,
+                'source_manifest': str(Path(outdir).parent / '02_paper_trail_merge_meeting' / 'run_manifest.json'),
+                'source_sequence_file': '',
+                'marker_qc_class': 'FAIL_QC',
+                'marker_qc_recommendation': 'RESEQUENCE',
+                'marker_qc_reasons': reason,
+                'manual_review_status': 'NOT_REVIEWED',
+                'chimera_call': 'NOT_RUN',
+            })
+        db.upsert_sequence_provenance(provenance_rows)
+        for sequence_id, reason in markerless_qc_failures.items():
+            # A markerless isolate must not carry a classifier assignment from
+            # an earlier incomplete/legacy import. MALDI evidence is separate.
+            with db.connect() as conn:
+                sequence_row = conn.execute(
+                    'SELECT sequence FROM sequences WHERE id=?', (sequence_id,),
+                ).fetchone()
+                if not sequence_row or str(sequence_row[0] or '').strip():
+                    continue
+                conn.execute('DELETE FROM taxonomy WHERE id=?', (sequence_id,))
+                conn.execute('DELETE FROM taxonomy_alt WHERE id=?', (sequence_id,))
+                conn.execute('DELETE FROM distances WHERE id=?', (sequence_id,))
+                conn.execute('DELETE FROM classification_evidence WHERE sequence_id=?', (sequence_id,))
+            db.update_isolate_status(
+                sequence_id, 'MARKER_QC_FAILED', detail=reason,
+                source_file=str(Path(outdir) / 'qc_rejections.tsv'),
+            )
     log.info(
         '[PERFORMANCE REVIEW] Loaded partner sequencing metadata from %s: %d matched rows, %d warning(s)',
         metadata_path,
@@ -531,7 +789,7 @@ def _write_detailed_output_guide(outdir: Path, rows):
         "- `EvidenceQuality`: whether the marker classification and placement warnings are strong enough to support selection.",
         "- `MarkerQC`, `MarkerReview`: Paper Trail/Merge Meeting evidence and any explicit manual decision. Unreviewed warning/unverified markers cannot become PRIMARY/BACKUP.",
         "- `CulturedGap`: distance from the cultured baseline: large below 97 percent, moderate from 97 to below 98.65 percent, small at or above 98.65 percent.",
-        "- `ProjectCoverage`: number of other partner candidates at or above 97 percent identity, including the current rolling collection but excluding the query itself.",
+        "- `ProjectCoverage`: number of other partner candidates at or above 97 percent identity and 95 percent query coverage, including selected-for-sequencing partner isolates, the current rolling collection, and excluding the query itself.",
         "- `ReferenceContext`: divergence from the external reference using 94.5 and 98.65 percent full-length 16S heuristic boundaries.",
         "- `CommittedGenomesSameAssessmentSpecies`, `SelectedPendingGenomesSameAssessmentSpecies`, `PangenomeTarget`, `PangenomeGap`: exact GTDB-species coverage and commitments. Baselines and completed partner genomes are available; selected pending isolates reserve planned slots. `SpeciesContext` adds a soft near-species or cluster-level note without relaxing the hard species gate.",
         "- `LocalTreeFigure`: relative path to the grouped local-clade PNG for visual inspection.",
@@ -542,7 +800,7 @@ def _write_detailed_output_guide(outdir: Path, rows):
         "",
         "- `GTDBTaxonomy`, `GTDBClassificationHit`, `GTDBClassificationIdentity`, `GTDBClassificationConfidence`, `GTDBQueryCoverage`: authoritative GTDB assignment and supporting alignment extent.",
         "- `Taxonomy_<DB>`, `ClassificationHit_<DB>`, `Identity_<DB>`, `Confidence_<DB>`: assignment from additional databases such as GG2, SILVA, or NCBI.",
-        "- `BaselineNearestHit`, `BaselineNearestHitDataset`, `BaselineNearestHitTaxonomy`, `BaselineNearestIdentity`: closest cultured isolate, for example Hungate.",
+        "- `CulturedProjectNearestHit`, `CulturedProjectNearestHitDataset`, `CulturedProjectNearestHitTaxonomy`, `CulturedProjectNearestIdentity`, `CulturedProjectNearestQueryCoverage`: closest sequence in the combined cultured-project pool; inspect identity together with query coverage.",
         "- `ProjectNearestHit`, `ProjectNearestIdentity`, `ProjectNoveltyScore`: comparison against all partner candidates in the rolling project collection, excluding self.",
         "- `GTDBReferenceNearestHit`, `GTDBReferenceNearestIdentity`, `GTDBReferenceNoveltyScore`: nearest hit and context against the GTDB reference FASTA.",
         "- `PartnerID`, `SelectedForGenomeSequencing`, `GenomeAlreadySequenced`, `BaselineGenomesSameAssessmentSpecies`, `SequencedPartnerGenomesSameAssessmentSpecies`, `SelectedPendingGenomesSameAssessmentSpecies`, `PangenomeGap`: rolling genome-collection context. Assessment species is GTDB for bacterial/archaeal Performance Reviews.",
@@ -554,21 +812,21 @@ def _write_detailed_output_guide(outdir: Path, rows):
         "",
         "`assessment/novelty_metrics.tsv` contains cultured-baseline novelty, rolling project novelty, GTDB-reference context, and genome-collection coverage.",
         "",
-        "- Leading `Nearest*`, `NoveltyScore`, `Crowding`, and `SequencingPriority` columns mirror the cultured-rumen comparison when a baseline pool exists; otherwise they mirror project novelty.",
-        "- `Hungate*`, `SecondaryBaseline*`, and `CulturedRumen*` columns keep priority, secondary, and combined cultured-rumen evidence separate.",
-        "- `Project*` columns compare against all partner candidate datasets, including the current rolling collection and excluding each query's self-hit. Baseline datasets are not mixed into this pool.",
+        "- Leading `Nearest*`, `NoveltyScore`, `Crowding`, and `SequencingPriority` columns mirror the cultured-project comparison when a baseline pool exists; otherwise they mirror project novelty.",
+        "- `Hungate*`, `SecondaryBaseline*`, and `CulturedProject*` columns keep priority, secondary, and combined cultured-project evidence separate.",
+        "- `Project*` columns compare against all partner candidate datasets, including partner isolates selected for sequencing and the current rolling collection, while excluding each query's self-hit. Baseline datasets are not mixed into this pool.",
         "- `Reference*` columns compare against the chosen external reference FASTA supplied with `--ref`, usually GTDB. These are separate from the baseline/project novelty scores.",
         "- `GenomeCollection*` columns compare against every baseline genome and every partner isolate with a genome already available. Exact same-GTDB-species counts drive the nine-genome target, while baseline identity and query coverage prevent near-identical cultured isolates from consuming diversity-panel ranks.",
-        "- `NearestIdentity`: vsearch global-alignment percent identity to the nearest sequence in that pool.",
-        "- `NearestQueryCoverage`, `NearestAlignmentLength`: how much marker evidence supports that identity; low-coverage identity must not be treated as a full-length equivalent.",
-        "- `Novel`: `True` when nearest identity is below 97 percent.",
-        "- `MatchesGE99`, `MatchesGE97`, `MatchesGE95`: number of pool sequences at or above 99, 97, and 95 percent identity. These describe how busy the local neighbourhood is.",
-        "- `Crowding`: `isolated` when there is at most one hit at both 99 and 97 percent; `sparse` when <=3 hits at 97 percent; `moderate` when <=10 hits at 97 percent; otherwise `crowded`.",
+        "- `NearestIdentity`: vsearch global-alignment percent identity to the highest-identity sequence with at least 95% query coverage; if no sequence meets that coverage, the nearest hit is `None` and unsupported partial matches do not drive novelty.",
+        "- `NearestQueryCoverage`, `NearestAlignmentLength`: how much marker evidence supports that identity. Nearest hits are selected by highest identity among alignments covering at least 95% of the query, then by coverage and alignment length for ties.",
+        "- `Novel`: `True` when no hit reaches 95 percent query coverage or the best qualifying hit is below 97 percent identity.",
+        "- `MatchesGE99`, `MatchesGE97`, `MatchesGE95`: number of pool sequences at or above 99, 97, and 95 percent identity with at least 95 percent query coverage. These describe how busy the supported local neighbourhood is.",
+        "- `Crowding`: `isolated` when there is at most one hit at both 99 and 97 percent; `sparse` when <=3 hits at 97 percent; `moderate` when <=10 hits at 97 percent; otherwise `crowded`. Only alignments covering at least 95 percent of the query count.",
         "- `NoveltyScore`: 0-100 score where higher means more novel and less crowded. It combines distance from the nearest hit with density bonuses for sparse neighbourhoods.",
-        "- `SequencingPriority`: `HIGH` for <97 percent identity with few close neighbours, `MEDIUM` for moderately novel/sparse cases, otherwise `LOW`.",
+        "- `SequencingPriority`: `HIGH` for <97 percent identity among hits with at least 95 percent query coverage and few close neighbours, `MEDIUM` for moderately novel/sparse cases, otherwise `LOW`.",
         "- `DensitySource`: names the pool used, for example `baseline:Hungate`, `project_collection`, `target_fasta`, or `reference_fasta` fallback.",
         "",
-        "Interpretation: a sequence far from Hungate but close to non-Hungate isolates is likely novel relative to cultured rumen isolate collections, but not necessarily novel relative to everything already supplied to the project.",
+        "Interpretation: a sequence distant from one named baseline but close to another cultured-project sequence may be novel relative to the first baseline, but not relative to all project evidence.",
         "",
         "## Taxonomy Metrics",
         "",
@@ -593,10 +851,13 @@ def _write_detailed_output_guide(outdir: Path, rows):
         "- `tree/current_tree.nwk`: tree to upload to iTOL.",
         "- `itol/phylum.itol`, `itol/family.itol`, `itol/genus.itol`: taxonomy colour strips.",
         "- `itol/dataset_membership.itol`: dataset-of-origin colour strip.",
+        "- `itol/marker_replacement_status.itol`: red tree-tip markers for isolates whose new marker failed QC and whose previous marker remains in use.",
         "- `itol/novelty.itol`: novelty/nearest-identity colour strip.",
-        "- `assessment/neighbourhoods/clade_*.png`: compact labelled subtrees with selection-set role/rank and MSA pident to the P1 isolate. Nearest baseline hits are forced into the displayed context.",
+        "- `assessment/neighbourhoods/clade_*.png`: compact labelled subtrees with selection-set role/rank, MSA pident to the P1 isolate, and red triangles for retained old markers after failed resequencing QC. Nearest baseline hits are forced into the displayed context.",
         "- `assessment/neighbourhoods/clade_*_pairwise_pident.tsv`: all displayed leaf-to-leaf MSA percent identities and compared-column counts.",
         "- `assessment/neighbourhoods/neighbourhood_manifest.tsv`: maps each assessed ID to its figure/pident table, P1 identity anchor, forced baseline hits, and displayed context.",
+        "- `assessment/marker_replacement_report.tsv`: per-isolate replacement outcome, previous/incoming QC, marker lengths, read support, and which marker was retained. `assessment/replaced_markers.fasta` contains the exact incoming sequences applied. Replacement consensus minimum is the normal 800 bp QC threshold.",
+        "- `assessment/marker_replacement_history.tsv`: append-only replacement attempt history with outcome, sequence hashes, QC details, and source paths; successful replacements are also retained in the project database.",
         "",
         "BranchManager keeps iTOL `DATASET_COLORSTRIP` files only. Older branch `TREE_COLORS` and symbol-strip variants duplicated the same metadata and are removed to keep outputs readable.",
         "",
@@ -635,6 +896,10 @@ def _write_output_explanations(outdir: str):
         ('qc_rejections.tsv', 'Per-sequence QC rejection table. Columns: ID, Length, NCount, NPercent, Reasons, MinLength, MaxNPercent. Reasons explain exactly why each sequence was filtered before downstream analysis.'),
         ('partner_metadata_warnings.tsv', 'Warnings from --partner-metadata mapping. Rows indicate metadata IDs not found in the project database/current run, baseline IDs supplied as partner metadata, or current-run sequences missing from the metadata table.'),
         ('marker_qc_provenance.tsv', 'Per-isolate bridge from Paper Trail/Merge Meeting raw reads and marker QC into Performance Review, including source checksums, manual review, and chimera call.'),
+        ('marker_replacement_report.tsv', 'Per-isolate replacement summary comparing prior and incoming QC class, length, read sources, final outcome, and which marker was retained.'),
+        ('replaced_markers.fasta', 'Exact incoming marker sequences applied as replacements in this Performance Review run.'),
+        ('marker_replacement_history.tsv', 'Append-only record of marker replacement attempts and successful replacements, including outcomes, old/new sequence hashes, QC reasons, and source paths. The project database retains this history across runs.'),
+        ('marker_replacement_status.itol', 'iTOL colour strip: red marks a tree leaf whose attempted replacement failed QC and whose previous marker is retained.'),
         ('chimera_screen.tsv', 'Reference-UCHIME marker screen. CHIMERA, INDETERMINATE, SKIPPED, or NOT_RUN calls force selection evidence to review.'),
         ('decision_changes.tsv', 'Difference between the two latest stored assessment snapshots, including recommendation, set role, pangenome gap, and tracked evidence changes.'),
         ('run_manifest.json', 'Machine-readable workflow manifest with input/output SHA256 checksums, software/tool versions, stage status, timestamps, warnings, and failure details.'),
@@ -653,8 +918,8 @@ def _write_output_explanations(outdir: str):
         ('novelty_matches.tsv', 'vsearch BLAST-like output used to compute nearest-neighbour novelty identities.'),
         ('novelty_metrics.tsv', (
             'Per-sequence novelty metrics. The leading Nearest*/NoveltyScore columns mirror the '
-            'cultured-rumen comparison when available; explicit Hungate*, SecondaryBaseline*, and '
-            'CulturedRumen* columns separate baseline-tier evidence, and Project* columns compare against all partner candidates '
+            'cultured-project comparison when available; explicit Hungate*, SecondaryBaseline*, and '
+            'CulturedProject* columns separate baseline-tier evidence, and Project* columns compare against all partner candidates '
             'stored in the DB. Reference* columns compare against the external reference FASTA, usually '
             'GTDB. GenomeCollection* and Pangenome* columns add rolling genome-coverage context. '
             'DensitySource columns name the comparison pool.'
@@ -849,6 +1114,9 @@ def _organise_run_outputs(outdir: str, *, primary_db_name: str | None = None):
     # Overall assessment and prioritisation reports.
     for name in (
         'sequence_assessment.tsv',
+        'marker_replacement_report.tsv',
+        'marker_replacement_history.tsv',
+        'replaced_markers.fasta',
         'cluster_summary.tsv',
         'clusters.csv',
         'backup_candidates.tsv',
@@ -910,6 +1178,7 @@ def _organise_run_outputs(outdir: str, *, primary_db_name: str | None = None):
         'itol_genus_colours.itol': 'genus.itol',
         'itol_dataset_membership.itol': 'dataset_membership.itol',
         'itol_baseline_tier.itol': 'baseline_tier.itol',
+        'itol_marker_replacement_status.itol': 'marker_replacement_status.itol',
         'itol_novelty.itol': 'novelty.itol',
         'itol_user_colours.itol': 'user_colours.itol',
         'filing_cabinet_dataset.itol': 'filing_cabinet_dataset.itol',
@@ -1110,6 +1379,7 @@ def _load_performance_review_baseline(
                     ref_fasta=baseline_ref,
                     taxa_tsv=baseline_taxa_tsv,
                     threads=threads,
+                    db_name=getattr(args, 'ref_name', None) or _classify_derive_db_name(baseline_ref),
                 )
                 tax_entries, dist_entries = load_classification_results_for_dataset(
                     class_out,
@@ -1409,7 +1679,7 @@ def _cmd_filing_cabinet_impl(args):
                 )
                 _store_alt_taxonomy_in_db(db, all_results, main_db)
             else:
-                class_out = classify.run_classification(input_for_classify, outdir, ref_fasta=effective_ref, taxa_tsv=effective_taxa_tsv, threads=threads)
+                class_out = classify.run_classification(input_for_classify, outdir, ref_fasta=effective_ref, taxa_tsv=effective_taxa_tsv, threads=threads, db_name=ref_name)
 
             # parse classification output and persist taxonomy/distances only for
             # the registered baseline sequence IDs (short ids present in the DB)
@@ -1677,7 +1947,8 @@ def cmd_filing_cabinet(args):
     for source in getattr(args, 'alt_ref', None) or []:
         manifest.add_input(source, role='alternate_reference')
     for source in getattr(args, 'alt_taxa', None) or []:
-        manifest.add_input(source, role='alternate_reference_taxonomy')
+        if source:
+            manifest.add_input(source, role='alternate_reference_taxonomy')
 
     staged_path = outdir / '.filing_cabinet_project.sqlite'
     lock_path = original.with_name(original.name + '.lock')
@@ -1923,10 +2194,15 @@ def _cmd_performance_review_impl(args):
     used_ids = set(db.get_all_ids())
     orig_to_short = {}
     mapped_records = []
+    initial_marker_records = []
+    pending_initial_markers = {}
+    replaced_marker_records = []
     skipped_existing = 0
     resequencing_decisions = []
+    replacement_report_rows = []
     provenance_for_replacements = {}
     declined_resequencing_ids = set()
+    failed_resequencing_ids = set()
 
     def _incoming_ab1_files(sequence_id):
         """Find raw-read paths recorded alongside the incoming marker FASTA."""
@@ -1969,7 +2245,11 @@ def _cmd_performance_review_impl(args):
         else:
             try:
                 logging.getLogger(__name__).info("[PERFORMANCE REVIEW] Running pre-insert classification to filter by domain=%s", kingdom)
-                early_class_out = classify.run_classification(str(candidate_input), outdir, ref_fasta=effective_ref, taxa_tsv=effective_taxa_tsv, threads=threads)
+                early_class_out = classify.run_classification(
+                    str(candidate_input), outdir, ref_fasta=effective_ref,
+                    taxa_tsv=effective_taxa_tsv, threads=threads,
+                    db_name=getattr(args, 'ref_name', None) or _classify_derive_db_name(effective_ref),
+                )
                 allowed_qids = _classification_ids_matching_kingdom(early_class_out, kingdom_text)
                 logging.getLogger(__name__).info("[PERFORMANCE REVIEW] Domain filter: %d QC-passing sequences match %s", len(allowed_qids), kingdom)
             except Exception as e:
@@ -1994,6 +2274,29 @@ def _cmd_performance_review_impl(args):
         # The "INSERT OR IGNORE" during insert_sequences will prevent DB duplicates.
         existing_id = db.resolve_sequence_id(h)
         if existing_id and existing_id in used_ids:
+            with db.connect() as conn:
+                stored_row = conn.execute(
+                    'SELECT sequence FROM sequences WHERE id=?', (existing_id,),
+                ).fetchone()
+            if stored_row and not str(stored_row[0] or '').strip():
+                previous_pending = pending_initial_markers.get(existing_id)
+                if previous_pending is not None and previous_pending != s:
+                    raise SystemExit(
+                        f'[PERFORMANCE REVIEW] Multiple different marker sequences were submitted for '
+                        f'markerless isolate {existing_id!r} in one run.'
+                    )
+                if previous_pending is None:
+                    pending_initial_markers[existing_id] = s
+                    initial_marker_records.append((existing_id, s))
+                    mapped_records.append((existing_id, s))
+                orig_to_short[h] = existing_id
+                try:
+                    canonical_id = canonicalise_sequence_id(h)
+                    if canonical_id:
+                        orig_to_short[canonical_id] = existing_id
+                except Exception:
+                    pass
+                continue
             try:
                 db.assert_sequence_compatible(existing_id, s)
             except ValueError as e:
@@ -2019,6 +2322,7 @@ def _cmd_performance_review_impl(args):
                 }
                 resequencing_decisions.append(decision_row)
                 _write_resequencing_decisions()
+                provenance_row = {}
                 if approved:
                     from branchmanager.marker_provenance import load_marker_provenance
                     if existing_id not in provenance_for_replacements:
@@ -2038,31 +2342,83 @@ def _cmd_performance_review_impl(args):
                     qc_reasons = str(provenance_row.get('marker_qc_reasons') or 'no_marker_qc_sidecar')
                     decision_row['qc_class'] = qc_class
                     decision_row['qc_reasons'] = qc_reasons
-                    if qc_class != 'PASS_HIGH_CONFIDENCE':
+                    previous_provenance = db.get_sequence_provenance([existing_id]).get(existing_id, {})
+                    previous_qc_class = str(
+                        previous_provenance.get('marker_qc_class') or '',
+                    ).upper()
+                    if (
+                        len(s) >= 800
+                        and previous_qc_class in _MARKER_QC_RANK
+                        and qc_class in _MARKER_QC_RANK
+                        and _MARKER_QC_RANK[qc_class] < _MARKER_QC_RANK[previous_qc_class]
+                    ):
                         print(
-                            f'[DB] User approved resequencing for {existing_id}; retaining incoming marker '
-                            f'despite QC class {qc_class}. QC reasons: {qc_reasons}'
+                            f'[DB] Incoming marker for {existing_id} has lower QC '
+                            f'({qc_class}) than the stored marker ({previous_qc_class}).'
                         )
-                    decision_row['qc_review_decision'] = 'USER_APPROVED_RESEQUENCING_QC_RETAINED'
+                        try:
+                            qc_response = input(
+                                f'Use the lower-QC incoming marker for {existing_id}? [y/N] ',
+                            ).strip().lower()
+                        except EOFError:
+                            qc_response = ''
+                        approved = qc_response in {'y', 'yes'}
+                        decision_row['qc_review_decision'] = (
+                            'USER_APPROVED_LOWER_QC_REPLACEMENT'
+                            if approved else 'USER_DECLINED_LOWER_QC_REPLACEMENT'
+                        )
+                        if not approved:
+                            decision_row['detail'] = (
+                                f'{decision_row["detail"]}; lower-QC replacement declined '
+                                f'({qc_class} versus {previous_qc_class})'
+                            )
+                            db.record_marker_replacement_attempt(
+                                existing_id, 'LOWER_QC_DECLINED',
+                                f'user retained existing {previous_qc_class} marker over incoming {qc_class} marker',
+                                source_manifest=str(Path(outdir) / 'run_manifest.json'),
+                                source_fasta=str(args.input),
+                                incoming_qc_class=qc_class,
+                                incoming_qc_reasons=qc_reasons,
+                                incoming_sequence=s,
+                            )
+                    else:
+                        decision_row['qc_review_decision'] = 'USER_APPROVED_RESEQUENCING'
                     _write_resequencing_decisions()
+                if approved:
                     replacement = {**provenance_row, 'sequence_id': existing_id, 'sequence': s}
                     result = db.replace_selected_markers(
                         [replacement], source_manifest=str(Path(outdir) / 'run_manifest.json'),
                         source_fasta=str(args.input), allow_unselected=True,
                     )[0]
+                    replacement_report_rows.append(
+                        _marker_replacement_report_row(existing_id, result)
+                    )
                     if result.get('status') != 'REPLACED':
                         detail = result.get('detail') or result.get('status')
                         decision_row['detail'] = f'{decision_row["detail"]}; replacement not applied: {detail}'
-                        print(f'[DB] Could not replace {existing_id}; keeping its stored sequence and continuing: {detail}')
+                        _write_resequencing_decisions()
+                        if result.get('status') != 'TOO_SHORT':
+                            raise SystemExit(
+                                f'[PERFORMANCE REVIEW] Approved resequencing for {existing_id!r} could not be applied '
+                                f'({result.get("status")}: {detail}); inspect resequencing_conflicts.tsv and resolve '
+                                'the replacement eligibility issue before rerunning the review.'
+                            )
                         with db.connect() as conn:
                             existing_row = conn.execute(
                                 'SELECT sequence FROM sequences WHERE id=?', (existing_id,),
                             ).fetchone()
-                        if existing_row and existing_row[0]:
-                            mapped_records.append((existing_id, existing_row[0]))
-                        else:
-                            print(f'[DB] Stored sequence for {existing_id} is unavailable; skipping this isolate.')
-                            decision_row['detail'] += '; isolate skipped because stored sequence is unavailable'
+                        if not existing_row or not existing_row[0]:
+                            raise SystemExit(
+                                f'[PERFORMANCE REVIEW] Replacement for {existing_id!r} failed QC and no stored marker '
+                                'is available to retain.'
+                            )
+                        mapped_records.append((existing_id, existing_row[0]))
+                        if result.get('status') == 'TOO_SHORT':
+                            failed_resequencing_ids.add(existing_id)
+                            print(
+                                f'[DB] Replacement for {existing_id} did not meet the 800 bp minimum ({detail}); '
+                                'retaining and flagging the old marker.'
+                            )
                     else:
                         provenance_for_replacements[existing_id] = replacement
                         db.upsert_sequence_provenance([replacement])
@@ -2071,6 +2427,7 @@ def _cmd_performance_review_impl(args):
                             source_file=str(args.input),
                         )
                         mapped_records.append((existing_id, s))
+                        replaced_marker_records.append((existing_id, s))
                         short = existing_id
                     _write_resequencing_decisions()
                     short = existing_id
@@ -2081,11 +2438,38 @@ def _cmd_performance_review_impl(args):
                         existing_row = conn.execute(
                             'SELECT sequence FROM sequences WHERE id=?', (existing_id,),
                         ).fetchone()
+                    previous_provenance = db.get_sequence_provenance([existing_id]).get(existing_id, {})
                     existing = existing_row[0] if existing_row else None
                     if existing:
                         mapped_records.append((short, existing))
                     else:
                         raise SystemExit(f'[DB] Existing sequence {existing_id!r} could not be loaded after declining resequencing.')
+                    lower_qc_declined = (
+                        decision_row.get('qc_review_decision') == 'USER_DECLINED_LOWER_QC_REPLACEMENT'
+                    )
+                    replacement_report_rows.append(_marker_replacement_report_row(
+                        existing_id,
+                        {
+                            'status': 'LOWER_QC_DECLINED' if lower_qc_declined else 'USER_DECLINED',
+                            'detail': (
+                                f'user retained existing {previous_provenance.get("marker_qc_class") or "QC"} '
+                                f'marker over incoming {provenance_row.get("marker_qc_class") or "lower-QC"} marker'
+                                if lower_qc_declined
+                                else 'user declined replacement; existing marker retained'
+                            ),
+                            'retained_marker': 'EXISTING',
+                            'previous_length': len(existing),
+                            'previous_qc_class': previous_provenance.get('marker_qc_class') or '',
+                            'previous_qc_reasons': previous_provenance.get('marker_qc_reasons') or '',
+                            'previous_read_ids': previous_provenance.get('source_read_ids') or '',
+                            'previous_read_files': previous_provenance.get('source_read_files') or '',
+                            'incoming_length': len(s) if lower_qc_declined else '',
+                            'incoming_qc_class': provenance_row.get('marker_qc_class') or '',
+                            'incoming_qc_reasons': provenance_row.get('marker_qc_reasons') or '',
+                            'incoming_read_ids': provenance_row.get('source_read_ids') or '',
+                            'incoming_read_files': ';'.join(incoming_files),
+                        },
+                    ))
                 orig_to_short[h] = short
                 try:
                     cid = canonicalise_sequence_id(h)
@@ -2095,6 +2479,65 @@ def _cmd_performance_review_impl(args):
                     pass
                 skipped_existing += 1
                 continue
+            incoming_files = _incoming_ab1_files(existing_id)
+            if incoming_files:
+                from branchmanager.marker_provenance import load_marker_provenance
+                incoming_rows, _ = load_marker_provenance(
+                    args.input,
+                    qc_path=getattr(args, 'marker_qc', None),
+                    review_path=getattr(args, 'marker_review', None),
+                    id_map={h: existing_id},
+                    accept_unverified=bool(getattr(args, 'accept_unverified_marker_qc', False)),
+                )
+                incoming = next(
+                    (row for row in incoming_rows if row.get('sequence_id') == existing_id),
+                    {'sequence_id': existing_id},
+                )
+                previous = db.get_sequence_provenance([existing_id]).get(existing_id, {})
+                merged_provenance = _merge_identical_marker_provenance(previous, incoming)
+                db.upsert_sequence_provenance([merged_provenance])
+                db.record_marker_replacement_attempt(
+                    existing_id, 'SEQUENCE_UNCHANGED',
+                    'incoming sequence is identical to the stored marker; existing sequence retained',
+                    source_manifest=str(incoming.get('source_manifest') or ''),
+                    source_fasta=str(incoming.get('source_sequence_file') or args.input),
+                    incoming_qc_class=incoming.get('marker_qc_class') or '',
+                    incoming_qc_reasons=incoming.get('marker_qc_reasons') or '',
+                    incoming_sequence=s,
+                )
+                replacement_report_rows.append(_marker_replacement_report_row(
+                    existing_id,
+                    {
+                        'status': 'SEQUENCE_UNCHANGED',
+                        'detail': 'incoming sequence is identical to the stored marker; incoming read provenance recorded',
+                        'retained_marker': 'EXISTING',
+                        'comparison': 'SEQUENCE_IDENTICAL',
+                        'previous_length': len(s),
+                        'incoming_length': len(s),
+                        'previous_qc_class': previous.get('marker_qc_class') or '',
+                        'incoming_qc_class': incoming.get('marker_qc_class') or '',
+                        'previous_qc_reasons': previous.get('marker_qc_reasons') or '',
+                        'incoming_qc_reasons': incoming.get('marker_qc_reasons') or '',
+                        'previous_read_ids': previous.get('source_read_ids') or '',
+                        'incoming_read_ids': incoming.get('source_read_ids') or '',
+                        'previous_used_read_ids': previous.get('source_used_read_ids') or '',
+                        'incoming_used_read_ids': incoming.get('source_used_read_ids') or '',
+                        'previous_read_count': _used_marker_read_count(
+                            previous.get('source_used_read_ids'),
+                            previous.get('source_read_ids'),
+                            previous.get('marker_qc_reasons'),
+                        ),
+                        'incoming_read_count': _used_marker_read_count(
+                            incoming.get('source_used_read_ids'),
+                            incoming.get('source_read_ids'),
+                            incoming.get('marker_qc_reasons'),
+                        ),
+                        'previous_read_files': previous.get('source_read_files') or '',
+                        'incoming_read_files': ';'.join(incoming_files),
+                        'previous_sequence_sha256': previous.get('source_sequence_sha256') or '',
+                        'incoming_sequence_sha256': incoming.get('source_sequence_sha256') or '',
+                    },
+                ))
             skipped_existing += 1
             short = existing_id
             orig_to_short[h] = short
@@ -2125,6 +2568,14 @@ def _cmd_performance_review_impl(args):
                 pass
     if skipped_existing:
         logging.getLogger(__name__).info("[DB] Found %d sequences already in DB; keeping them for tree inclusion", skipped_existing)
+    _write_marker_replacement_report(
+        Path(outdir) / 'marker_replacement_report.tsv',
+        replacement_report_rows,
+    )
+    write_fasta(
+        replaced_marker_records,
+        str(Path(outdir) / 'replaced_markers.fasta'),
+    )
     write_fasta(mapped_records, str(current_dataset_fasta))
     if resequencing_decisions:
         decision_path = Path(outdir) / 'resequencing_conflicts.tsv'
@@ -2132,14 +2583,26 @@ def _cmd_performance_review_impl(args):
         logging.getLogger(__name__).info('[DB] Resequencing decisions written to %s', decision_path)
     logging.getLogger(__name__).info("[DB] Mapped %d user sequence IDs to runtime IDs and wrote %s", len(mapped_records), current_dataset_fasta)
     if not mapped_records:
-        raise SystemExit(
-            '[PERFORMANCE REVIEW] No sequences passed sequence/domain QC. Project state was not accepted; '
-            'inspect qc.stats, classification, and the requested --sequence-domain.'
+        logging.getLogger(__name__).warning(
+            '[PERFORMANCE REVIEW] No marker sequences passed QC/domain filtering; failed isolates will be '
+            'registered as markerless QC-failed records with no classifier taxonomy.'
         )
     # insert mapped records into DB (dataset provided by user)
     run_dataset = getattr(args, 'dataset', 'user')
     db.upsert_dataset_role(run_dataset, 'candidate', genomes_available=False)
     db.insert_sequences(mapped_records, dataset=run_dataset)
+    for sequence_id, sequence in initial_marker_records:
+        db.attach_initial_marker_sequence(sequence_id, sequence)
+        replacement_report_rows.append(_marker_replacement_report_row(
+            sequence_id,
+            {
+                'status': 'INITIAL_MARKER_ADDED',
+                'retained_marker': 'INCOMING',
+                'previous_length': 0,
+                'incoming_length': len(sequence),
+                'detail': 'first passing marker sequence attached to the existing markerless isolate ID',
+            },
+        ))
     # write mapping file
     try:
         map_path = Path(outdir) / 'user_id_map.tsv'
@@ -2189,6 +2652,15 @@ def _cmd_performance_review_impl(args):
                 provenance_for_replacements.get(row['sequence_id'], row)
                 for row in marker_provenance
             ]
+        if failed_resequencing_ids:
+            prior_provenance = db.get_sequence_provenance(failed_resequencing_ids)
+            marker_provenance = [
+                prior_provenance[row['sequence_id']]
+                if row['sequence_id'] in prior_provenance
+                else row
+                for row in marker_provenance
+                if row['sequence_id'] not in failed_resequencing_ids or row['sequence_id'] in prior_provenance
+            ]
         db.upsert_sequence_provenance(marker_provenance)
         marker_bridge_path = write_marker_qc_bridge(
             Path(outdir) / 'marker_qc_provenance.tsv', marker_provenance,
@@ -2218,7 +2690,11 @@ def _cmd_performance_review_impl(args):
         raise SystemExit(f'[PERFORMANCE REVIEW] Marker-QC provenance could not be established: {exc}')
 
     try:
-        if not hasattr(args, 'skip_chimera_check') or getattr(args, 'skip_chimera_check', False):
+        if (
+            not mapped_records
+            or not hasattr(args, 'skip_chimera_check')
+            or getattr(args, 'skip_chimera_check', False)
+        ):
             chimera_results = {
                 sequence_id: {'call': 'SKIPPED', 'score': None}
                 for sequence_id, _sequence in mapped_records
@@ -2253,7 +2729,20 @@ def _cmd_performance_review_impl(args):
         or _classify_derive_db_name(effective_ref)
         or 'main'
     )
-    if assignment_tsv:
+    if not mapped_records:
+        class_out = str(Path(outdir) / 'taxonomy.tsv')
+        with open(class_out, 'w') as handle:
+            handle.write('\t'.join(classify._classification_header(run_main_db_name)) + '\n')
+        empty_databases = {run_main_db_name: {}}
+        for ref, _taxa, name in _build_alt_databases(args):
+            empty_databases.setdefault(name, {})
+        primary_name = getattr(args, 'ref_name', None) or _classify_derive_db_name(effective_ref)
+        empty_databases.setdefault(primary_name, {})
+        if len(empty_databases) > 1:
+            classify._write_merged_taxonomy(
+                outdir, empty_databases, run_main_db_name, [],
+            )
+    elif assignment_tsv:
         taxa_file = assignment_tsv
         logging.getLogger(__name__).info("[PERFORMANCE REVIEW] Using taxa assignments from %s (skipping classifier)", taxa_file)
         # parse provided taxonomy assignment table and insert taxonomy for mapped runtime ids
@@ -2327,7 +2816,8 @@ def _cmd_performance_review_impl(args):
             class_out = early_class_out
         else:
             class_out = classify.run_classification(
-                str(current_dataset_fasta), outdir, ref_fasta=effective_ref, taxa_tsv=effective_taxa_tsv, threads=threads
+                str(current_dataset_fasta), outdir, ref_fasta=effective_ref,
+                taxa_tsv=effective_taxa_tsv, threads=threads, db_name=ref_name,
             )
 
     if (
@@ -2703,6 +3193,26 @@ def _cmd_performance_review_impl(args):
         membership_path = Path(outdir) / 'itol_dataset_membership.itol'
         itol.write_dataset_membership_strip(str(membership_path), ids_in_order, ds_map)
         logging.getLogger(__name__).info("[ITOL] Wrote dataset membership ITOL to %s", membership_path)
+        try:
+            tree_ids = {
+                header for header, _sequence in read_fasta(
+                    str(Path(outdir) / 'current_alignment.fasta')
+                )
+            }
+            unresolved_replacements = db.get_unresolved_marker_replacement_failures()
+            flagged_tree_ids = set(unresolved_replacements) & tree_ids
+            if flagged_tree_ids:
+                marker_status_path = Path(outdir) / 'itol_marker_replacement_status.itol'
+                itol.write_marker_replacement_strip(
+                    str(marker_status_path), ids_in_order, flagged_tree_ids,
+                )
+                logging.getLogger(__name__).warning(
+                    "[ITOL] %d tree leaf/leaves retain an old marker after resequencing QC failed; "
+                    "status strip written to %s",
+                    len(flagged_tree_ids), marker_status_path,
+                )
+        except Exception as exc:
+            raise RuntimeError(f'Could not annotate retained markers after failed resequencing: {exc}') from exc
         tier_map = {}
         try:
             with db.connect() as conn:
@@ -2800,8 +3310,10 @@ def _cmd_performance_review_impl(args):
                 )
                 from branchmanager.marker_provenance import marker_qc_flag
                 project_provenance = db.get_sequence_provenance(run_ids_for_assessment)
+                unresolved_replacements = db.get_unresolved_marker_replacement_failures(run_ids_for_assessment)
                 for assessment_row in assessment_rows:
-                    provenance = project_provenance.get(str(assessment_row.get('id'))) or {}
+                    sequence_id = str(assessment_row.get('id'))
+                    provenance = project_provenance.get(sequence_id) or {}
                     qc_flag = marker_qc_flag(provenance)
                     assessment_row.update({
                         'marker_qc_class': provenance.get('marker_qc_class', 'QUALITY_UNVERIFIED'),
@@ -2813,6 +3325,18 @@ def _cmd_performance_review_impl(args):
                         'chimera_call': provenance.get('chimera_call', 'NOT_RUN'),
                         'chimera_score': provenance.get('chimera_score', 'NA'),
                     })
+                    replacement_failure = unresolved_replacements.get(sequence_id)
+                    if replacement_failure:
+                        assessment_row['marker_qc_flag'] = 'MARKER_REPLACEMENT_QC_FAILED'
+                        prior_reasons = str(assessment_row.get('marker_qc_reasons') or '').strip()
+                        replacement_reason = (
+                            'replacement QC failed; old stored marker retained'
+                            + (f': {replacement_failure["detail"]}' if replacement_failure.get('detail') else '')
+                        )
+                        assessment_row['marker_qc_reasons'] = ';'.join(
+                            value for value in (prior_reasons, replacement_reason) if value
+                        )
+                        qc_flag = 'MARKER_REPLACEMENT_QC_FAILED'
                     if qc_flag:
                         flags = [flag for flag in str(assessment_row.get('placement_flags') or '').split(';') if flag]
                         if qc_flag not in flags:
@@ -3027,10 +3551,66 @@ def _cmd_performance_review_impl(args):
                             "[PERFORMANCE REVIEW] Added %d resequence-required placeholder row(s) "
                             "for isolates with no assembled marker sequence", added,
                         )
+                    report_ids = {row['sequence_id'] for row in replacement_report_rows}
+                    for rejected in rejected_rows:
+                        source_id = str(rejected.get('id') or '')
+                        resolved_id = db.resolve_sequence_id(source_id) if source_id else None
+                        if not resolved_id or resolved_id in report_ids:
+                            continue
+                        with db.connect() as conn:
+                            existing_row = conn.execute(
+                                'SELECT length(sequence) FROM sequences WHERE id=?',
+                                (resolved_id,),
+                            ).fetchone()
+                        previous_provenance = db.get_sequence_provenance([resolved_id]).get(resolved_id, {})
+                        replacement_report_rows.append(_marker_replacement_report_row(
+                            resolved_id,
+                            {
+                                'status': 'NO_INCOMING_CONSENSUS',
+                                'detail': rejected.get('reason') or 'incoming reads did not produce a QC-passing marker consensus',
+                                'retained_marker': 'EXISTING' if existing_row else 'NONE',
+                                'previous_length': existing_row[0] if existing_row else '',
+                                'previous_qc_class': previous_provenance.get('marker_qc_class') or '',
+                                'previous_qc_reasons': previous_provenance.get('marker_qc_reasons') or '',
+                                'previous_read_ids': previous_provenance.get('source_read_ids') or '',
+                                'previous_read_files': previous_provenance.get('source_read_files') or '',
+                                'incoming_qc_class': 'FAIL_QC',
+                                'incoming_read_files': ';'.join(_incoming_ab1_files(resolved_id)),
+                            },
+                        ))
+                        report_ids.add(resolved_id)
                 except Exception as e:
                     logging.getLogger(__name__).warning(
                         "[PERFORMANCE REVIEW] Could not merge rejected-before-assembly isolates into final reports: %s", e
                     )
+
+                try:
+                    replacement_report_path = Path(outdir) / 'marker_replacement_report.tsv'
+                    _write_marker_replacement_report(
+                        replacement_report_path,
+                        replacement_report_rows,
+                    )
+                    history = db.get_marker_replacement_history()
+                    history_path = Path(outdir) / 'marker_replacement_history.tsv'
+                    fields = [
+                        'attempt_id', 'sequence_id', 'status', 'detail', 'old_sequence_sha256',
+                        'incoming_sequence_sha256', 'incoming_length', 'incoming_qc_class',
+                        'incoming_qc_reasons', 'source_manifest', 'source_fasta', 'attempted_at',
+                    ]
+                    with open(history_path, 'w', newline='') as handle:
+                        writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t')
+                        writer.writeheader()
+                        writer.writerows(history)
+                    logging.getLogger(__name__).info(
+                        "[PERFORMANCE REVIEW] Wrote %d marker replacement attempt(s) to %s",
+                        len(history), history_path,
+                    )
+                    logging.getLogger(__name__).info(
+                        "[PERFORMANCE REVIEW] Wrote %d per-isolate replacement outcome(s) to %s",
+                        len(replacement_report_rows), replacement_report_path,
+                    )
+                except Exception as e:
+                    raise RuntimeError(f'Marker replacement history could not be written: {e}') from e
 
                 # Final report write after tree-derived fields have been attached.
                 assess_path = write_sequence_assessment_tsv(
@@ -3133,7 +3713,8 @@ def cmd_performance_review(args):
     for source in getattr(args, 'alt_ref', None) or []:
         manifest.add_input(source, role='alternate_reference')
     for source in getattr(args, 'alt_taxa', None) or []:
-        manifest.add_input(source, role='alternate_reference_taxonomy')
+        if source:
+            manifest.add_input(source, role='alternate_reference_taxonomy')
     run_id = f"performance-review:{getattr(args, 'dataset', 'dataset')}:{utc_now()}:{uuid.uuid4().hex[:8]}"
 
     with open(lock_path, 'a+') as lock_handle:
@@ -3687,6 +4268,8 @@ def build_parser():
             '  performance-review Assess taxonomy, novelty, phylogeny, and sequencing candidates.\n'
             '  status-meeting     Import factual isolate lifecycle changes.\n'
             '  records-update     Import completed-genome, QC, GTDB, and ANI evidence.\n'
+            '  add-maldi-identifications Register partner isolates with MALDI-TOF taxonomy and no marker.\n'
+            '  import-partner-workbook Import partner metadata and MALDI status from an .xlsm workbook.\n'
             '  quarterly-review   Nominate a later genome tranche from the complete project.\n'
             '  exit-interview     Remove isolates from active project state with a retained audit.\n'
             '  annual-report      Produce the cumulative end-of-project report.\n'
@@ -3733,7 +4316,7 @@ def build_parser():
     filing_cabinet_parser.add_argument('--dataset', required=False,
         help='Label for this dataset stored in the DB (e.g. Hungate). Used to colour iTOL strips.')
     filing_cabinet_parser.add_argument('--baseline-tier', choices=['priority', 'secondary'], default=None,
-        help='Cultured baseline tier for this dataset: priority for Hungate, secondary for other rumen isolate genomes. Inferred from --dataset when omitted.')
+        help='Cultured baseline tier for this dataset: priority for Hungate, secondary for other project baseline genomes. Inferred from --dataset when omitted.')
     filing_cabinet_parser.add_argument('--shorten-ids', dest='shorten_ids',
         action=argparse.BooleanOptionalAction, default=False,
         help='Replace input headers with compact IDs (e.g. HUN001). Default is to preserve the IDs exactly as supplied.')
@@ -3770,7 +4353,7 @@ def build_parser():
             'or mixed/all/none to disable domain filtering.'
         ))
     filing_cabinet_parser.add_argument('--anchors', required=False, default=None,
-        help='Custom reference anchor FASTA for tree topology scaffolding. Defaults to the 26-sequence bundled anchor set (src/branchmanager/data/reference_anchors.fasta).')
+        help='Custom reference anchor FASTA for tree topology scaffolding. By default uses the bundled 26-sequence rumen/gut anchor set (src/branchmanager/data/rumen-gut_reference_anchors.fasta).')
     filing_cabinet_parser.add_argument('--threads', type=int, required=False, default=4,
         help='Number of CPU threads for MAFFT and VSEARCH (default: 4).')
     filing_cabinet_parser.add_argument('--tree-method', dest='tree_method',
@@ -3874,7 +4457,7 @@ def build_parser():
     performance_review_parser.add_argument('--baseline-dataset', dest='baseline_dataset', required=False, default='Baseline',
         help='Dataset label for --baseline-fasta in the DB and default cultured-baseline novelty pool (default: Baseline). Must differ from --dataset.')
     performance_review_parser.add_argument('--baseline-tier', choices=['priority', 'secondary'], default=None,
-        help='Cultured baseline tier for --baseline-fasta: priority for Hungate, secondary for other rumen isolate genomes. Inferred from --baseline-dataset when omitted.')
+        help='Cultured baseline tier for --baseline-fasta: priority for Hungate, secondary for other project baseline genomes. Inferred from --baseline-dataset when omitted.')
     performance_review_parser.add_argument('--novelty-baseline-dataset', dest='novelty_baseline_datasets', action='append', default=[],
         help='Existing DB dataset label to include in the baseline/cultured novelty pool (repeatable; useful for Hungate plus other cultured isolate sets).')
     performance_review_parser.add_argument('--baseline-taxa-assignments', dest='baseline_taxa_assignments', required=False, default=None,
@@ -3927,7 +4510,7 @@ def build_parser():
              'When combined with --previous-review, ignores the previous alignment and jointly estimates '
              'tree topology across all datasets. (--rebuild-tree is an alias for this flag.)')
     performance_review_parser.add_argument('--anchors', required=False, default=None,
-        help='Custom reference anchor FASTA for tree scaffolding. Defaults to bundled anchors.')
+        help='Custom reference anchor FASTA for tree scaffolding. By default uses the bundled 26-sequence rumen/gut anchor set.')
     performance_review_parser.add_argument('--threads', dest='threads', type=int, default=4,
         help='CPU threads for MAFFT and VSEARCH (default: 4).')
     performance_review_parser.add_argument('--tree-method', dest='tree_method',
@@ -4119,7 +4702,7 @@ def build_parser():
     org_chart_parser.add_argument('--ref', required=False,
         help='Reference FASTA for orientation correction (slow-path full build only).')
     org_chart_parser.add_argument('--anchors', required=False, default=None,
-        help='Custom reference anchor FASTA. Defaults to bundled anchors (26 NCBI RefSeq sequences).')
+        help='Custom reference anchor FASTA. By default uses the bundled 26-sequence rumen/gut anchor set (NCBI RefSeq).')
     org_chart_parser.add_argument('--threads', type=int, default=4,
         help='CPU threads for FastTree / MAFFT (default: 4).')
     org_chart_parser.add_argument('--min-seqs', dest='min_seqs', type=int, default=3,
@@ -4272,7 +4855,7 @@ def build_parser():
         ('benchmark-selection', _tool_benchmark,
          'Tool: benchmark isolate rankings against adjudicated labels (precision@k, recall@k, MAP).'),
         ('build-anchors', _tool_anchors,
-         'Tool: download NCBI RefSeq 16S tree-anchor sequences into reference_anchors.fasta.'),
+         'Tool: download NCBI RefSeq 16S tree-anchor sequences into rumen-gut_reference_anchors.fasta.'),
         ('check-ids', _tool_ids,
          'Tool: check (and optionally sanitise) sequence/isolate IDs in a CSV/TSV table or FASTA.'),
     ):
@@ -4464,6 +5047,31 @@ def build_parser():
     external_genomes_parser.add_argument('--baseline-tier', choices=['priority', 'secondary'], default='secondary')
     external_genomes_parser.add_argument('-o', '--out', required=True)
 
+    maldi_parser = sub.add_parser(
+        'add-maldi-identifications',
+        help='Register partner isolates identified by MALDI-TOF without marker sequences.',
+        formatter_class=_Fmt,
+    )
+    maldi_parser.add_argument('--db', required=True)
+    maldi_parser.add_argument('--input', required=True,
+        help='CSV/TSV with sequence_id, partner_id, and taxon_name or taxon_id; optional rank, score, instrument, library, date, and notes.')
+    maldi_parser.add_argument('--dataset', default='MALDI_TOF_Partner_Isolates')
+    maldi_parser.add_argument('-o', '--out', required=True)
+
+    partner_workbook_parser = sub.add_parser(
+        'import-partner-workbook',
+        help='Import isolate metadata and MALDI status from a partner .xlsm workbook.',
+        formatter_class=_Fmt,
+    )
+    partner_workbook_parser.add_argument('--db', required=True)
+    partner_workbook_parser.add_argument('--input', required=True,
+        help='Partner .xlsm workbook with a Bulk Upload Template sheet.')
+    partner_workbook_parser.add_argument('--sheet', default='Bulk Upload Template',
+        help='Worksheet containing the partner isolate records.')
+    partner_workbook_parser.add_argument('--dataset', default='PartnerWorkbook',
+        help='Dataset label for newly created markerless isolate records.')
+    partner_workbook_parser.add_argument('-o', '--out', required=True)
+
     exit_interview_parser = sub.add_parser(
         'exit-interview',
         help='Exit Interview: withdraw sequences from active project analyses with an audit trail.',
@@ -4519,10 +5127,14 @@ def build_parser():
         formatter_class=_Fmt,
     )
     add_project_config_option(assistant_parser)
-    assistant_input = assistant_parser.add_mutually_exclusive_group(required=True)
+    # Config profiles may provide a per-run input path through data.sample_map
+    # (or assistant defaults), so enforce presence after config defaults load.
+    assistant_input = assistant_parser.add_mutually_exclusive_group(required=False)
     assistant_input.add_argument('--sample-map', help='AB1/primer-read sample map; runs Paper Trail and Merge Meeting.')
     assistant_input.add_argument('--fasta', help='Partner-supplied marker FASTA; bypasses Paper Trail and Merge Meeting.')
     assistant_input.add_argument('--pacbio-map', help='One segmented PacBio HiFi FASTQ per isolate; clusters reads then continues as partner-sequenced markers.')
+    assistant_input.add_argument('--cohort-manifest',
+        help='CSV/TSV listing partner_id, dataset, sample_map, and optional read_dir/partner_workbook for a joint multi-partner assessment.')
     assistant_parser.add_argument('--partner-metadata', required=True)
     assistant_parser.add_argument('--partner-id', default=None,
         help='Expected partner acronym for validation, for example QUB or UoG.')
@@ -4540,7 +5152,7 @@ def build_parser():
     assistant_parser.add_argument('--baseline-tier', choices=['priority', 'secondary'], default=None)
     assistant_parser.add_argument('--baseline-taxa-assignments', default=None)
     assistant_parser.add_argument('--anchors', default=None,
-        help='Reference anchor FASTA for tree scaffolding; defaults to the active project profile or bundled anchors.')
+        help='Custom reference anchor FASTA for tree scaffolding. By default uses the bundled 26-sequence rumen/gut anchor set; configure this option to use a collection-specific set.')
     assistant_parser.add_argument('--mwl', default=None)
     assistant_parser.add_argument('--sequence-domain', choices=SEQUENCE_DOMAIN_CHOICES, default='bacteria')
     assistant_parser.add_argument('--threads', type=int, default=4,
@@ -5207,7 +5819,7 @@ def cmd_replace_selected_markers(args):
         qc_outputs = _paper_trail_module.run_paper_trail(
             [], sanger_out, sample_map=str(reviewed_map),
             primers=primers,
-            primer_sequences=primer_sequences, min_length=1300,
+            primer_sequences=primer_sequences, min_length=800,
             min_read_length=policy.min_read_length, min_quality=policy.min_quality,
             min_mean_quality=policy.min_mean_quality, mask_quality=policy.mask_quality,
             max_read_expected_errors=policy.max_read_expected_errors,
@@ -5233,11 +5845,38 @@ def cmd_replace_selected_markers(args):
         for row in provenance:
             sequence_id = str(row['sequence_id'])
             qc_class = str(row.get('marker_qc_class') or '').upper()
-            if qc_class != 'PASS_HIGH_CONFIDENCE' or sequence_id not in sequence_by_id:
-                report_rows.append({
-                    'sequence_id': sequence_id, 'status': 'QC_NOT_HIGH_CONFIDENCE',
-                    'detail': row.get('marker_qc_reasons') or qc_class,
-                })
+            if sequence_id not in sequence_by_id:
+                db.record_marker_replacement_attempt(
+                    sequence_id, 'FAILED_QC',
+                    row.get('marker_qc_reasons') or qc_class or 'replacement sequence was not assembled',
+                    source_manifest=str(root / 'run_manifest.json'),
+                    source_fasta=str(assembled),
+                    incoming_qc_class=qc_class,
+                    incoming_qc_reasons=row.get('marker_qc_reasons') or '',
+                    incoming_sequence=sequence_by_id.get(sequence_id, ''),
+                )
+                with db.connect() as conn:
+                    old = conn.execute(
+                        'SELECT length(sequence) FROM sequences WHERE id=?', (sequence_id,),
+                    ).fetchone()
+                old_provenance = db.get_sequence_provenance([sequence_id]).get(sequence_id, {})
+                report_rows.append(_marker_replacement_report_row(
+                    sequence_id,
+                    {
+                        'status': 'FAILED_QC',
+                        'detail': row.get('marker_qc_reasons') or qc_class or 'replacement sequence was not assembled',
+                        'retained_marker': 'EXISTING' if old else 'NONE',
+                        'previous_length': old[0] if old else '',
+                        'previous_qc_class': old_provenance.get('marker_qc_class') or '',
+                        'previous_qc_reasons': old_provenance.get('marker_qc_reasons') or '',
+                        'previous_read_ids': old_provenance.get('source_read_ids') or '',
+                        'incoming_qc_class': qc_class,
+                        'incoming_qc_reasons': row.get('marker_qc_reasons') or '',
+                        'incoming_length': len(sequence_by_id.get(sequence_id, '')),
+                        'incoming_read_ids': row.get('source_read_ids') or '',
+                        'incoming_read_files': row.get('source_read_files') or '',
+                    },
+                ))
                 continue
             eligible.append({**row, 'sequence': sequence_by_id[sequence_id]})
         applied = db.replace_selected_markers(
@@ -5254,14 +5893,13 @@ def cmd_replace_selected_markers(args):
                         source_file=str(assembled),
                     )
         for row in eligible:
-            report_rows.append(applied_by_id.get(row['sequence_id'], {
+            result = applied_by_id.get(row['sequence_id'], {
                 'sequence_id': row['sequence_id'], 'status': 'NOT_PROCESSED', 'detail': '',
-            }))
+            })
+            report_rows.append(_marker_replacement_report_row(row['sequence_id'], result))
         report_path = root / 'marker_replacement_report.tsv'
         root.mkdir(parents=True, exist_ok=True)
-        with open(report_path, 'w', newline='') as handle:
-            writer = csv.DictWriter(handle, fieldnames=['sequence_id', 'status', 'detail'], delimiter='\t')
-            writer.writeheader(); writer.writerows(report_rows)
+        _write_marker_replacement_report(report_path, report_rows)
         replacement_fasta = root / 'replaced_markers.fasta'
         write_fasta(
             [(sequence_id, sequence_by_id[sequence_id]) for sequence_id in sorted(replaced_ids)],
@@ -5276,7 +5914,7 @@ def cmd_replace_selected_markers(args):
             (review_path, 'resequencing_file_review'), (reviewed_map, 'reviewed_replacement_sample_map'),
         ):
             manifest.add_output(path, role=role)
-        manifest.add_stage('paper_trail', 'COMPLETE', detail='1300 bp Sanger replacement QC')
+        manifest.add_stage('paper_trail', 'COMPLETE', detail='800 bp minimum Sanger replacement QC')
         manifest.add_stage('marker_replacement', 'COMPLETE', detail=f'{len(replaced_ids)} markers replaced')
         manifest.finish('COMPLETE')
     except Exception as exc:
@@ -5464,6 +6102,132 @@ def cmd_add_external_genomes(args):
     print(f'[external-genomes] {len(results) - rejected} genome(s) imported; {rejected} rejected.\n  Report: {report}')
 
 
+def cmd_add_maldi_identifications(args):
+    """Register markerless partner isolates with source-labeled MALDI context."""
+    import fcntl
+    import sqlite3
+    from branchmanager.project_state import import_maldi_identifications, write_maldi_import_report
+
+    root = Path(args.out).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    manifest = RunManifest(root, 'maldi_identification_import')
+    manifest.add_input(args.input, role='maldi_identifications')
+    original = Path(args.db).expanduser().resolve()
+    if not original.is_file():
+        raise SystemExit(f'[maldi-identifications] Project database does not exist: {original}')
+    staged = root / '.maldi_identifications_project.sqlite'
+    with open(original.with_name(original.name + '.lock'), 'a+') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            staged.unlink(missing_ok=True)
+            with sqlite3.connect(str(original)) as source, sqlite3.connect(str(staged)) as target:
+                source.backup(target)
+            db = Database(str(staged))
+            db.initialise()
+            results = import_maldi_identifications(
+                db, args.input, default_dataset=args.dataset,
+            )
+            report = write_maldi_import_report(root / 'maldi_identification_import_report.tsv', results)
+            manifest.add_output(report, role='import_report')
+            rejected = sum(row.get('result') == 'REJECTED' for row in results)
+            imported = sum(row.get('result') == 'IMPORTED' for row in results)
+            manifest.add_stage(
+                'maldi_identification_import',
+                'COMPLETE' if rejected == 0 else 'COMPLETE_WITH_WARNINGS',
+                detail=f'{imported} imported; {rejected} rejected',
+            )
+            manifest.finish('COMPLETE' if rejected == 0 else 'COMPLETE_WITH_WARNINGS')
+            db.record_project_run(
+                f'maldi-identification-import:{manifest.data["started_at"]}',
+                'maldi_identification_import', manifest.data['status'],
+                manifest_path=str(manifest.json_path), started_at=manifest.data['started_at'],
+                completed_at=manifest.data['completed_at'],
+            )
+            publish = original.with_name(original.name + '.publishing')
+            publish.unlink(missing_ok=True)
+            with sqlite3.connect(str(staged)) as source, sqlite3.connect(str(publish)) as target:
+                source.backup(target)
+            os.replace(publish, original)
+            staged.unlink(missing_ok=True)
+            manifest.add_output(original, role='project_database')
+        except BaseException as exc:
+            manifest.finish('FAILED', error=exc)
+            raise
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    print(f'[maldi-identifications] {imported} identification(s) imported; {rejected} rejected.\n  Report: {report}')
+
+
+def cmd_import_partner_workbook(args):
+    """Import isolate metadata and MALDI observations from a partner XLSM."""
+    import fcntl
+    import sqlite3
+    from branchmanager.project_state import (
+        import_partner_workbook, write_partner_workbook_import_report,
+    )
+
+    root = Path(args.out).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    manifest = RunManifest(root, 'partner_workbook_import')
+    manifest.add_input(args.input, role='partner_metadata_workbook')
+    original = Path(args.db).expanduser().resolve()
+    if not original.is_file():
+        raise SystemExit(f'[partner-workbook] Project database does not exist: {original}')
+    staged = root / '.partner_workbook_project.sqlite'
+    with open(original.with_name(original.name + '.lock'), 'a+') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            staged.unlink(missing_ok=True)
+            with sqlite3.connect(str(original)) as source, sqlite3.connect(str(staged)) as target:
+                source.backup(target)
+            db = Database(str(staged))
+            db.initialise()
+            results = import_partner_workbook(
+                db, args.input, sheet_name=args.sheet, dataset=args.dataset,
+            )
+            report = write_partner_workbook_import_report(
+                root / 'partner_workbook_import_report.tsv', results,
+            )
+            manifest.add_output(report, role='partner_workbook_import_report')
+            inserted = sum(row.get('metadata_result') == 'INSERTED_ISOLATE' for row in results)
+            maldi_imported = sum(row.get('maldi_result') == 'SOFT_TAXON_CONTEXT_IMPORTED' for row in results)
+            needs_review = sum(row.get('maldi_result') in {
+                'MALDI_RESULT_NEEDS_REVIEW', 'MALDI_SELECTED_NO_RESULT',
+                'MALDI_FIELDS_WITHOUT_SELECTION',
+            } for row in results)
+            status = 'COMPLETE_WITH_WARNINGS' if needs_review else 'COMPLETE'
+            manifest.add_stage(
+                'partner_workbook_import', status,
+                detail=f'{len(results)} isolate rows; {inserted} inserted; {maldi_imported} MALDI context records; {needs_review} MALDI row(s) need review',
+            )
+            manifest.finish(status)
+            db.record_project_run(
+                f'partner-workbook-import:{manifest.data["started_at"]}',
+                'partner_workbook_import', status,
+                manifest_path=str(manifest.json_path), started_at=manifest.data['started_at'],
+                completed_at=manifest.data['completed_at'],
+            )
+            publish = original.with_name(original.name + '.publishing')
+            publish.unlink(missing_ok=True)
+            with sqlite3.connect(str(staged)) as source, sqlite3.connect(str(publish)) as target:
+                source.backup(target)
+                if target.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                    raise RuntimeError('partner-workbook staged database failed integrity_check')
+            os.replace(publish, original)
+            staged.unlink(missing_ok=True)
+            manifest.add_output(original, role='project_database')
+        except BaseException as exc:
+            manifest.finish('FAILED', error=exc)
+            raise
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    print(
+        f'[partner-workbook] {len(results)} isolate row(s); {inserted} inserted; '
+        f'{maldi_imported} soft MALDI context record(s); {needs_review} need review.\n'
+        f'  Report: {report}'
+    )
+
+
 def cmd_exit_interview(args):
     """Preview or atomically apply an audited sequence withdrawal."""
     import fcntl
@@ -5628,8 +6392,327 @@ def cmd_it_desk(args):
         raise SystemExit(2)
 
 
+def _read_assistant_cohort_manifest(path: str | Path) -> list[dict[str, str]]:
+    manifest_path = Path(path).expanduser().resolve()
+    with open(manifest_path, newline='') as handle:
+        sample = handle.read(4096)
+        handle.seek(0)
+        delimiter = '\t' if manifest_path.suffix.lower() in {'.tsv', '.txt'} else ','
+        try:
+            delimiter = csv.Sniffer().sniff(sample, delimiters=',\t').delimiter
+        except Exception:
+            pass
+        raw_rows = list(csv.DictReader(handle, delimiter=delimiter))
+    rows = []
+    seen_datasets = set()
+    for line_number, raw in enumerate(raw_rows, start=2):
+        row = {
+            str(key or '').strip().lower().replace('-', '_').replace(' ', '_'):
+                str(value or '').strip()
+            for key, value in raw.items() if key is not None
+        }
+        partner = row.get('partner_id') or row.get('partner') or row.get('partner_acronym')
+        dataset = row.get('dataset') or row.get('batch_id')
+        sample_map = row.get('sample_map') or row.get('ab1_map') or row.get('mailroom_map')
+        if not any(row.values()):
+            continue
+        missing = [name for name, value in (
+            ('partner_id', partner), ('dataset', dataset), ('sample_map', sample_map),
+        ) if not value]
+        if missing:
+            raise ValueError(
+                f'Cohort manifest row {line_number} is missing required field(s): {", ".join(missing)}'
+            )
+        if dataset.casefold() in seen_datasets:
+            raise ValueError(f'Cohort manifest repeats dataset {dataset!r} on row {line_number}')
+        seen_datasets.add(dataset.casefold())
+        rows.append({
+            'partner_id': partner,
+            'dataset': dataset,
+            'sample_map': str(Path(sample_map).expanduser().resolve()
+                              if Path(sample_map).expanduser().is_absolute()
+                              else (manifest_path.parent / sample_map).resolve()),
+            'read_dir': str(
+                (manifest_path.parent / row.get('read_dir')).resolve()
+                if row.get('read_dir') and not Path(row.get('read_dir')).expanduser().is_absolute()
+                else Path(row.get('read_dir')).expanduser().resolve()
+            ) if row.get('read_dir') else '',
+            'partner_workbook': str(
+                (manifest_path.parent / (row.get('partner_workbook') or row.get('metadata_workbook'))).resolve()
+                if not Path(row.get('partner_workbook') or row.get('metadata_workbook')).expanduser().is_absolute()
+                else Path(row.get('partner_workbook') or row.get('metadata_workbook')).expanduser().resolve()
+            ) if (row.get('partner_workbook') or row.get('metadata_workbook')) else '',
+            'partner_workbook_sheet': row.get('partner_workbook_sheet') or 'Bulk Upload Template',
+        })
+    if not rows:
+        raise ValueError(f'Cohort manifest contains no partner batches: {manifest_path}')
+    return rows
+
+
+def _merge_tsv_files(paths: list[str | Path], output: str | Path) -> list[dict]:
+    rows = []
+    fields = []
+    for path in paths:
+        with open(path, newline='') as handle:
+            reader = csv.DictReader(handle, delimiter='\t')
+            for field in reader.fieldnames or []:
+                if field not in fields:
+                    fields.append(field)
+            rows.extend(dict(row) for row in reader)
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with open(output, 'w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(rows)
+    return rows
+
+
+def cmd_assistant_cohort(args):
+    """QC partner batches independently, then assess all passing markers together."""
+    import fcntl
+    import sqlite3
+    import re
+    from branchmanager.onboarding import validate_submission, write_onboarding_outputs
+    from branchmanager.partner_metadata import load_partner_sequencing_metadata
+    from branchmanager.project_state import (
+        import_partner_workbook, write_partner_workbook_import_report,
+    )
+    from branchmanager.utils.fasta import read_fasta, write_fasta
+
+    root = Path(args.out).expanduser().resolve()
+    prep_root = root / '00_cohort_preparation'
+    joint_root = root / '01_joint_assistant'
+    prep_root.mkdir(parents=True, exist_ok=True)
+    batches = _read_assistant_cohort_manifest(args.cohort_manifest)
+    run_manifest = RunManifest(root, 'assistant_cohort')
+    run_manifest.add_input(args.cohort_manifest, role='cohort_manifest')
+    run_manifest.add_input(args.partner_metadata, role='cumulative_partner_catalogue')
+    for batch in batches:
+        run_manifest.add_input(batch['sample_map'], role=f"sample_map:{batch['dataset']}")
+        if batch['read_dir']:
+            run_manifest.add_input(batch['read_dir'], role=f"raw_reads:{batch['dataset']}")
+        if batch['partner_workbook']:
+            run_manifest.add_input(batch['partner_workbook'], role=f"partner_workbook:{batch['partner_id']}")
+
+    original_db = Path(args.db).expanduser().resolve()
+    if not original_db.is_file():
+        raise SystemExit(f'[assistant-cohort] Project database does not exist: {original_db}')
+    working_db = prep_root / '.assistant_cohort_project.sqlite'
+    lock_path = original_db.with_name(original_db.name + '.lock')
+    source_manifest_rows = []
+    assembled_fastas = []
+    assembly_reports = []
+    failed_manifests = []
+    batch_ids: dict[str, str] = {}
+    try:
+        with open(lock_path, 'a+') as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                working_db.unlink(missing_ok=True)
+                with sqlite3.connect(str(original_db)) as source, sqlite3.connect(str(working_db)) as target:
+                    source.backup(target)
+                project_db = Database(str(working_db))
+                project_db.initialise()
+
+                for index, batch in enumerate(batches, start=1):
+                    if batch['partner_workbook']:
+                        imported = import_partner_workbook(
+                            project_db, batch['partner_workbook'],
+                            sheet_name=batch['partner_workbook_sheet'],
+                            dataset=batch['dataset'],
+                        )
+                        import_report = write_partner_workbook_import_report(
+                            prep_root / f'{index:02d}_{batch["dataset"]}_workbook_import.tsv', imported,
+                        )
+                        run_manifest.add_output(import_report, role=f"partner_workbook_report:{batch['dataset']}")
+
+                    onboard_dir = prep_root / f'{index:02d}_{batch["dataset"]}_onboarding'
+                    result = validate_submission(
+                        batch['sample_map'], partner_metadata=args.partner_metadata,
+                        read_dir=batch['read_dir'] or None, primers=args.primers or (),
+                        expected_partner_id=batch['partner_id'], dataset=batch['dataset'],
+                    )
+                    onboarding_outputs = write_onboarding_outputs(onboard_dir, result)
+                    run_manifest.add_output(onboarding_outputs['report'], role=f"onboarding_report:{batch['dataset']}")
+                    if result['status'] != 'PASS':
+                        raise RuntimeError(
+                            f"Onboarding failed for {batch['partner_id']} / {batch['dataset']}; "
+                            f"inspect {onboarding_outputs['report']}"
+                        )
+                    for row in result['normalised']:
+                        sequence_id = str(row['sequence_id'])
+                        if sequence_id in batch_ids:
+                            raise ValueError(
+                                f"Isolate {sequence_id!r} appears in multiple cohort batches "
+                                f"({batch_ids[sequence_id]!r} and {batch['dataset']!r})"
+                            )
+                        batch_ids[sequence_id] = batch['dataset']
+                        source_manifest_rows.append({
+                            'sequence_id': sequence_id, 'partner_id': batch['partner_id'],
+                            'dataset': batch['dataset'],
+                        })
+
+                    trace_dir = prep_root / f'{index:02d}_{batch["dataset"]}_paper_trail'
+                    trace_args = argparse.Namespace(**vars(args))
+                    trace_args.command = 'paper-trail'
+                    trace_args.input = []
+                    trace_args.sample_map = onboarding_outputs['normalised']
+                    trace_args.out = str(trace_dir)
+                    trace_args.read_dir = batch['read_dir'] or None
+                    trace_args.screen_ref = args.ref
+                    trace_args.screen_taxa = args.taxa
+                    trace_args.mailroom_summary = None
+                    trace_args.mailroom_status = 'PASS'
+                    trace_args.assemble = True
+                    trace_args.recursive = True
+                    cmd_paper_trail(trace_args)
+                    assembled = trace_dir / 'assembled.fasta'
+                    assembly_report = trace_dir / 'assembly_report.tsv'
+                    failed_manifest = trace_dir / 'failed_qc_sequences' / 'failed_qc_manifest.tsv'
+                    assembled_fastas.append(assembled)
+                    assembly_reports.append(assembly_report)
+                    if failed_manifest.is_file():
+                        failed_manifests.append(failed_manifest)
+
+                combined_records = []
+                used_ids = set()
+                for source_fasta in assembled_fastas:
+                    for sequence_id, sequence in read_fasta(source_fasta):
+                        if sequence_id in used_ids:
+                            raise ValueError(f'Cohort contains duplicate passing marker ID {sequence_id!r}')
+                        used_ids.add(sequence_id)
+                        combined_records.append((sequence_id, sequence))
+                combined_fasta = prep_root / 'cohort_passing_markers.fasta'
+                write_fasta(combined_records, str(combined_fasta))
+                combined_qc = prep_root / 'cohort_marker_qc.tsv'
+                _merge_tsv_files(assembly_reports, combined_qc)
+                failed_rows = _merge_tsv_files(
+                    failed_manifests, prep_root / 'cohort_failed_qc_manifest.tsv',
+                ) if failed_manifests else []
+                if not failed_manifests:
+                    with open(prep_root / 'cohort_failed_qc_manifest.tsv', 'w') as handle:
+                        handle.write('SequenceID\tQCClass\tRecommendation\tStatus\tReasons\n')
+                failure_reasons = {}
+                for row in failed_rows:
+                    sequence_id = str(row.get('SequenceID') or '').strip()
+                    if sequence_id:
+                        failure_reasons[sequence_id] = str(row.get('Reasons') or row.get('Status') or 'failed_qc')
+                failure_path = prep_root / 'cohort_qc_failures.tsv'
+                with open(failure_path, 'w', newline='') as handle:
+                    writer = csv.DictWriter(handle, fieldnames=['ID', 'Reasons'], delimiter='\t')
+                    writer.writeheader()
+                    writer.writerows({'ID': sid, 'Reasons': reason} for sid, reason in sorted(failure_reasons.items()))
+
+                # Register each isolate under its own batch before the joint run.
+                # Performance Review then attaches the passing marker to this ID,
+                # retaining the partner's dataset label in the rolling database.
+                by_dataset: dict[str, list[tuple[str, str]]] = {}
+                for sequence_id, dataset in batch_ids.items():
+                    existing = project_db.resolve_sequence_id(sequence_id)
+                    if existing:
+                        with project_db.connect() as conn:
+                            stored = conn.execute('SELECT sequence, dataset FROM sequences WHERE id=?', (existing,)).fetchone()
+                        if not stored:
+                            continue
+                        if str(stored[1] or '') in project_db.get_dataset_names_by_role('baseline'):
+                            raise ValueError(f'Partner isolate {sequence_id!r} resolves to a registered baseline')
+                        if not str(stored[0] or '').strip():
+                            with project_db.connect() as conn:
+                                conn.execute('UPDATE sequences SET dataset=? WHERE id=?', (dataset, existing))
+                        continue
+                    by_dataset.setdefault(dataset, []).append((sequence_id, ''))
+                for dataset, records in by_dataset.items():
+                    project_db.upsert_dataset_role(dataset, 'candidate', genomes_available=False)
+                    project_db.insert_sequences(records, dataset=dataset)
+
+                if combined_records:
+                    joint_args = argparse.Namespace(**vars(args))
+                    joint_args.cohort_manifest = None
+                    joint_args.command = 'assistant'
+                    joint_args.sample_map = None
+                    joint_args.pacbio_map = None
+                    joint_args.fasta = str(combined_fasta)
+                    joint_args.marker_qc = str(combined_qc)
+                    joint_args.marker_review = None
+                    joint_args.partner_id = None
+                    joint_args.cohort_qc_failures = str(failure_path)
+                    joint_args.db = str(working_db)
+                    joint_args.out = str(joint_root)
+                    cmd_assistant(joint_args)
+                else:
+                    # All isolates failed before producing a marker: retain them
+                    # as markerless records and record QC state without fabricating
+                    # an empty-sequence Assistant run.
+                    metadata_by_id = {
+                        row['source_id']: row for row in load_partner_sequencing_metadata(args.partner_metadata)
+                    }
+                    for sequence_id, reason in failure_reasons.items():
+                        row = metadata_by_id.get(sequence_id, {})
+                        project_db.upsert_sequencing_metadata([{
+                            'id': sequence_id,
+                            'partner_id': row.get('partner_id') or sequence_id.split('_', 1)[0],
+                            'dataset': batch_ids.get(sequence_id, args.dataset),
+                            'selected_for_sequencing': row.get('selected_for_sequencing', False),
+                            'selected_for_wgs': row.get('selected_for_wgs', False),
+                            'source_id': sequence_id,
+                            'source_file': args.partner_metadata,
+                            'raw_selected_value': row.get('raw_selected_value', ''),
+                            'raw_commitment_value': row.get('raw_commitment_value', ''),
+                            'project_metadata': row.get('project_metadata', {}),
+                        }])
+                        project_db.upsert_sequence_provenance([{
+                            'sequence_id': sequence_id, 'marker_qc_class': 'FAIL_QC',
+                            'marker_qc_recommendation': 'RESEQUENCE', 'marker_qc_reasons': reason,
+                            'manual_review_status': 'NOT_REVIEWED', 'chimera_call': 'NOT_RUN',
+                        }])
+                        project_db.update_isolate_status(
+                            sequence_id, 'MARKER_QC_FAILED', detail=reason,
+                            source_file=str(failure_path),
+                        )
+                    run_manifest.add_output(failure_path, role='cohort_qc_failures')
+
+                if original_db.exists():
+                    publish = original_db.with_name(original_db.name + '.publishing')
+                    publish.unlink(missing_ok=True)
+                    with sqlite3.connect(str(working_db)) as source, sqlite3.connect(str(publish)) as target:
+                        source.backup(target)
+                        if target.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                            raise RuntimeError('cohort project database failed SQLite integrity_check')
+                    os.replace(publish, original_db)
+                working_db.unlink(missing_ok=True)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+        run_manifest.add_output(combined_fasta, role='cohort_marker_fasta')
+        run_manifest.add_output(combined_qc, role='cohort_marker_qc')
+        run_manifest.add_output(failure_path, role='cohort_qc_failures')
+        if combined_records:
+            run_manifest.add_output(joint_root / 'run_manifest.json', role='joint_assistant_manifest')
+            run_manifest.add_output(joint_root / '03_performance_review_hiring_panel' / 'assessment' / 'selection_summary.tsv', role='joint_selection_summary')
+            run_manifest.add_output(joint_root / '03_performance_review_hiring_panel' / 'assessment' / 'sequence_assessment.tsv', role='joint_sequence_assessment')
+        status = 'COMPLETE_WITH_WARNINGS' if failure_reasons else 'COMPLETE'
+        run_manifest.add_stage(
+            'assistant_cohort', status,
+            detail=f'{len(batches)} partner batch(es), {len(batch_ids)} isolate(s), '
+                   f'{len(combined_records)} passing marker(s), {len(failure_reasons)} QC failure(s)',
+        )
+        run_manifest.finish(status)
+        print(
+            f'[assistant-cohort] {status}: {len(batches)} batch(es), {len(batch_ids)} isolate(s), '
+            f'{len(combined_records)} passing marker(s), {len(failure_reasons)} QC failure(s).\n'
+            f'  Joint selection: {joint_root / "03_performance_review_hiring_panel" / "assessment" / "selection_summary.tsv" if combined_records else "not generated (no passing markers)"}\n'
+            f'  Cohort report  : {run_manifest.json_path}'
+        )
+    except BaseException as exc:
+        run_manifest.finish('FAILED', error=exc)
+        raise
+
+
 def cmd_assistant(args):
     """Run the Assistant workflow with explicit scientific stage boundaries."""
+    if getattr(args, 'cohort_manifest', None):
+        return cmd_assistant_cohort(args)
     from branchmanager.it_desk import run_it_desk_checks, write_it_desk_report
 
     root = Path(args.out).expanduser().resolve()
@@ -5649,7 +6732,8 @@ def cmd_assistant(args):
     for source in args.alt_ref or []:
         manifest.add_input(source, role='alternate_reference')
     for source in args.alt_taxa or []:
-        manifest.add_input(source, role='alternate_reference_taxonomy')
+        if source:
+            manifest.add_input(source, role='alternate_reference_taxonomy')
     try:
         it_desk_dir = root / '00_it_desk'
         checks = run_it_desk_checks(
@@ -6030,6 +7114,18 @@ def main(argv=None):
         project_config = load_project_config(selected_config)
         apply_project_config_defaults(parser, project_config)
     args = parser.parse_args(argv)
+    if args.command == 'assistant':
+        # A cohort manifest is itself the complete input declaration. Ignore any
+        # per-batch input path inherited from a reusable config profile.
+        if getattr(args, 'cohort_manifest', None):
+            args.sample_map = args.fasta = args.pacbio_map = None
+        input_count = sum(bool(getattr(args, key, None)) for key in ('sample_map', 'fasta', 'pacbio_map', 'cohort_manifest'))
+        if input_count != 1:
+            parser.error('assistant requires exactly one of --sample-map, --fasta, --pacbio-map, or --cohort-manifest, supplied on the command line or in --config')
+        if not args.dataset:
+            parser.error('assistant requires --dataset or a dataset in --config')
+        if not args.out:
+            parser.error('assistant requires --out or an output_directory in --config')
     if args.command == 'quarterly-review' and args.genome_budget is None:
         parser.error('quarterly-review requires --genome-budget or a project selection_budget in --config')
     if selected_config and args.command == 'filing-cabinet':
@@ -6067,6 +7163,10 @@ def main(argv=None):
         _cmd_project_import(args, genomes=True)
     elif args.command == 'add-external-genomes':
         cmd_add_external_genomes(args)
+    elif args.command == 'add-maldi-identifications':
+        cmd_add_maldi_identifications(args)
+    elif args.command == 'import-partner-workbook':
+        cmd_import_partner_workbook(args)
     elif args.command == 'exit-interview':
         cmd_exit_interview(args)
     elif args.command == 'annual-report':

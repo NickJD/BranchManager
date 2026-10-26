@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "project_directory": "/path/to/project/working-directory",
+  "project": {
+    "name": "My isolate collection",
+    "organism_scope": ["Bacteria"],
+    "marker_gene": "16S rRNA",
+    "taxonomy_authority": "GTDB"
+  },
+  "data": {
+    "primary_taxonomy_fasta": "path/to/gtdb_ssu_reps.fna.gz",
+    "partner_metadata": "path/to/partner_metadata.tsv",
+    "database": "path/to/project.sqlite",
+    "baseline_fasta": null,
+    "mwl": "path/to/most_wanted_list.csv",
+    "anchors": null,
+    "dataset": "Collection_01",
+    "sample_map": "path/to/ab1_map.tsv",
+    "output_directory": "assistant_Collection_01"
+  },
+  "defaults": {
+    "assistant": {
+      "db": "path/to/project.sqlite",
+      "partner_metadata": "path/to/partner_metadata.tsv",
+      "ref": "path/to/gtdb_ssu_reps.fna.gz",
+      "ref_name": "GTDB",
+      "taxa": null,
+      "alt_databases": [
+        {
+          "name": "GG2_2024_09",
+          "ref": "path/to/greengenes2.fna.gz",
+          "taxa": "path/to/greengenes2_taxonomy.tsv.gz"
+        },
+        {
+          "name": "NCBI_16S",
+          "ref": "path/to/ncbi_16s.fasta",
+          "taxa": null
+        },
+        {
+          "name": "SILVA_138.2",
+          "ref": "path/to/silva_16s.fasta.gz",
+          "taxa": null
+        }
+      ],
+      "baseline_fasta": null,
+      "baseline_dataset": null,
+      "baseline_tier": "priority",
+      "mwl": "path/to/most_wanted_list.csv",
+      "anchors": null,
+      "sequence_domain": "bacteria",
+      "threads": 8,
+      "tree_method": "fasttree",
+      "pangenome_target": 9,
+      "candidate_set_size": 9
+    }
+  }
+}

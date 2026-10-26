@@ -8,7 +8,7 @@ format expected by BranchManager's tree builder:
 
     >BRANCHMANAGER_REF_<PhylumName> accession=<ACC> source=NCBI_RefSeq
 
-Output: src/branchmanager/data/reference_anchors.fasta
+Output: src/branchmanager/data/rumen-gut_reference_anchors.fasta
 
 Usage
 -----
@@ -214,7 +214,7 @@ def build_anchor_fasta(out_path: Path, email: str, skip_existing: bool = False):
 
 
 
-DEFAULT_OUT = Path(__file__).resolve().parent.parent / "data" / "reference_anchors.fasta"
+DEFAULT_OUT = Path(__file__).resolve().parent.parent / "data" / "rumen-gut_reference_anchors.fasta"
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:

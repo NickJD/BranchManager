@@ -99,11 +99,19 @@ def process_files(input_excel, input_dir, output_dir, manifest_name, sanitise_id
     print(f"Reading Excel: {input_path}")
 
     try:
-        # Read the specific sheet
+        # Read the specific sheet. pandas treats Excel row 1 as the header by
+        # default, so an instruction in A1 appears in df.columns, not df.iloc[0].
         df = pd.read_excel(input_path, sheet_name='Primer file mapping')
+
+        if len(df.columns) and "Ensure that the ID" in str(df.columns[0]):
+            df = pd.read_excel(input_path, sheet_name='Primer file mapping', skiprows=1)
 
         # Clean up column names (remove newlines and extra whitespace)
         df.columns = [str(c).replace('\n', ' ').replace('  ', ' ').strip() for c in df.columns]
+
+        # Also handle instruction text in the first data row.
+        if not df.empty and "Ensure that the ID" in str(df.iloc[0, 0]):
+            df = df.iloc[1:].reset_index(drop=True)
 
         id_col = 'Partner culture collection isolate ID'
         if id_col not in df.columns:
@@ -113,6 +121,7 @@ def process_files(input_excel, input_dir, output_dir, manifest_name, sanitise_id
 
         source_index = _build_source_index(source_dir)
         manifest_data = []
+        source_isolates = {}
 
         print("Processing rows...")
         for _, row in df.iterrows():
@@ -137,22 +146,15 @@ def process_files(input_excel, input_dir, output_dir, manifest_name, sanitise_id
 
                 filename = str(filename).strip()
 
-                # Extract a "Clean" primer name (e.g., "27F" instead of the whole header)
-                # Logic: Find text inside parentheses, if none, use the whole header.
+                # Extract the primer identifier (e.g., "27F") from the header.
                 if '(' in col and ')' in col:
-                    primer_name = col.split('(')[-1].replace(')', '').strip()
-                else:
-                    primer_name = col
-
-                # 1. Extract the clean identifier from the header
-                # Example: "Filename of primer sequence (27F)" -> "27F"
-                if '(' in col and ')' in col:
-                    # Split by the last opening parenthesis and remove the trailing closing one
                     primer_identifier = col.split('(')[-1].replace(')', '').strip()
                 else:
                     primer_identifier = col.strip()
 
-                # 2. Determine direction based ONLY on the extracted identifier
+                primer_name = primer_identifier
+
+                # Determine direction based ONLY on the extracted identifier.
                 if 'F' in primer_identifier.upper() and 'R' not in primer_identifier.upper():
                     direction = "forward"
                 elif 'R' in primer_identifier.upper():
@@ -168,10 +170,19 @@ def process_files(input_excel, input_dir, output_dir, manifest_name, sanitise_id
                     dest_file = dest_dir / src_file.name
                     shutil.copy2(src_file, dest_file)
 
+                    source_isolates.setdefault(src_file.resolve(), set()).add(str(sample_id).strip())
+
                     # Append to manifest list: [ID, filename, direction, clean_primer_name]
                     manifest_data.append([str(sample_id).strip(), src_file.name, direction, primer_name])
                 else:
                     print(f"Warning: File not found: {filename} (Sample: {sample_id})")
+
+        for src_file, isolates in source_isolates.items():
+            if len(isolates) > 1:
+                print(
+                    f"Warning: AB1 file '{src_file}' is assigned to multiple isolates: "
+                    f"{', '.join(sorted(isolates))}"
+                )
 
         # ID sanitation: always report problems; rewrite IDs only with --sanitise-ids
         ids = [row[0] for row in manifest_data]
