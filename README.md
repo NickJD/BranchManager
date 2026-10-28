@@ -129,7 +129,7 @@ branchmanager assistant --config configs/rumen_gateway.json \
   -o runs/RGW_COHORT_2026_10
 ```
 
-The configured `--partner-metadata` remains the cumulative isolate catalogue used to validate ownership and prior sequencing commitments. Per-partner workbook rows in the manifest add workbook metadata to the project database before assessment. Give each partner batch a unique dataset label. The cohort run writes per-batch onboarding and Paper Trail reports under `00_cohort_preparation/`, and the single combined selection report under `01_joint_assistant/`.
+The configured `--partner-metadata` remains the cumulative isolate catalogue used to validate ownership and prior sequencing commitments. Per-partner workbook rows in the manifest add workbook metadata to the project database before assessment. Give each partner batch a unique dataset label. The cohort run writes per-batch onboarding and Paper Trail reports under `00_cohort_preparation/`, a combined `cohort_marker_review_template.tsv` there, and the single combined selection report under `01_joint_assistant/`. To record manual decisions, copy the combined template to a separate file, fill `decision`, `reviewer`, and `notes` for reviewed isolates (`approve` or `reject`), then rerun Assistant with `--marker-review reviewed_cohort.tsv`. Do not edit the generated template in place because a rerun regenerates it.
 
 The profile's `project` object is collection metadata and is copied into run manifests; `data` documents relevant files and, for Assistant, supplies run defaults for `database`, `dataset`, `sample_map`, and `output_directory`; `defaults` maps command names to CLI argument names. Explicit CLI values override profile defaults. Each run manifest records the profile file checksum. Additional columns in the partner ledger are retained per isolate in the database's `sequencing_metadata.project_metadata_json` field, while BranchManager interprets its standard ID, partner, selection, and genome-availability columns. The bundled rumen/gut anchor set is used unless a project config or command-line option supplies a custom set; projects outside that biological scope should configure vetted, domain-appropriate anchors. See [collection profiles and scope](docs/collection-profiles-and-validation.md) before interpreting results from a new marker/domain.
 
@@ -398,6 +398,30 @@ Onboarding reports only actionable errors and warnings. Normalised submission/re
 
 Convert Sanger AB1 chromatograms or already-basecalled primer reads into a trimmed FASTA for the Performance Review. When multiple reads belong to the same isolate, for example `27F` and `907R`, BranchManager orients reverse-primer reads and builds a quality-aware overlap consensus.
 
+#### Interactive Sanger Studio
+
+Use the local browser-based Sanger Studio to inspect raw reads and assembly decisions before submitting a batch. It calls the same Paper Trail base-caller, trimming, QC, and assembler used by the command line. It displays read-level QC, trimmed positions, primer orientation, overlap/consensus evidence, warnings, and the generated visual reports. Primer and direction fields can be corrected for an isolate and re-run; read mode can use the map setting, force assembly, or select the best individual read. A passing sequence with warnings can be recorded as approved or rejected for later marker review.
+
+```bash
+branchmanager sanger-studio \
+  --root /path/to/partner_submission \
+  --sample-map /path/to/partner_submission/mailroom/ab1_map.tsv \
+  -o /path/to/partner_submission/sanger_studio_runs
+```
+
+The root must contain both the map and every read path referenced by it. Set `--root` to a common parent if reads are stored in a separate directory. If no map is supplied, use **Browse** to load one, or select raw AB1/ABI files to create a quick editable map. The GUI binds only to localhost; use `--no-browser` to start it without opening a browser automatically, and `--port` to choose another local port. **Process and download all** runs the loaded map through Paper Trail once and downloads a ZIP containing the assembled FASTA, `assembly_report.tsv`, read-level reports, visualizations, failed-QC records, resolved read map, run manifest, and any saved `marker_review_decisions.tsv`.
+
+Sanger Studio is an optional review/preparation step; it does not read or change the project database and it never modifies or replaces an Assistant run. It shares the same Paper Trail engine and QC defaults. There are two supported ways to continue into the main workflow:
+
+- For Assistant to process the raw reads itself as part of the normal end-to-end run, give it the Mailroom map with `branchmanager assistant --sample-map ...`. Assistant runs Paper Trail/Merge Meeting again under its own run directory and manifest.
+- To use the exact sequence set already reviewed in Studio, extract the downloaded ZIP and give Assistant the included `assembled.fasta` with `--fasta`, its adjacent `assembly_report.tsv` with `--marker-qc`, and the Studio `marker_review_decisions.tsv` with `--marker-review` (if review decisions were recorded). Assistant then starts at marker provenance and taxonomy assessment, rather than reprocessing the traces.
+
+These are separate runs. Choose the first route when you want the standard fully auditable Assistant run from raw traces; choose the second when Studio's inspected assembly is the intended hand-off. QC defaults are shared, but changing Studio-only settings does not silently change a later Assistant run.
+
+For a joint `assistant --cohort-manifest` run, each cohort entry currently expects a partner sample map and Assistant performs Paper Trail itself. Studio-produced FASTAs are accepted by the single-partner `assistant --fasta` route, but are not yet a direct input type for cohort-manifest entries. To preserve the cohort's joint selection behavior, use Studio as a preflight review and then provide the original partner maps to the cohort Assistant.
+
+The default policy allows an individual usable primer read of at least 300 bp while requiring the final marker sequence or assembled consensus to be at least 800 bp. Therefore, a good 700 bp read can contribute to a passing consensus if it overlaps its partner read; the 800 bp threshold applies to the resulting marker, not each primer read. A low-quality read excluded from assembly cannot contribute length. Passing with warnings means the evidence needs review; it does not automatically mean resequencing is necessary. Failed QC results include the read-level or assembly reasons to help distinguish likely poor culture/purity from trimming, mapping, or coverage issues.
+
 ```bash
 branchmanager paper-trail \
   --input ab1_reads/ \
@@ -405,7 +429,8 @@ branchmanager paper-trail \
   --min-quality 20 \
   --min-mean-quality 20 \
   --min-length 800 \
-  --min-overlap 40
+  --min-overlap 80 \
+  --min-overlap-identity 0.98
 
 branchmanager performance-review \
   --input paper_trail_out/assembled.fasta \
@@ -1101,7 +1126,7 @@ branchmanager import-partner-workbook --db project.sqlite \
   --input JP_October_09.xlsm --dataset QUB_Workbook -o imports/QUB_workbook
 ```
 
-The command writes `partner_workbook_import_report.tsv`; review rows marked `MALDI_RESULT_NEEDS_REVIEW`, `MALDI_SELECTED_NO_RESULT`, or `MALDI_FIELDS_WITHOUT_SELECTION` before relying on those records.
+The command writes `partner_workbook_import_report.tsv`. Its `metadata_details` column contains a JSON object of the workbook metadata saved for each isolate, including host/sample/culture fields and workbook provenance. Review rows marked `MALDI_RESULT_NEEDS_REVIEW`, `MALDI_SELECTED_NO_RESULT`, or `MALDI_FIELDS_WITHOUT_SELECTION` before relying on those records.
 
 ## Benchmarking recommendations
 

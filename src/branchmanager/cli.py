@@ -4265,6 +4265,7 @@ def build_parser():
             '  filing-cabinet     Register the cultured baseline and backbone tree.\n'
             '  onboarding         Validate a partner submission before project state changes.\n'
             '  paper-trail        Interpret chromatograms and assemble primer reads.\n'
+            '  sanger-studio      Inspect and assemble Sanger reads in a local browser GUI.\n'
             '  performance-review Assess taxonomy, novelty, phylogeny, and sequencing candidates.\n'
             '  status-meeting     Import factual isolate lifecycle changes.\n'
             '  records-update     Import completed-genome, QC, GTDB, and ANI evidence.\n'
@@ -4741,6 +4742,26 @@ def build_parser():
         ),
         formatter_class=_Fmt,
     )
+    sanger_studio_parser = sub.add_parser(
+        'sanger-studio',
+        help='Open the local browser-based Sanger chromatogram inspector and assembler.',
+        description=(
+            'Launch a local-only browser interface for checking AB1 reads, correcting read maps, '
+            'reviewing trimming and overlap assembly, and recording manual warning decisions. '
+            'The project root must contain the sample map and all referenced reads.'
+        ),
+        formatter_class=_Fmt,
+    )
+    sanger_studio_parser.add_argument('--root', default='.',
+        help='Project root that contains the sample map and all AB1/ABI reads (default: current directory).')
+    sanger_studio_parser.add_argument('--sample-map', default=None,
+        help='Optional Mailroom or read map. If omitted, load a map or create one from selected AB1 files in the UI.')
+    sanger_studio_parser.add_argument('-o', '--out', default='sanger_studio_runs',
+        help='Directory for inspection runs and review decisions (default: sanger_studio_runs).')
+    sanger_studio_parser.add_argument('--port', type=int, default=8765,
+        help='Local web server port (default: 8765).')
+    sanger_studio_parser.add_argument('--no-browser', action='store_true',
+        help='Start the local server without opening a browser window.')
     paper_trail_parser.add_argument(
         '--input', nargs='+', required=False, default=[],
         help='AB1/ABI/FASTA/FASTQ files or directories to process. Directories are searched recursively by default. Optional when --sample-map lists the read files.',
@@ -4810,9 +4831,9 @@ def build_parser():
         action='store_true', default=False,
         help='Allow AB1 reads missing PCON quality scores to pass with warnings. By default they fail QC.')
     paper_trail_parser.add_argument('--min-overlap', dest='min_overlap', type=int, default=paper_trail_policy.min_overlap,
-        help='Minimum overlap length for assembling multiple primer reads (default: 40 bp).')
+        help='Minimum overlap length for assembling multiple primer reads (default: 80 bp).')
     paper_trail_parser.add_argument('--min-overlap-identity', dest='min_overlap_identity', type=float, default=paper_trail_policy.min_overlap_identity,
-        help='Minimum overlap identity for assembly, 0-1 (default: 0.95).')
+        help='Minimum overlap identity for assembly, 0-1 (default: 0.98).')
     paper_trail_parser.add_argument('--assemble', dest='assemble',
         action=argparse.BooleanOptionalAction, default=True,
         help='Assemble multiple reads per sequence_id when possible (default). Use --no-assemble to keep the best read.')
@@ -6488,6 +6509,8 @@ def cmd_assistant_cohort(args):
     run_manifest = RunManifest(root, 'assistant_cohort')
     run_manifest.add_input(args.cohort_manifest, role='cohort_manifest')
     run_manifest.add_input(args.partner_metadata, role='cumulative_partner_catalogue')
+    if getattr(args, 'marker_review', None):
+        run_manifest.add_input(args.marker_review, role='marker_review_decisions')
     for batch in batches:
         run_manifest.add_input(batch['sample_map'], role=f"sample_map:{batch['dataset']}")
         if batch['read_dir']:
@@ -6503,6 +6526,7 @@ def cmd_assistant_cohort(args):
     source_manifest_rows = []
     assembled_fastas = []
     assembly_reports = []
+    marker_review_templates = []
     failed_manifests = []
     batch_ids: dict[str, str] = {}
     try:
@@ -6557,7 +6581,10 @@ def cmd_assistant_cohort(args):
                     trace_args = argparse.Namespace(**vars(args))
                     trace_args.command = 'paper-trail'
                     trace_args.input = []
-                    trace_args.sample_map = onboarding_outputs['normalised']
+                    # Paper Trail needs one row per read, including its primer and
+                    # orientation. `normalised` is the isolate-level summary and
+                    # collapses paired reads, losing the reverse-read direction.
+                    trace_args.sample_map = onboarding_outputs['read_map']
                     trace_args.out = str(trace_dir)
                     trace_args.read_dir = batch['read_dir'] or None
                     trace_args.screen_ref = args.ref
@@ -6572,6 +6599,9 @@ def cmd_assistant_cohort(args):
                     failed_manifest = trace_dir / 'failed_qc_sequences' / 'failed_qc_manifest.tsv'
                     assembled_fastas.append(assembled)
                     assembly_reports.append(assembly_report)
+                    review_template = trace_dir / 'marker_review_template.tsv'
+                    if review_template.is_file():
+                        marker_review_templates.append(review_template)
                     if failed_manifest.is_file():
                         failed_manifests.append(failed_manifest)
 
@@ -6587,6 +6617,15 @@ def cmd_assistant_cohort(args):
                 write_fasta(combined_records, str(combined_fasta))
                 combined_qc = prep_root / 'cohort_marker_qc.tsv'
                 _merge_tsv_files(assembly_reports, combined_qc)
+                combined_review_template = prep_root / 'cohort_marker_review_template.tsv'
+                if marker_review_templates:
+                    _merge_tsv_files(marker_review_templates, combined_review_template)
+                else:
+                    with open(combined_review_template, 'w') as handle:
+                        handle.write(
+                            'sequence_id\tdecision\treviewer\tnotes\tqc_reasons\t'
+                            'taxonomy_concordance\tread_taxonomy_assignments\toutput_length\tn_percent\n'
+                        )
                 failed_rows = _merge_tsv_files(
                     failed_manifests, prep_root / 'cohort_failed_qc_manifest.tsv',
                 ) if failed_manifests else []
@@ -6634,7 +6673,7 @@ def cmd_assistant_cohort(args):
                     joint_args.pacbio_map = None
                     joint_args.fasta = str(combined_fasta)
                     joint_args.marker_qc = str(combined_qc)
-                    joint_args.marker_review = None
+                    joint_args.marker_review = getattr(args, 'marker_review', None)
                     joint_args.partner_id = None
                     joint_args.cohort_qc_failures = str(failure_path)
                     joint_args.db = str(working_db)
@@ -6686,6 +6725,7 @@ def cmd_assistant_cohort(args):
 
         run_manifest.add_output(combined_fasta, role='cohort_marker_fasta')
         run_manifest.add_output(combined_qc, role='cohort_marker_qc')
+        run_manifest.add_output(combined_review_template, role='cohort_marker_review_template')
         run_manifest.add_output(failure_path, role='cohort_qc_failures')
         if combined_records:
             run_manifest.add_output(joint_root / 'run_manifest.json', role='joint_assistant_manifest')
@@ -7149,6 +7189,10 @@ def main(argv=None):
         cmd_background_check(args)
     elif args.command == 'paper-trail':
         cmd_paper_trail(args)
+    elif args.command == 'sanger-studio':
+        from branchmanager.sanger_studio import serve
+        serve(args.root, args.out, args.sample_map, port=args.port,
+              open_browser=not args.no_browser)
     elif args.command == 'mailroom':
         cmd_mailroom(args)
     elif args.command == 'interview':

@@ -38,11 +38,11 @@ class PaperTrailQCPolicy:
     max_mixed_peak_percent: float = 15.0
     mixed_peak_min_quality: int = 20
     quality_difference: int = 10
-    min_overlap: int = 40
-    min_overlap_identity: float = 0.95
+    min_overlap: int = 80
+    min_overlap_identity: float = 0.98
 
 
-PAPER_TRAIL_QC_POLICY_VERSION = '2.2'
+PAPER_TRAIL_QC_POLICY_VERSION = '2.3'
 DEFAULT_QC_POLICY = PaperTrailQCPolicy()
 
 

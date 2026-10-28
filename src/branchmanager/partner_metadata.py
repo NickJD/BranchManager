@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import gzip
 import re
+import warnings
 from pathlib import Path
 from typing import Iterable
 
@@ -128,7 +129,17 @@ def load_partner_workbook_rows(
     except Exception as exc:
         raise RuntimeError('Reading .xlsm partner workbooks requires openpyxl') from exc
 
-    workbook = load_workbook(path, read_only=True, data_only=True, keep_vba=True)
+    # This importer only reads cached cell values; it never writes the workbook
+    # or executes macros. openpyxl warns when it encounters Excel's extended
+    # data-validation metadata, which is irrelevant to reading these values.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            'ignore',
+            message='Data Validation extension is not supported and will be removed',
+            category=UserWarning,
+            module=r'openpyxl\.worksheet\.',
+        )
+        workbook = load_workbook(path, read_only=True, data_only=True, keep_vba=False)
     try:
         if sheet_name not in workbook.sheetnames:
             raise ValueError(
@@ -136,7 +147,14 @@ def load_partner_workbook_rows(
                 f"available sheets: {', '.join(workbook.sheetnames)}"
             )
         sheet = workbook[sheet_name]
-        rows_iter = sheet.iter_rows(values_only=True)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                'ignore',
+                message='Data Validation extension is not supported and will be removed',
+                category=UserWarning,
+                module=r'openpyxl\.worksheet\.',
+            )
+            rows_iter = iter(list(sheet.iter_rows(values_only=True)))
         header_row = next(rows_iter, None)
         if not header_row:
             return []

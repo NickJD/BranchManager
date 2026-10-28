@@ -632,6 +632,17 @@ def import_partner_workbook(db, path: str | Path, *, sheet_name='Bulk Upload Tem
         elif raw_taxon or row.get('maldi_instrument') or row.get('maldi_library'):
             maldi_result = 'MALDI_FIELDS_WITHOUT_SELECTION'
 
+        report_metadata = dict(row.get('project_metadata') or {})
+        report_metadata.update({
+            'partner_workbook_source': source_file,
+            'partner_workbook_source_row': row['source_row'],
+            'partner_workbook_dataset': dataset,
+            'partner_workbook_partner_raw': row.get('partner_raw') or '',
+            'amplicon_method_reported': bool(row.get('amplicon_method_reported')),
+            'maldi_method_reported': bool(row.get('maldi_method_reported')),
+        })
+        if project_metadata.get('addition_method'):
+            report_metadata['addition_method'] = project_metadata['addition_method']
         report.append({
             'source_row': row['source_row'],
             'sequence_id': sequence_id,
@@ -639,6 +650,9 @@ def import_partner_workbook(db, path: str | Path, *, sheet_name='Bulk Upload Tem
             'metadata_result': 'INSERTED_ISOLATE' if is_new_sequence else 'METADATA_UPDATED',
             'maldi_result': maldi_result,
             'source_taxon_value': raw_taxon,
+            'metadata_details': json.dumps(
+                report_metadata, sort_keys=True, ensure_ascii=False, separators=(',', ':')
+            ),
             'detail': (
                 'MALDI data is stored separately from marker taxonomy; unresolved values do not contribute '
                 'to same-taxon context or selection scores.'
@@ -673,7 +687,7 @@ def write_partner_workbook_import_report(path: str | Path, rows: Iterable[dict])
     output.parent.mkdir(parents=True, exist_ok=True)
     fields = [
         'source_row', 'sequence_id', 'partner_id', 'metadata_result',
-        'maldi_result', 'source_taxon_value', 'detail',
+        'maldi_result', 'source_taxon_value', 'metadata_details', 'detail',
     ]
     with open(output, 'w', newline='') as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', extrasaction='ignore')

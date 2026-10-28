@@ -4,7 +4,7 @@
   "project": {
     "name": "Rumen Gateway",
     "collection_name": "Hungate Collection and partner rumen isolate collection",
-    "organism_scope": ["Bacteria", "Archaea"],
+    "organism_scope": ["Bacteria"],
     "marker_gene": "16S rRNA",
     "taxonomy_authority": "GTDB",
     "partner_field": "partner_id",
