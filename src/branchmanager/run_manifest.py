@@ -100,6 +100,8 @@ def _command_version(candidates: Iterable[str], version_args: Iterable[str] = ('
 def external_tool_versions() -> dict:
     return {
         'vsearch': _command_version(('vsearch',)),
+        'barrnap': _command_version(('barrnap',)),
+        'gtdbtk': _command_version(('gtdbtk',), ('--version',)),
         'mafft': _command_version(('mafft',), ('--version',)),
         'fasttree': _command_version(('FastTree', 'fasttree'), ('-help',)),
         'iqtree': _command_version(('iqtree3', 'iqtree2', 'iqtree'), ('--version',)),

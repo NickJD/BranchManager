@@ -1150,6 +1150,154 @@ branchmanager it-desk --db project.sqlite --ref gtdb_ssu_reps.fna.gz \
   --tree-method fasttree --strict -o it_desk
 ```
 
+# BranchManager genomic 16S selection subtool
+
+This patch adds `branchmanager genomic-16s-selection`, which turns a directory of isolate genome assemblies into a traceable, genome-identifiable 16S representative set.
+
+## Installation into a checkout
+
+From the root of the BranchManager repository:
+
+1. Copy `src/branchmanager/tools/genomic_16s_selection.py` into the same path in your checkout.
+2. Apply the CLI registration patch:
+
+   ```bash
+   git apply --check /path/to/cli_genomic_16s_selection.patch
+   git apply /path/to/cli_genomic_16s_selection.patch
+   ```
+
+   The patch is based on the `cli.py` uploaded for this task. If your working tree has changed since that copy, inspect the diff and apply the three CLI registration/help edits manually rather than replacing your current `cli.py` with an older snapshot.
+
+## Example
+
+```bash
+branchmanager genomic-16s-selection \
+  --genome-dir /path/to/assembled_isolates \
+  --reference /mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/GTDB/gtdb_r232_bac_arch_ssu_reps.fna.gz \
+  --gtdb-summary /path/to/gtdbtk.bac120.summary.tsv \
+  -o /path/to/genomic_16s_selection
+```
+
+For archaeal assemblies, select `--kingdom arc` and supply the corresponding GTDB-Tk archaeal summary (or both summaries, repeating `--gtdb-summary`). If no GTDB-Tk summaries are provided, the tool still runs Barrnap and VSEARCH; the BranchManager taxonomy assignment file is populated only where the SSU match passes the configured evidence thresholds.
+
+Check installed software first:
+
+```bash
+barrnap --version
+vsearch --version
+branchmanager genomic-16s-selection --help
+```
+
+## Main outputs
+
+- `best_16s_per_genome.fna`: one chosen 16S marker per genome with at least one Barrnap hit. FASTA headers equal the normalised genome IDs derived from assembly filenames, so the file can be loaded into BranchManager directly.
+- `all_16s_candidates.fna`: every detected 16S copy, with coordinate-derived, genome-identifiable candidate IDs.
+- `16s_candidates.tsv`: one row per detected copy, including coordinates, length, ambiguity, contig-edge status, best VSEARCH match and selection flag.
+- `gtdb16s_hits.tsv`: VSEARCH reference matches with identity, query coverage, target coverage and embedded GTDB lineage.
+- `16s_taxonomy_assessment.tsv`: per-copy GTDB-Tk concordance assessment and near-top SSU-hit consensus.
+- `genome_16s_summary.tsv`: one row per input genome, including no-hit/failure status and chosen candidate.
+- `branchmanager_taxa_assignments.tsv`: `ID`, `Taxon`, `Confidence` columns keyed to the representative FASTA IDs; only written for genomes with an available GTDB-Tk assignment or a sufficiently supported VSEARCH fallback. Confidence is blank because the standard GTDB-Tk classification summary does not provide a scalar confidence value.
+- `taxonomy_assignment_audit.tsv`: records the source of each downstream taxonomy assignment and the comparison evidence.
+- `no_16s_or_failed.tsv`: assemblies with no 16S candidate or a processing failure.
+- `gff/`, `logs/`, `run_manifest.tsv`, and `run_manifest.json`: Barrnap feature calls, per-genome logs, run status, input/reference hashes, tool versions, parameters and output inventory.
+
+## Selection policy and caveats
+
+1. Barrnap is run independently per genome and all detected 16S candidates are retained.
+2. VSEARCH `--usearch_global` searches candidate copies against the supplied GTDB SSU representative FASTA. Candidate hit results are retained; a no-hit is not treated as proof of novelty or a bad sequence.
+3. Physical sequence evidence is ranked first: full-length-like length, contig-edge status, ambiguous bases and distance from the preferred length. Taxonomy agreement and VSEARCH match evidence are tie-breakers only; a disagreement does not automatically reject a copy.
+4. GTDB-Tk taxonomy is the preferred downstream assignment when available. Without it, the near-top GTDB SSU taxonomy consensus can be used as a fallback only when the best hit meets the configured identity and query/target coverage thresholds.
+5. Species-level concordance is not reported below the configured 98.65% identity heuristic. These are screening heuristics, not species-delimitation decisions.
+6. A genome with no detected 16S hit cannot contribute a representative FASTA record; it remains explicitly listed in `no_16s_or_failed.tsv` and `genome_16s_summary.tsv`.
+
+## Defaults worth reviewing for the project
+
+- Barrnap full-length-like sequence window: 1,400–1,700 bp.
+- VSEARCH search floor: 70% identity and 70% query coverage, retaining up to 20 accepted matches per query.
+- Taxonomy comparison: minimum 94.5% identity, 95% query coverage, 80% reference-target coverage.
+- Species-level concordance heuristic: 98.65% identity.
+- Eight concurrent Barrnap processes and eight VSEARCH threads by default; set these to match the allocated CPUs and memory of your environment.
+
+The exact defaults are configurable from `branchmanager genomic-16s-selection --help`.
+
+# BranchManager genomic 16S selection subtool
+
+This patch adds `branchmanager genomic-16s-selection`, which turns a directory of isolate genome assemblies into a traceable, genome-identifiable 16S representative set.
+
+## Installation into a checkout
+
+From the root of the BranchManager repository:
+
+1. Copy `src/branchmanager/tools/genomic_16s_selection.py` into the same path in your checkout.
+2. Apply the CLI registration patch:
+
+   ```bash
+   git apply --check /path/to/cli_genomic_16s_selection.patch
+   git apply /path/to/cli_genomic_16s_selection.patch
+   ```
+
+   The patch is based on the `cli.py` uploaded for this task. If your working tree has changed since that copy, inspect the diff and apply the three CLI registration/help edits manually rather than replacing your current `cli.py` with an older snapshot.
+3. Run the tests using your project environment:
+
+   ```bash
+   python -m pytest tests/test_genomic_16s_selection.py -q
+   ```
+
+   The tests use tiny fake Barrnap and VSEARCH executables to test the orchestration and output schema. They do not replace a real-tool test against your full GTDB SSU reference.
+
+## Example
+
+```bash
+branchmanager genomic-16s-selection \
+  --genome-dir /path/to/assembled_isolates \
+  --reference /mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/GTDB/gtdb_r232_bac_arch_ssu_reps.fna.gz \
+  --gtdb-summary /path/to/gtdbtk.bac120.summary.tsv \
+  -o /path/to/genomic_16s_selection
+```
+
+For archaeal assemblies, select `--kingdom arc` and supply the corresponding GTDB-Tk archaeal summary (or both summaries, repeating `--gtdb-summary`). If no GTDB-Tk summaries are provided, the tool still runs Barrnap and VSEARCH; the BranchManager taxonomy assignment file is populated only where the SSU match passes the configured evidence thresholds.
+
+Check installed software first:
+
+```bash
+barrnap --version
+vsearch --version
+branchmanager genomic-16s-selection --help
+```
+
+## Main outputs
+
+- `best_16s_per_genome.fna`: one chosen 16S marker per genome with at least one Barrnap hit. FASTA headers equal the normalised genome IDs derived from assembly filenames, so the file can be loaded into BranchManager directly.
+- `all_16s_candidates.fna`: every detected 16S copy, with coordinate-derived, genome-identifiable candidate IDs.
+- `16s_candidates.tsv`: one row per detected copy, including coordinates, length, ambiguity, contig-edge status, best VSEARCH match and selection flag.
+- `gtdb16s_hits.tsv`: VSEARCH reference matches with identity, query coverage, target coverage and embedded GTDB lineage.
+- `16s_taxonomy_assessment.tsv`: per-copy GTDB-Tk concordance assessment and near-top SSU-hit consensus.
+- `genome_16s_summary.tsv`: one row per input genome, including no-hit/failure status and chosen candidate.
+- `branchmanager_taxa_assignments.tsv`: `ID`, `Taxon`, `Confidence` columns keyed to the representative FASTA IDs; only written for genomes with an available GTDB-Tk assignment or a sufficiently supported VSEARCH fallback. Confidence is blank because the standard GTDB-Tk classification summary does not provide a scalar confidence value.
+- `taxonomy_assignment_audit.tsv`: records the source of each downstream taxonomy assignment and the comparison evidence.
+- `no_16s_or_failed.tsv`: assemblies with no 16S candidate or a processing failure.
+- `gff/`, `logs/`, `run_manifest.tsv`, and `run_manifest.json`: Barrnap feature calls, per-genome logs, run status, input/reference hashes, tool versions, parameters and output inventory.
+
+## Selection policy and caveats
+
+1. Barrnap is run independently per genome and all detected 16S candidates are retained.
+2. VSEARCH `--usearch_global` searches candidate copies against the supplied GTDB SSU representative FASTA. Candidate hit results are retained; a no-hit is not treated as proof of novelty or a bad sequence.
+3. Physical sequence evidence is ranked first: full-length-like length, contig-edge status, ambiguous bases and distance from the preferred length. Taxonomy agreement and VSEARCH match evidence are tie-breakers only; a disagreement does not automatically reject a copy.
+4. GTDB-Tk taxonomy is the preferred downstream assignment when available. Without it, the near-top GTDB SSU taxonomy consensus can be used as a fallback only when the best hit meets the configured identity and query/target coverage thresholds.
+5. Species-level concordance is not reported below the configured 98.65% identity heuristic. These are screening heuristics, not species-delimitation decisions.
+6. A genome with no detected 16S hit cannot contribute a representative FASTA record; it remains explicitly listed in `no_16s_or_failed.tsv` and `genome_16s_summary.tsv`.
+
+## Defaults worth reviewing for the project
+
+- Barrnap full-length-like sequence window: 1,400–1,700 bp.
+- VSEARCH search floor: 70% identity and 70% query coverage, retaining up to 20 accepted matches per query.
+- Taxonomy comparison: minimum 94.5% identity, 95% query coverage, 80% reference-target coverage.
+- Species-level concordance heuristic: 98.65% identity.
+- Eight concurrent Barrnap processes and eight VSEARCH threads by default; set these to match the allocated CPUs and memory of your environment.
+
+The exact defaults are configurable from `branchmanager genomic-16s-selection --help`.
+
+
 ## What BranchManager does
 
 BranchManager is aimed at ranking marker-gene sequence evidence for isolate follow-up. It helps identify lineages that may have been missed because of primer bias, sparse reference coverage, taxonomy lag, or conservative filtering. Many targets are not new in nature — they are often **new to the reference record** or **underrepresented in existing collections**.

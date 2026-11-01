@@ -66,6 +66,45 @@ def _alignment_evidence(parts: list[str]) -> tuple[Optional[float], Optional[int
     return query_coverage, alignment_length
 
 
+def _write_genome_derived_context(input_fasta: str, outdir: str, db, qids, threads=None) -> Optional[str]:
+    """Compare queries with Barrnap-derived 16S evidence without changing primary scores."""
+    if db is None:
+        return None
+    try:
+        pool_path, _source, datasets, count = _build_db_pool_fasta(
+            db=db, outdir=outdir, name='genome_derived_16s', evidence_pool='genome_derived',
+        )
+    except Exception as exc:
+        logger.warning('[NOVELTY] Could not build the genome-derived 16S context pool: %s', exc)
+        return None
+    if not pool_path:
+        return None
+    matches_path = Path(outdir) / 'genome_derived_16s_matches.tsv'
+    best = _run_nearest_search(input_fasta, pool_path, matches_path, threads=threads, exclude_self=True)
+    summary_path = Path(outdir) / 'genome_derived_16s_context.tsv'
+    with open(summary_path, 'w', newline='') as handle:
+        writer = __import__('csv').DictWriter(
+            handle,
+            fieldnames=['sequence_id', 'genome_derived_nearest_hit', 'identity', 'query_coverage',
+                        'alignment_length', 'context_datasets', 'context_sequence_count'],
+            delimiter='\t',
+        )
+        writer.writeheader()
+        for sequence_id in qids:
+            hit = best.get(sequence_id)
+            writer.writerow({
+                'sequence_id': sequence_id,
+                'genome_derived_nearest_hit': hit[1] if hit else 'NA',
+                'identity': f'{hit[0]:.3f}' if hit else 'NA',
+                'query_coverage': f'{hit[2]:.3f}' if hit and hit[2] is not None else 'NA',
+                'alignment_length': hit[3] if hit and hit[3] is not None else 'NA',
+                'context_datasets': ';'.join(datasets),
+                'context_sequence_count': count,
+            })
+    logger.info('[NOVELTY] Wrote supplementary Barrnap-derived 16S context for %d query sequence(s) to %s', len(best), summary_path)
+    return str(summary_path)
+
+
 def run_novelty(
     input_fasta: str,
     ref_fasta: str,
@@ -128,51 +167,20 @@ def run_novelty(
 
     elif db is not None:
         try:
-            with db.connect() as conn:
-                cur = conn.cursor()
-                # Get sequences from ALL datasets except the current run.
-                # This intentionally includes every registered baseline dataset so that
-                # novelty is measured against the full user-submitted baseline.
-                if run_dataset:
-                    cur.execute(
-                        "SELECT id, sequence FROM sequences WHERE dataset IS NOT ? OR dataset IS NULL",
-                        (run_dataset,)
-                    )
-                else:
-                    cur.execute("SELECT id, sequence FROM sequences")
-                rows = cur.fetchall()
-
-            # Log the distinct datasets contributing to the comparison pool
-            try:
-                with db.connect() as conn:
-                    cur = conn.cursor()
-                    if run_dataset:
-                        cur.execute(
-                            "SELECT DISTINCT dataset FROM sequences "
-                            "WHERE dataset IS NOT ? OR dataset IS NULL",
-                            (run_dataset,),
-                        )
-                    else:
-                        cur.execute("SELECT DISTINCT dataset FROM sequences")
-                    pool_datasets = [r[0] for r in cur.fetchall()]
-                logger.info(
-                    "[NOVELTY] Comparison pool contains %d distinct dataset(s): %s",
-                    len(pool_datasets),
-                    pool_datasets,
-                )
-            except Exception:
-                pass
-
-            records = [(r[0], r[1]) for r in rows if r[1]]
+            # Use the v1 provenance-aware pool once the registry has been
+            # migrated. Before migration, _query_db_pool intentionally retains
+            # the legacy behaviour so existing installations can transition.
+            records, pool_datasets = _query_db_pool(
+                db, run_dataset=run_dataset, evidence_pool='primary',
+            )
             if records:
                 write_fasta(records, str(db_fasta))
                 submission_db_exists = True
-                logger.info(
-                    "[NOVELTY] Built submission comparison DB from %d previously submitted sequences "
-                    "(Filing Cabinet + prior review datasets). Novelty is expressed relative to YOUR submitted "
-                    "sequences, not against the global reference.",
-                    len(records),
-                )
+            logger.info(
+                "[NOVELTY] Primary comparison pool contains %d eligible marker(s) "
+                "from %d dataset(s): %s",
+                len(records), len(pool_datasets), pool_datasets,
+            )
         except Exception as e:
             raise RuntimeError(f'failed to build the submitted-sequence novelty pool: {e}') from e
 
@@ -424,27 +432,16 @@ def compute_db_nearest_identities(mapped_derep: str, outdir: str, db, run_datase
     """
     db_preset_fasta = Path(outdir) / 'project_collection_reference.fasta'
     try:
-        with db.connect() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT id, sequence FROM sequences WHERE dataset IS NOT ? OR dataset IS NULL", (run_dataset,))
-            rows = cur.fetchall()
-        records = [(r[0], r[1]) for r in rows]
-        if records:
-            write_fasta(records, str(db_preset_fasta))
-            # Log which datasets are in the pool
-            try:
-                with db.connect() as conn2:
-                    cur2 = conn2.cursor()
-                    cur2.execute(
-                        "SELECT DISTINCT dataset FROM sequences WHERE dataset IS NOT ? OR dataset IS NULL",
-                        (run_dataset,),
-                    )
-                    pool_ds = [r[0] for r in cur2.fetchall()]
-                logger.info("[NOVELTY] Nearest-identity pool: %d seqs from datasets: %s", len(records), pool_ds)
-            except Exception:
-                pass
-        else:
+        records, pool_ds = _query_db_pool(
+            db, run_dataset=run_dataset, evidence_pool='primary',
+        )
+        if not records:
             return {}
+        write_fasta(records, str(db_preset_fasta))
+        logger.info(
+            "[NOVELTY] Nearest-identity primary marker pool: %d sequences from datasets: %s",
+            len(records), pool_ds,
+        )
     except Exception:
         return {}
 
@@ -680,7 +677,28 @@ def _query_db_pool(
     include_datasets=None,
     include_ids=None,
     exclude_datasets=None,
+    evidence_pool: str = 'primary',
 ):
+    # Once the evidence registry has been backfilled, only eligible HIGH/MODERATE
+    # primary markers may enter the normal project/cultured pools. Barrnap-derived
+    # observations are queried separately and never affect primary novelty scores.
+    try:
+        from branchmanager.marker_evidence import query_marker_evidence_pool
+        with db.connect() as conn:
+            registry_ready = conn.execute(
+                "SELECT value FROM marker_evidence_meta WHERE key='legacy_backfill_v1'"
+            ).fetchone()
+            registry_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='marker_evidence'"
+            ).fetchone()
+            if registry_ready and registry_ready[0] == 'complete' and registry_exists:
+                return query_marker_evidence_pool(
+                    conn, pool=evidence_pool, run_dataset=run_dataset,
+                    include_datasets=include_datasets, include_ids=include_ids,
+                    exclude_datasets=exclude_datasets,
+                )
+    except Exception as exc:
+        logger.warning('[NOVELTY] Evidence registry unavailable; using legacy sequence pool: %s', exc)
     include = _normalise_dataset_names(include_datasets)
     ids = list(dict.fromkeys(str(item) for item in (include_ids or []) if str(item)))
     exclude = _normalise_dataset_names(exclude_datasets)
@@ -731,6 +749,7 @@ def _build_db_pool_fasta(
     include_datasets=None,
     include_ids=None,
     exclude_datasets=None,
+    evidence_pool: str = 'primary',
 ) -> tuple[Optional[str], str, list[str], int]:
     if db is None:
         return None, 'none', [], 0
@@ -741,6 +760,7 @@ def _build_db_pool_fasta(
             include_datasets=include_datasets,
             include_ids=include_ids,
             exclude_datasets=exclude_datasets,
+            evidence_pool=evidence_pool,
         )
     except Exception as e:
         raise RuntimeError(f'failed to query the {name} novelty pool from the project database: {e}') from e
@@ -1686,8 +1706,11 @@ def build_reference_novelty_metrics(
         reference_metrics,
         sequencing_context,
     )
+    genome_derived_context = _write_genome_derived_context(
+        input_fasta, outdir, db, qids, threads=threads,
+    )
     logger.info(
-        '[NOVELTY] Wrote novelty metrics to %s (primary=%s; hungate=%s; secondary=%s; cultured=%s; project=%s; reference=%s)',
+        '[NOVELTY] Wrote novelty metrics to %s (primary=%s; hungate=%s; secondary=%s; cultured=%s; project=%s; reference=%s; genome-derived-context=%s)',
         output,
         'cultured_project' if cultured_pool_path else all_source,
         hungate_source,
@@ -1695,5 +1718,6 @@ def build_reference_novelty_metrics(
         cultured_source,
         all_source,
         reference_source,
+        genome_derived_context or 'none',
     )
     return str(output)

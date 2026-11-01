@@ -31,14 +31,19 @@ def run_it_desk_checks(*, db_path=None, references=(), output_dir=None, tree_met
         except Exception as exc:
             rows.append(_row(f'python_module:{module}', 'FAIL' if required else 'WARN', str(exc), required))
 
-    binaries = [('vsearch', ('vsearch',), True), ('mafft', ('mafft',), True)]
+    binaries = [
+        ('vsearch', ('vsearch',), True), ('mafft', ('mafft',), True),
+        # Genomic 16S evidence is optional for marker-only collections, but
+        # report availability before a genome-derived cohort is attempted.
+        ('barrnap', ('barrnap',), False), ('gtdbtk', ('gtdbtk',), False),
+    ]
     if tree_method.startswith('iqtree'):
         binaries.append(('tree_builder', ('iqtree3', 'iqtree2', 'iqtree'), True))
     else:
         binaries.append(('tree_builder', ('FastTree', 'fasttree'), True))
     for label, candidates, required in binaries:
         found = next((shutil.which(item) for item in candidates if shutil.which(item)), None)
-        rows.append(_row(label, 'PASS' if found else 'FAIL', found or f'not found: {", ".join(candidates)}', required))
+        rows.append(_row(label, 'PASS' if found else ('FAIL' if required else 'WARN'), found or f'not found: {", ".join(candidates)}', required))
 
     for index, reference in enumerate(references or (), start=1):
         item = Path(reference).expanduser()

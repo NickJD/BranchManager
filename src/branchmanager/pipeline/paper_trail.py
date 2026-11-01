@@ -302,6 +302,24 @@ def _trace_peak_evidence(
     return ratios, secondary_bases
 
 
+def _classify_ab1_quality_values(qualities: Iterable[int], sequence_length: int) -> tuple[bool, str]:
+    """Distinguish usable Phred data from missing, partial, or zero-filled PCON.
+
+    A full-length all-zero PCON array is not treated as measured Q0 data. It is
+    separately flagged because this pattern is commonly produced by an AB1
+    export/base-calling pipeline that did not populate quality values.
+    """
+    values = [int(value) for value in (qualities or [])]
+    expected = max(0, int(sequence_length))
+    if not values:
+        return False, 'AB1_MISSING_PCON'
+    if len(values) < expected:
+        return False, 'AB1_PARTIAL_PCON'
+    if expected and not any(value > 0 for value in values[:expected]):
+        return False, 'AB1_ZERO_FILLED_PCON'
+    return True, 'AB1_PCON_OK'
+
+
 def _read_ab1_details(path: str | Path) -> dict[str, object]:
     """Read calls, Phred values, peak positions, and four dye channels from ABIF."""
     try:
@@ -331,13 +349,14 @@ def _read_ab1_details(path: str | Path) -> dict[str, object]:
         sequence = ''.join(base if base in IUPAC_BASES else 'N' for base in sequence)
         quality_bytes = entries.get(('PCON', 2)) or entries.get(('PCON', 1)) or b''
         qualities = _integer_list(quality_bytes)[:len(sequence)]
-        quality_available = bool(qualities)
+        quality_available, quality_status = _classify_ab1_quality_values(qualities, len(sequence))
         if len(qualities) < len(sequence):
             qualities.extend([0] * (len(sequence) - len(qualities)))
         return {
             'sequence': sequence,
             'qualities': qualities,
             'quality_available': quality_available,
+            'quality_status': quality_status,
             'trace_available': False,
             'trace_order': '',
             'peak_locations': [],
@@ -349,7 +368,7 @@ def _read_ab1_details(path: str | Path) -> dict[str, object]:
     sequence = str(record.seq).strip().upper()
     sequence = ''.join(base if base in IUPAC_BASES else 'N' for base in sequence)
     qualities = [int(value) for value in record.letter_annotations.get('phred_quality', [])]
-    quality_available = bool(qualities)
+    quality_available, quality_status = _classify_ab1_quality_values(qualities, len(sequence))
     if len(qualities) < len(sequence):
         qualities.extend([0] * (len(sequence) - len(qualities)))
     qualities = qualities[:len(sequence)]
@@ -373,6 +392,7 @@ def _read_ab1_details(path: str | Path) -> dict[str, object]:
         'sequence': sequence,
         'qualities': qualities,
         'quality_available': quality_available,
+        'quality_status': quality_status,
         'trace_available': trace_available,
         'trace_order': order,
         'peak_locations': peak_locations,
@@ -766,7 +786,8 @@ def _read_records_from_file(path: Path) -> list[tuple[str, str, list[int], bool,
         qual = list(details['qualities'])
         quality_available = bool(details['quality_available'])
         read_id = Path(path.stem).stem if lower.endswith('.gz') else path.stem
-        source = 'ab1_pcon' if quality_available else 'ab1_missing_pcon'
+        quality_status = str(details.get('quality_status') or ('AB1_PCON_OK' if quality_available else 'AB1_MISSING_PCON'))
+        source = 'ab1_pcon' if quality_available else quality_status.lower()
         return [(read_id, seq, qual, quality_available, source, details)]
     if lower.endswith(('.fastq', '.fq', '.fastq.gz', '.fq.gz')):
         return [(rid, seq, qual, True, 'fastq', {}) for rid, seq, qual in read_fastq(path)]
@@ -1620,6 +1641,7 @@ def _draw_dashed_horizontal(draw, x0: int, x1: int, y: int, *, fill: str, width:
 
 def _quality_points(
     qualities: list[int], x0: float, y0: float, width: float, height: float,
+    *, position_offset: int = 0, total_length: int | None = None,
 ) -> list[tuple[float, float]]:
     if not qualities:
         return ''
@@ -1629,10 +1651,10 @@ def _quality_points(
     for start in range(0, len(qualities), step):
         chunk = qualities[start:start + step]
         binned.append((start + len(chunk) // 2, _mean_quality(chunk)))
-    denom = max(1, len(qualities) - 1)
+    denom = max(1, (total_length or len(qualities)) - 1)
     points = []
     for pos, q in binned:
-        x = x0 + (pos / denom) * width
+        x = x0 + ((position_offset + pos) / denom) * width
         y = y0 + height - (min(45.0, max(0.0, q)) / 45.0) * height
         points.append((x, y))
     return points
@@ -1666,7 +1688,7 @@ def _write_read_error_profile_png(
     draw.text((24, 18), 'Sanger read error and trimming profiles', fill='#1f2937', font=title_font)
     draw.text(
         (24, 48),
-        'Blue: Phred quality. Green: retained trim window. Orange: internally masked low-quality bases.',
+        'Blue: raw Phred quality. Purple: post-QC trimmed quality. Green: retained window. Orange: masked bases.',
         fill='#4b5563', font=body_font,
     )
     if page_note:
@@ -1683,7 +1705,11 @@ def _write_read_error_profile_png(
         raw_len = max(1, len(read.raw_sequence))
         trim_start_x = left + (read.trim_start / raw_len) * graph_width
         trim_end_x = left + (read.trim_end / raw_len) * graph_width
-        points = _quality_points(read.raw_qualities, left, graph_top, graph_width, graph_height)
+        raw_points = _quality_points(read.raw_qualities, left, graph_top, graph_width, graph_height)
+        post_qc_points = _quality_points(
+            read.trimmed_qualities or [], left, graph_top, graph_width, graph_height,
+            position_offset=read.trim_start, total_length=len(read.raw_sequence),
+        )
         raw_mean = _mean_quality(read.raw_qualities)
         trim_mean = _mean_quality(read.trimmed_qualities or [])
         masked_mean = _mean_quality(read.masked_qualities or [])
@@ -1741,8 +1767,10 @@ def _write_read_error_profile_png(
                 x1 = left + (seg_end / raw_len) * graph_width
                 draw.rectangle((round(x0), graph_top, max(round(x0) + 1, round(x1)), graph_top + graph_height), fill='#fed7aa')
                 mask_start = None
-        if points:
-            draw.line(points, fill='#2563eb', width=2)
+        if raw_points:
+            draw.line(raw_points, fill='#2563eb', width=2)
+        if post_qc_points:
+            draw.line(post_qc_points, fill='#7c3aed', width=2)
         draw.text((left, graph_top + graph_height + 6), '1', fill='#6b7280', font=small_font)
         end_label = f'{len(read.raw_sequence)} bases'
         draw.text((left + graph_width - draw.textlength(end_label, font=small_font), graph_top + graph_height + 6), end_label, fill='#6b7280', font=small_font)
@@ -2960,19 +2988,39 @@ def run_paper_trail(
             )
     with open(marker_review_template_tsv, 'w') as handle:
         handle.write(
-            'sequence_id\tdecision\treviewer\tnotes\tqc_reasons\ttaxonomy_concordance\t'
-            'read_taxonomy_assignments\toutput_length\tn_percent\n'
+            'sequence_id\tdecision\treviewer\treviewed_at\tnotes\treview_type\t'
+            'eligible_for_manual_acceptance\tcandidate_fasta\tqc_class\tqc_reasons\t'
+            'taxonomy_concordance\tread_taxonomy_assignments\toutput_length\tn_percent\n'
         )
         for row in recommendation_rows:
-            if row.get('Recommendation') != 'MANUAL_REVIEW':
+            recommendation = str(row.get('Recommendation') or '').upper()
+            qc_class = str(row.get('QCClass') or '').upper()
+            consensus = str(row.get('_ConsensusSequence') or '')
+            output_length = len(consensus)
+            output_n_percent = _n_percent(consensus)
+            if recommendation == 'MANUAL_REVIEW':
+                review_type = 'WARNING_REVIEW'
+            elif (
+                qc_class == 'FAIL_QC'
+                and consensus
+                and output_length >= final_min_length
+                and output_n_percent <= float(max_n_percent)
+            ):
+                # Only expose failed consensuses that are long enough and do not
+                # exceed the hard ambiguity ceiling. Short/no-output/high-N
+                # failures cannot be rescued by a review spreadsheet decision.
+                review_type = 'FAILED_QC_REVIEW'
+            else:
                 continue
+            eligible = bool(consensus and output_length >= final_min_length and output_n_percent <= float(max_n_percent))
+            candidate_path = str(failed_final_fasta) if qc_class == 'FAIL_QC' else str(assembled_fasta)
             handle.write(
-                f'{_clean_field(row.get("SequenceID", ""))}\t\t\t\t'
+                f'{_clean_field(row.get("SequenceID", ""))}\t\t\t\t\t{review_type}\t'
+                f'{"yes" if eligible else "no"}\t{_clean_field(candidate_path)}\t{qc_class}\t'
                 f'{_clean_field(row.get("Reasons", ""))}\t'
                 f'{_clean_field(row.get("TaxonomyConcordance", ""))}\t'
                 f'{_clean_field(row.get("ReadTaxonomyAssignments", ""))}\t'
-                f'{row.get("OutputLength", 0)}\t'
-                f'{row.get("OutputNPercent", 0.0)}\n'
+                f'{row.get("OutputLength", 0)}\t{row.get("OutputNPercent", 0.0)}\n'
             )
     qc_policy_tsv.write_text(
         '\n'.join([

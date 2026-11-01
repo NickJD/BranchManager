@@ -89,6 +89,7 @@ def _inspect_trace(path: Path, output: Path) -> dict[str, object]:
         'instrument_model': '',
         'raw_length': '',
         'quality_available': '',
+        'quality_status': '',
         'trace_available': '',
         'embedded_primer': '',
         'parse_status': 'PASS',
@@ -105,6 +106,7 @@ def _inspect_trace(path: Path, output: Path) -> dict[str, object]:
             'instrument_model': _decode_abif_text(entries.get(('MODL', 1), b'')),
             'raw_length': len(str(details.get('sequence') or '')),
             'quality_available': 'yes' if details.get('quality_available') else 'no',
+            'quality_status': str(details.get('quality_status') or ('AB1_PCON_OK' if details.get('quality_available') else 'AB1_QUALITY_UNAVAILABLE')) ,
             'trace_available': 'yes' if details.get('trace_available') else 'no',
             'embedded_primer': _embedded_primer(entries),
         })
@@ -411,7 +413,7 @@ def prepare_ab1_map(
     _write_tsv(inventory_path, inventory, (
         'read_file', 'filename', 'supplier_prefix', 'abif_sample', 'abif_comment',
         'abif_run_name', 'instrument_model', 'raw_length', 'quality_available',
-        'trace_available', 'embedded_primer', 'parse_status', 'parse_error',
+        'quality_status', 'trace_available', 'embedded_primer', 'parse_status', 'parse_error',
     ))
     _write_tsv(report_path, report, (
         'severity', 'line', 'sequence_id', 'supplier_read_id', 'code', 'detail',
@@ -430,6 +432,8 @@ def prepare_ab1_map(
         'isolates': len(expected_reads),
         'mapped_isolates': len(grouped),
         'unresolved_primers': unresolved,
+        'ab1_zero_filled_quality_files': sum(row.get('quality_status') == 'AB1_ZERO_FILLED_PCON' for row in inventory),
+        'ab1_missing_quality_files': sum(row.get('quality_status') in {'AB1_MISSING_PCON', 'AB1_PARTIAL_PCON'} for row in inventory),
         'errors': errors,
         'warnings': warnings,
     }

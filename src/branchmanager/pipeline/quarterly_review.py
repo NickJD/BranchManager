@@ -89,6 +89,11 @@ def normalise_assessment_row(row: dict, *, source_path: str = '') -> dict:
         'classification_query_coverage': _value(
             row, 'classification_query_coverage', 'GTDBQueryCoverage', 'QueryCoverage',
         ),
+        'marker_source_type': _value(row, 'marker_source_type', 'MarkerSourceType', default=''),
+        'marker_evidence_tier': _value(row, 'marker_evidence_tier', 'MarkerEvidenceTier', default=''),
+        'marker_qc_class': _value(row, 'marker_qc_class', 'MarkerQC', default=''),
+        'marker_manual_review_status': _value(row, 'marker_manual_review_status', 'MarkerReview', default=''),
+        'marker_review_decision': _value(row, 'marker_review_decision', 'MarkerReviewDecision', default=''),
         'baseline_evidence_class': _value(row, 'baseline_evidence_class', 'BaselineEvidenceClass'),
         'hungate_nearest_hit': _value(row, 'hungate_nearest_hit', 'HungateNearestHit'),
         'hungate_nearest_hit_taxonomy': _value(row, 'hungate_nearest_hit_taxonomy', 'HungateNearestHitTaxonomy'),
@@ -254,6 +259,31 @@ def _tree_leaf(row: dict) -> str:
 
 
 def _evidence_quality(row: dict) -> str:
+    """Return selection evidence tier without conflating marker source and taxonomy.
+
+    Explicit marker provenance takes precedence over the legacy identity-based
+    heuristic. A genome-predicted marker is capped at MODERATE; an unreviewed
+    FAIL_QC/QUALITY_UNVERIFIED marker remains LOW. A documented APPROVE_FAIL_QC
+    review can admit an otherwise recoverable failed consensus as MODERATE while
+    preserving its original QC class in the reports.
+    """
+    source = str(row.get('marker_source_type') or '').strip().upper()
+    tier = str(row.get('marker_evidence_tier') or '').strip().upper()
+    qc_class = str(row.get('marker_qc_class') or '').strip().upper()
+    review = str(row.get('marker_manual_review_status') or '').strip().upper()
+    decision = str(row.get('marker_review_decision') or '').strip().upper()
+
+    if tier in {'HIGH', 'MODERATE', 'LOW'}:
+        if tier == 'LOW' or review == 'REJECTED':
+            return 'LOW'
+        if qc_class in {'FAIL_QC', 'QUALITY_UNVERIFIED'}:
+            if not (review == 'APPROVED' and decision in {'APPROVE_FAIL_QC', 'APPROVE_UNVERIFIED', 'APPROVE'}):
+                return 'LOW'
+            return 'MODERATE'
+        if source == 'GENOME_BARRNAP':
+            return 'MODERATE' if tier == 'HIGH' else tier
+        return tier
+
     explicit = str(row.get('evidence_quality') or '').strip().upper()
     if explicit in {'HIGH', 'MODERATE', 'LOW'}:
         return explicit
@@ -264,7 +294,6 @@ def _evidence_quality(row: dict) -> str:
     taxonomy = str(row.get('taxonomy') or '').strip().lower()
     if flag_set & SELECTION_BLOCKING_PLACEMENT_FLAGS:
         return 'LOW'
-    # MARKER_QC_REVIEW_APPROVED: fall through to standard checks.
     if identity is not None and identity < 90.0:
         return 'LOW'
     if coverage is not None and coverage < 80.0:
@@ -559,6 +588,11 @@ def build_quarterly_review(
                 'quarterly_review_group': key,
                 'selection_group_type': selection_group_type,
                 'evidence_quality': evidence,
+                'marker_source_type': row.get('marker_source_type', 'NA'),
+                'marker_evidence_tier': row.get('marker_evidence_tier', evidence),
+                'marker_qc_class': row.get('marker_qc_class', 'NA'),
+                'marker_manual_review_status': row.get('marker_manual_review_status', 'NA'),
+                'marker_review_decision': row.get('marker_review_decision', 'NA'),
                 'available_genomes_before': counts_by_group[key],
                 'hungate_baseline_genomes_before': hungate_counts_by_group[key],
                 'secondary_baseline_genomes_before': secondary_counts_by_group[key],
@@ -786,7 +820,9 @@ def build_quarterly_review(
 
 QUARTERLY_REVIEW_FIELDS = [
     'round_id', 'sequence_id', 'partner_id', 'role', 'round_rank', 'backup_rank', 'backup_for',
-    'priority_tier', 'assessment_species', 'evidence_quality', 'available_genomes_before',
+    'priority_tier', 'assessment_species', 'evidence_quality', 'marker_source_type',
+    'marker_evidence_tier', 'marker_qc_class', 'marker_manual_review_status',
+    'marker_review_decision', 'available_genomes_before',
     'hungate_baseline_genomes_before', 'secondary_baseline_genomes_before',
     'cultured_project_baseline_genomes_before', 'selection_group_type',
     'qc_passed_genome_ids', 'available_ani_clusters',

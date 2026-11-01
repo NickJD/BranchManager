@@ -1605,6 +1605,19 @@ def _cmd_filing_cabinet_impl(args):
         baseline_tier=baseline_tier,
     )
     try:
+        from branchmanager.marker_evidence import ensure_marker_evidence_schema, register_baseline_marker_records
+        ensure_marker_evidence_schema(db)
+        # The mapped FASTA contains the stable IDs actually inserted into the DB.
+        if mapped_fasta and Path(mapped_fasta).is_file():
+            evidence_count = register_baseline_marker_records(
+                db, mapped_fasta, dataset=str(getattr(args, 'dataset', 'Baseline')),
+            )
+            logging.getLogger(__name__).info(
+                '[FILING CABINET] Registered %d curated baseline marker-evidence record(s)', evidence_count,
+            )
+    except Exception as exc:
+        raise RuntimeError(f'Could not register baseline marker evidence: {exc}') from exc
+    try:
         if alias_entries:
             id_map_path = _write_id_map_tsv(Path(outdir) / 'filing_cabinet_id_map.tsv', alias_entries)
             logging.getLogger(__name__).info('[FILING CABINET] Wrote baseline ID mapping to %s', id_map_path)
@@ -2138,6 +2151,15 @@ def cmd_filing_cabinet_configured_baselines(args):
 def _cmd_performance_review_impl(args):
     db = Database(args.db)
     db.initialise()
+    # Marker evidence registry is additive to the legacy sequence/provenance tables.
+    # Backfill once before the first v1 assessment so existing curated baselines and
+    # accepted partner markers are classified under the explicit evidence policy.
+    try:
+        from branchmanager.marker_evidence import ensure_marker_evidence_schema, backfill_legacy_marker_evidence
+        ensure_marker_evidence_schema(db)
+        backfill_legacy_marker_evidence(db)
+    except Exception as exc:
+        raise RuntimeError(f'Could not initialise marker evidence registry: {exc}') from exc
     outdir = args.out
     threads = int(getattr(args, 'threads', 4) or 4)
     os.makedirs(outdir, exist_ok=True)
@@ -2717,6 +2739,29 @@ def _cmd_performance_review_impl(args):
             row['chimera_score'] = result.get('score')
         db.upsert_sequence_provenance(marker_provenance)
         write_marker_qc_bridge(Path(outdir) / 'marker_qc_provenance.tsv', marker_provenance)
+        # Register the exact sequence currently stored in the project DB, not a
+        # declined incoming replacement. This is what future novelty runs compare.
+        from branchmanager.marker_evidence import upsert_active_marker_evidence
+        source_type = str(getattr(args, 'marker_source_type', 'auto') or 'auto').upper()
+        if source_type == 'AUTO':
+            source_type = 'PARTNER_FASTA'
+        preserve_ids = set(declined_resequencing_ids) | set(failed_resequencing_ids)
+        evidence_records = []
+        for sequence_id, _incoming_sequence in mapped_records:
+            if sequence_id in preserve_ids:
+                continue
+            with db.connect() as conn:
+                stored = conn.execute('SELECT sequence FROM sequences WHERE id=?', (sequence_id,)).fetchone()
+            if stored and str(stored[0] or '').strip():
+                evidence_records.append((sequence_id, str(stored[0])))
+        inserted_evidence = upsert_active_marker_evidence(
+            db, evidence_records, marker_provenance,
+            source_type=source_type, dataset=run_dataset, source_file=str(Path(args.input).resolve()),
+        )
+        logging.getLogger(__name__).info(
+            '[PERFORMANCE REVIEW] Registered %d marker evidence record(s) in the v1 evidence registry',
+            len(inserted_evidence),
+        )
     except Exception as exc:
         raise SystemExit(f'[PERFORMANCE REVIEW] Reference-based chimera screening failed: {exc}')
 
@@ -3310,12 +3355,20 @@ def _cmd_performance_review_impl(args):
                 )
                 from branchmanager.marker_provenance import marker_qc_flag
                 project_provenance = db.get_sequence_provenance(run_ids_for_assessment)
+                from branchmanager.marker_evidence import get_active_marker_evidence
+                project_marker_evidence = get_active_marker_evidence(db, run_ids_for_assessment)
                 unresolved_replacements = db.get_unresolved_marker_replacement_failures(run_ids_for_assessment)
                 for assessment_row in assessment_rows:
                     sequence_id = str(assessment_row.get('id'))
                     provenance = project_provenance.get(sequence_id) or {}
+                    evidence = project_marker_evidence.get(sequence_id) or {}
                     qc_flag = marker_qc_flag(provenance)
                     assessment_row.update({
+                        'marker_source_type': evidence.get('marker_source_type', 'LEGACY_UNKNOWN'),
+                        'marker_evidence_tier': evidence.get('marker_evidence_tier', 'LOW'),
+                        'marker_review_decision': evidence.get('marker_review_decision', ''),
+                        'marker_review_reviewer': evidence.get('marker_review_reviewer', ''),
+                        'marker_review_notes': evidence.get('marker_review_notes', ''),
                         'marker_qc_class': provenance.get('marker_qc_class', 'QUALITY_UNVERIFIED'),
                         'marker_qc_recommendation': provenance.get('marker_qc_recommendation', 'MANUAL_REVIEW'),
                         'marker_qc_reasons': provenance.get('marker_qc_reasons', 'no_marker_qc_provenance'),
@@ -4262,6 +4315,7 @@ def build_parser():
             '  mailroom           Inventory AB1 deliveries and build a batch map.\n'
             '  interview          Run standalone AB1 QC from a Mailroom batch.\n'
             '  background-check   Pre-classify reference collections once and reuse the evidence.\n'
+            '  genomic-16s-selection Extract genome-identifiable 16S representatives with Barrnap + VSEARCH + optional GTDB-Tk comparison.\n'
             '  filing-cabinet     Register the cultured baseline and backbone tree.\n'
             '  onboarding         Validate a partner submission before project state changes.\n'
             '  paper-trail        Interpret chromatograms and assemble primer reads.\n'
@@ -4279,13 +4333,15 @@ def build_parser():
             '  org-chart          Extract a focused tree and iTOL files for a specific taxon.\n'
             '  label-maker        Regenerate iTOL annotation files from stored taxonomy.\n\n'
             'Typical workflow:\n'
-            '  P. branchmanager mailroom --read-dir All_AB1 --metadata supplier.csv --dataset QUB_01 --forward-primer 63F -o QUB_01\n'
+            '  P. branchmanager mailroom --read-dir All_AB1 --manifest manifest.csv --dataset QUB_01 --forward-primer 63F -o QUB_01\n'
             '  Q. branchmanager interview --mailroom QUB_01 -o QUB_01_interview\n'
             '  0. branchmanager background-check --dataset hungate16s=hungate.fasta --ref gtdb.fna --taxa gtdb_tax.tsv -o background_check_out\n'
             '  1. branchmanager filing-cabinet --fasta baseline.fasta --db project.db --dataset Hungate --taxa-assignments background_check_out/pipeline_taxonomy.tsv --build-tree -o filing_cabinet_out\n'
             '  2. branchmanager performance-review --input new_seqs.fasta --partner-metadata new_seqs_metadata.tsv --db project.db --dataset Batch1 --ref gtdb.fna --mwl MWL.xlsx -o review_out\n'
             '  3. branchmanager quarterly-review --db project.db --genome-budget 24 --tree review_out/tree/current_tree.nwk -o quarterly_review_01\n'
             '  4. branchmanager org-chart --db project.db --taxon archaea --from-dir filing_cabinet_out -o archaea_out\n'
+            '  5. branchmanager genomic-16s-selection --genome-dir assemblies --reference gtdb_r232_bac_arch_ssu_reps.fna.gz --gtdb-summary gtdbtk.bac120.summary.tsv -o genomic_16s\n'
+
         ),
         formatter_class=_Fmt,
     )
@@ -4418,6 +4474,10 @@ def build_parser():
     add_project_config_option(performance_review_parser)
     performance_review_parser.add_argument('--input', required=True,
         help='FASTA file of new sequences to analyse.')
+    performance_review_parser.add_argument('--marker-source-type',
+        choices=['auto', 'SANGER_AB1', 'PARTNER_FASTA', 'PACBIO_HIFI', 'MIXED'],
+        default='auto',
+        help='Provenance of the marker sequence. Auto treats direct --input FASTA as PARTNER_FASTA; Assistant resolves Sanger/PacBio automatically.')
     performance_review_parser.add_argument('--db', required=True,
         help='Path to the BranchManager SQLite database (must have been initialised with `branchmanager filing-cabinet`).')
     performance_review_parser.add_argument('-o', '--out', required=True,
@@ -4866,7 +4926,7 @@ def build_parser():
     from branchmanager.tools import (
         benchmark_selection as _tool_benchmark, build_anchor_fasta as _tool_anchors,
         id_sanitation as _tool_ids, metadata_to_diversity as _tool_diversity,
-        primers_to_manifest as _tool_manifest,
+        primers_to_manifest as _tool_manifest, genomic_16s_selection as _tool_genomic_16s,
     )
     for _name, _module, _help in (
         ('primers-to-manifest', _tool_manifest,
@@ -4879,6 +4939,9 @@ def build_parser():
          'Tool: download NCBI RefSeq 16S tree-anchor sequences into rumen-gut_reference_anchors.fasta.'),
         ('check-ids', _tool_ids,
          'Tool: check (and optionally sanitise) sequence/isolate IDs in a CSV/TSV table or FASTA.'),
+        ('genomic-16s-selection', _tool_genomic_16s,
+         'Tool: run Barrnap, VSEARCH against GTDB SSU representatives, optional GTDB-Tk concordance, and select one 16S representative per genome.'),
+
     ):
         _tool_parser = sub.add_parser(_name, help=_help, description=_help, formatter_class=_Fmt)
         _module.add_arguments(_tool_parser)
@@ -4896,8 +4959,8 @@ def build_parser():
     )
     mailroom_parser.add_argument('--read-dir', required=True,
         help='Directory containing Sanger AB1/ABI or segmented PacBio HiFi FASTQ files for one partner batch.')
-    mailroom_parser.add_argument('--metadata', required=True,
-        help='Supplier CSV/TSV. Sanger requires read ID, isolate ID, and direction; PacBio requires isolate ID and FASTQ filename.')
+    mailroom_parser.add_argument('--manifest', required=True,
+        help='Manifest file. Sanger requires read ID, isolate ID, and direction; PacBio requires isolate ID and FASTQ filename.')
     mailroom_parser.add_argument('--technology', choices=['sanger', 'pacbio'], default='sanger',
         help='Delivery technology (default: sanger). PacBio triggers FASTQ clustering after validation.')
     mailroom_parser.add_argument('--pacbio-library-prep', default='Kinnex 16S rRNA Kit',
@@ -5122,6 +5185,31 @@ def build_parser():
         help='Write project_before_exit_interview.sqlite before applying (default: enabled).')
     exit_interview_parser.add_argument('-o', '--out', required=True)
 
+    marker_evidence_migrate_parser = sub.add_parser(
+        'marker-evidence-migrate',
+        help='Create/backfill the source-aware marker evidence registry for selection database v1.',
+        formatter_class=_Fmt,
+    )
+    marker_evidence_migrate_parser.add_argument('--db', required=True)
+    marker_evidence_migrate_parser.add_argument('--force', action='store_true', default=False,
+        help='Re-run the legacy backfill. Normally only run once after reviewing the existing records.')
+    marker_evidence_migrate_parser.add_argument('-o', '--out', required=True)
+
+    register_marker_evidence_parser = sub.add_parser(
+        'register-marker-evidence',
+        help='Register additional marker observations (e.g. Barrnap 16S) without replacing the active marker.',
+        formatter_class=_Fmt,
+    )
+    register_marker_evidence_parser.add_argument('--db', required=True)
+    register_marker_evidence_parser.add_argument('--fasta', required=True,
+        help='FASTA of supplemental genomic 16S sequences; first header token maps through metadata fasta_id/genome_id.')
+    register_marker_evidence_parser.add_argument('--metadata', required=True,
+        help='TSV mapping fasta_id/genome_id to an existing BranchManager sequence_id, source/tier, and genome/16S taxonomy evidence.')
+    register_marker_evidence_parser.add_argument('--source-type', default='GENOME_BARRNAP',
+        choices=['GENOME_BARRNAP'])
+    register_marker_evidence_parser.add_argument('--evidence-tier', default='MODERATE', choices=['MODERATE', 'LOW'])
+    register_marker_evidence_parser.add_argument('-o', '--out', required=True)
+
     annual_report_parser = sub.add_parser(
         'annual-report',
         help='Annual Report: create a point-in-time project overview, ledgers, and decision-change report.',
@@ -5159,6 +5247,9 @@ def build_parser():
     assistant_parser.add_argument('--partner-metadata', required=True)
     assistant_parser.add_argument('--partner-id', default=None,
         help='Expected partner acronym for validation, for example QUB or UoG.')
+    assistant_parser.add_argument('--marker-source-type',
+        choices=['auto', 'SANGER_AB1', 'PARTNER_FASTA', 'PACBIO_HIFI', 'MIXED'], default='auto',
+        help='Evidence provenance for the marker imported by Assistant (default: infer from input mode).')
     assistant_parser.add_argument('--read-dir', default=None)
     assistant_parser.add_argument('--db', required=True)
     assistant_parser.add_argument('--dataset', required=True)
@@ -5682,11 +5773,11 @@ def cmd_mailroom(args):
 
     manifest = RunManifest(args.out, 'mailroom')
     manifest.add_input(args.read_dir, role=f'{args.technology}_directory')
-    manifest.add_input(args.metadata, role='supplier_metadata')
+    manifest.add_input(args.manifest, role='supplier_metadata')
     try:
         if args.technology == 'sanger':
             result = prepare_ab1_map(
-                args.read_dir, args.metadata, args.out, dataset=args.dataset,
+                args.read_dir, args.manifest, args.out, dataset=args.dataset,
                 forward_primer=args.forward_primer, reverse_primer=args.reverse_primer,
                 processing_mode=args.processing_mode, recursive=args.recursive,
             )
@@ -5694,7 +5785,7 @@ def cmd_mailroom(args):
                 manifest.add_output(result[role], role=role)
         else:
             result = prepare_pacbio_map(
-                args.read_dir, args.metadata, args.out, dataset=args.dataset,
+                args.read_dir, args.manifest, args.out, dataset=args.dataset,
                 recursive=args.recursive, library_prep=args.pacbio_library_prep,
             )
             for role in ('pacbio_map', 'inventory', 'report', 'summary'):
@@ -6379,6 +6470,51 @@ def cmd_exit_interview(args):
     )
 
 
+def cmd_marker_evidence_migrate(args):
+    """Create the v1 marker-evidence registry and conservatively backfill legacy rows."""
+    from branchmanager.marker_evidence import ensure_marker_evidence_schema, backfill_legacy_marker_evidence
+    db = Database(args.db)
+    db.initialise()
+    ensure_marker_evidence_schema(db)
+    counts = backfill_legacy_marker_evidence(db, force=bool(args.force))
+    output = Path(args.out).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    report = output / 'marker_evidence_backfill.tsv'
+    with open(report, 'w') as handle:
+        handle.write('Category\tCount\n')
+        for key, value in counts.items():
+            handle.write(f'{key}\t{value}\n')
+    print(f'[marker-evidence-migrate] Evidence registry ready. Report: {report}')
+
+
+def cmd_register_marker_evidence(args):
+    """Register supplementary marker observations without replacing the active isolate marker."""
+    from branchmanager.marker_evidence import (
+        ensure_marker_evidence_schema, backfill_legacy_marker_evidence,
+        register_supplemental_marker_fasta,
+    )
+    db = Database(args.db)
+    db.initialise()
+    ensure_marker_evidence_schema(db)
+    backfill_legacy_marker_evidence(db)
+    results = register_supplemental_marker_fasta(
+        db, args.fasta, args.metadata,
+        default_source_type=args.source_type,
+        default_evidence_tier=args.evidence_tier,
+    )
+    output = Path(args.out).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    report = output / 'marker_evidence_import.tsv'
+    fields = sorted({key for row in results for key in row}) or ['sequence_id', 'result']
+    with open(report, 'w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(results)
+    imported = sum(row.get('result') == 'IMPORTED' for row in results)
+    existing = sum(row.get('result') == 'ALREADY_PRESENT' for row in results)
+    print(f'[register-marker-evidence] {imported} imported; {existing} already present. Report: {report}')
+
+
 def cmd_annual_report(args):
     from branchmanager.reporting import write_annual_report
 
@@ -6673,6 +6809,9 @@ def cmd_assistant_cohort(args):
                     joint_args.pacbio_map = None
                     joint_args.fasta = str(combined_fasta)
                     joint_args.marker_qc = str(combined_qc)
+                    # Cohort FASTA is assembled from the Sanger sample_map batches
+                    # above; do not mislabel these consensuses as partner-supplied FASTA.
+                    joint_args.marker_source_type = 'SANGER_AB1'
                     joint_args.marker_review = getattr(args, 'marker_review', None)
                     joint_args.partner_id = None
                     joint_args.cohort_qc_failures = str(failure_path)
@@ -6888,6 +7027,11 @@ def cmd_assistant(args):
             group_phyla=None, functional=None, draft_rumen_functions=False,
             marker_qc=str(marker_qc) if marker_qc else None,
             marker_review=args.marker_review,
+            marker_source_type=(
+                str(getattr(args, 'marker_source_type', 'auto') or 'auto').upper()
+                if str(getattr(args, 'marker_source_type', 'auto') or 'auto').lower() != 'auto'
+                else ('SANGER_AB1' if args.sample_map else 'PACBIO_HIFI' if args.pacbio_map else 'PARTNER_FASTA')
+            ),
             accept_unverified_marker_qc=bool(args.accept_unverified_marker_qc),
             chimera_ref=args.chimera_ref or args.ref,
             skip_chimera_check=args.skip_chimera_check, collapse=False,
@@ -7209,6 +7353,10 @@ def main(argv=None):
         cmd_add_external_genomes(args)
     elif args.command == 'add-maldi-identifications':
         cmd_add_maldi_identifications(args)
+    elif args.command == 'marker-evidence-migrate':
+        cmd_marker_evidence_migrate(args)
+    elif args.command == 'register-marker-evidence':
+        cmd_register_marker_evidence(args)
     elif args.command == 'import-partner-workbook':
         cmd_import_partner_workbook(args)
     elif args.command == 'exit-interview':

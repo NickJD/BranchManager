@@ -970,6 +970,36 @@ def write_annual_report(db, outdir: str | Path) -> dict:
             handle.write('\t'.join('NA' if value is None else str(value) for value in row) + '\n')
     changes_path = write_decision_changes(db, output / 'decision_changes.tsv')
 
+    # Explicit marker evidence ledger: multiple marker observations may exist
+    # for one isolate, while project_isolate_ledger remains one row per isolate.
+    marker_evidence_path = output / 'project_marker_evidence_ledger.tsv'
+    try:
+        from branchmanager.marker_evidence import write_marker_evidence_report
+        write_marker_evidence_report(db, marker_evidence_path)
+    except Exception as exc:
+        marker_evidence_path.write_text(
+            'sequence_id\tdataset\tsource_type\tevidence_tier\tqc_class\tmanual_review_status\tError\n'
+            f'\t\t\t\t\t\t{str(exc).replace(chr(9), " ").replace(chr(10), " ")}\n'
+        )
+
+    # MALDI observations remain a separate soft-identification ledger; they are
+    # never inserted into the marker sequence/evidence registry or VSEARCH pool.
+    maldi_evidence_path = output / 'project_maldi_ledger.tsv'
+    try:
+        maldi_rows = db.get_maldi_identifications() if hasattr(db, 'get_maldi_identifications') else []
+        maldi_rows = [dict(row) for row in (maldi_rows or []) if isinstance(row, dict)]
+        maldi_fields = sorted({key for row in maldi_rows for key in row})
+        if not maldi_fields:
+            maldi_fields = ['sequence_id']
+        with open(maldi_evidence_path, 'w', newline='') as handle:
+            writer = csv.DictWriter(handle, fieldnames=maldi_fields, delimiter='\t', extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(maldi_rows)
+    except Exception as exc:
+        maldi_evidence_path.write_text(
+            'sequence_id\tError\n\t' + str(exc).replace('\t', ' ').replace('\n', ' ') + '\n'
+        )
+
     dataset_summary_headers = (
         'Dataset', 'Role', 'Baseline tier', 'Genomes available', 'Proposed sequences', 'Sequences',
         'Active marker-QC passed', 'Active marker-QC review', 'Active marker-QC failed',
@@ -1095,6 +1125,8 @@ def write_annual_report(db, outdir: str | Path) -> dict:
         '<a href="project_isolate_ledger.tsv">isolates</a>, '
         '<a href="project_candidate_overview.tsv">current candidate assessments</a>, '
         '<a href="project_genome_ledger.tsv">genomes</a>, '
+        '<a href="project_marker_evidence_ledger.tsv">marker evidence</a>, '
+        '<a href="project_maldi_ledger.tsv">MALDI observations</a>, '
         '<a href="project_visual_reports.tsv">visual reports</a>, '
         '<a href="project_visual_gallery.tsv">visual gallery</a>, '
         '<a href="annual_report_guide.html">report guide</a>, '
@@ -1105,6 +1137,7 @@ def write_annual_report(db, outdir: str | Path) -> dict:
         'html': str(report), 'readme': str(readme_path), 'readme_html': str(readme_html_path),
         'datasets': str(dataset_summary_path), 'isolates': str(isolate_path),
         'genomes': str(genome_path), 'candidates': str(candidate_path),
+        'marker_evidence': str(marker_evidence_path), 'maldi': str(maldi_evidence_path),
         'visual_reports': str(visual_report_path), 'visual_gallery': str(visual_gallery_path),
         'removals': str(removals_path), 'decision_changes': changes_path,
     }
