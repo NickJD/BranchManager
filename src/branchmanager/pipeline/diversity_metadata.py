@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List
 
 from branchmanager.taxonomy import canonicalise_sequence_id
+from branchmanager.utils.io import open_text
+from branchmanager.utils.text import normalise_column, normalise_for_matching
 
 
 ID_COLUMNS = {
@@ -34,51 +36,36 @@ def _safe_text(value: object) -> str:
     return str(value).replace('\t', ' ').replace('\n', ' ').replace('\r', ' ').strip()
 
 
-def _normalise_column(name: object) -> str:
-    return str(name or '').strip().lower().replace('-', '_')
-
-
-def _normalise_for_matching(name: object) -> str:
-    return _normalise_column(name).replace('_', '').replace(' ', '')
-
-
 def _normalise_value(value: object) -> str:
     return ' '.join(_safe_text(value).split()).casefold()
 
 
 def _find_column(fieldnames: Iterable[str], candidates: set[str]) -> str | None:
     fields = list(fieldnames or [])
-    exact = {_normalise_column(c): c for c in candidates}
-    compact = {_normalise_for_matching(c): c for c in candidates}
+    exact = {normalise_column(c): c for c in candidates}
+    compact = {normalise_for_matching(c): c for c in candidates}
     for field in fields:
-        norm = _normalise_column(field)
+        norm = normalise_column(field)
         if norm in exact:
             return field
     for field in fields:
-        norm = _normalise_for_matching(field)
+        norm = normalise_for_matching(field)
         if norm in compact:
             return field
     return None
 
 
-def _open_text(path: str | Path):
-    if str(path).endswith('.gz'):
-        import gzip
-        return gzip.open(path, 'rt', newline='')
-    return open(path, 'rt', newline='')
-
-
 def _rows_from_delimited(path: str | Path) -> list[dict]:
     suffixes = ''.join(Path(str(path).removesuffix('.gz')).suffixes).lower()
     delimiter = '\t' if suffixes.endswith('.tsv') or suffixes.endswith('.txt') else ','
-    with _open_text(path) as handle:
+    with open_text(path) as handle:
         sample = handle.read(4096)
         handle.seek(0)
         try:
             dialect = csv.Sniffer().sniff(sample, delimiters=',\t;')
             delimiter = dialect.delimiter
         except Exception:
-            pass
+            logger.debug('Could not sniff CSV delimiter for %r; using default', path)
         reader = csv.DictReader(handle, delimiter=delimiter)
         return [row for row in reader if any(v not in (None, '') for v in row.values())]
 

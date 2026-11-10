@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import csv
-import gzip
-import hashlib
 from pathlib import Path
 from typing import Iterable, Optional
+
+from branchmanager.utils.io import open_text, sha256sum
+from branchmanager.utils.text import normalise_header
 
 
 ISOLATE_STATES = (
@@ -29,32 +30,24 @@ TRUE_VALUES = {'1', 'true', 't', 'yes', 'y', 'pass', 'passed'}
 FALSE_VALUES = {'0', 'false', 'f', 'no', 'n', 'fail', 'failed'}
 
 
-def _normalise(name: object) -> str:
-    return str(name or '').strip().lstrip('\ufeff').lower().replace('-', '_').replace(' ', '_')
-
-
-def _open(path: str | Path):
-    return gzip.open(path, 'rt', newline='') if str(path).lower().endswith('.gz') else open(path, newline='')
-
-
 def _read_rows(path: str | Path) -> list[dict[str, str]]:
-    with _open(path) as handle:
+    with open_text(path) as handle:
         sample = handle.read(4096)
         handle.seek(0)
         delimiter = '\t' if str(path).lower().endswith(('.tsv', '.tsv.gz', '.txt', '.txt.gz')) else ','
         try:
             delimiter = csv.Sniffer().sniff(sample, delimiters=',\t').delimiter
         except Exception:
-            pass
+            logging.getLogger(__name__).debug('Could not sniff CSV delimiter for %r; using default', path)
         return [
-            {_normalise(key): str(value or '').strip() for key, value in row.items() if key is not None}
+            {normalise_header(key): str(value or '').strip() for key, value in row.items() if key is not None}
             for row in csv.DictReader(handle, delimiter=delimiter)
         ]
 
 
 def _value(row: dict[str, str], *names: str) -> str:
     for name in names:
-        value = row.get(_normalise(name), '')
+        value = row.get(normalise_header(name), '')
         if value:
             return value
     return ''
@@ -81,11 +74,7 @@ def _optional_bool(value: object) -> Optional[bool]:
 
 
 def _sha256(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, 'rb') as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return sha256sum(path)
 
 
 def normalise_state(value: object, *, default: str = 'RECEIVED') -> str:
@@ -174,7 +163,12 @@ def import_genome_results(
             status = 'GENOME_QC_PASSED' if metrics_pass else 'GENOME_QC_FAILED'
             qc_basis = f'automatic:{min_completeness:g}% completeness/{max_contamination:g}% contamination'
         else:
-            qc_pass = status == 'GENOME_QC_PASSED' if explicit_pass is None else explicit_pass
+            qc_pass = (
+                True if explicit_pass is None and status == 'GENOME_QC_PASSED'
+                else False if explicit_pass is None and status == 'GENOME_QC_FAILED'
+                else None if explicit_pass is None
+                else explicit_pass
+            )
             qc_basis = 'explicit_status_or_qc_flag'
         if status == 'GENOME_QC_FAILED' and qc_pass:
             results.append({'line': line_number, 'sequence_id': sequence_id, 'genome_id': genome_id, 'result': 'REJECTED', 'detail': 'GENOME_QC_FAILED conflicts with genome_qc_pass=yes'})
@@ -210,7 +204,7 @@ def import_genome_results(
             'sequence_id': sequence_id,
             'accession': _value(row, 'accession', 'genome_accession'),
             'genome_status': status,
-            'genome_qc_pass': bool(qc_pass),
+            'genome_qc_pass': qc_pass,
             'completeness': completeness,
             'contamination': contamination,
             'gtdb_taxonomy': _value(row, 'gtdb_taxonomy', 'gtdbtk_taxonomy', 'taxonomy'),
@@ -322,7 +316,7 @@ def import_external_genomes(
         })
         genome_status = _value(row, 'genome_status') or 'SEQUENCED'
         genome_qc = _optional_bool(_value(row, 'genome_qc_pass', 'qc_pass'))
-        if genome_qc is None:
+        if genome_qc is None and genome_status.strip().upper() in {'GENOME_QC_PASSED', 'GENOME_QC_FAILED'}:
             genome_qc = genome_status.strip().upper() == 'GENOME_QC_PASSED'
         genome_entries.append({
             'genome_id': genome_id, 'sequence_id': sequence_id,
@@ -700,6 +694,144 @@ def write_import_report(path: str | Path, rows: Iterable[dict]) -> str:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     fields = ['line', 'sequence_id', 'genome_id', 'result', 'detail']
+    with open(output, 'w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(rows)
+    return str(output)
+
+
+def import_genome_only_partner_workbook(
+    db, path: str | Path, *, sheet_name='Bulk Upload Template', dataset='PartnerWorkbook',
+) -> list[dict]:
+    """Register partner isolates from a workbook without importing marker/16S data.
+
+    This registers candidate isolate identities only. Genome assemblies and QC
+    evidence are imported separately through the genome-results workflow.
+    """
+    import json
+    from branchmanager.partner_metadata import load_genome_only_partner_workbook_rows
+
+    source_file = str(Path(path).expanduser().resolve())
+    rows = load_genome_only_partner_workbook_rows(source_file, sheet_name=sheet_name)
+    if not rows:
+        return []
+
+    roles = db.get_dataset_roles()
+    if roles.get(dataset, {}).get('role') == 'baseline':
+        raise ValueError(
+            f'dataset {dataset!r} is registered as a baseline; genome-only partner isolates '
+            'must be registered in a candidate dataset'
+        )
+
+    with db.connect() as conn:
+        existing_sequences = {
+            str(sid): {'dataset': str(ds or ''), 'sequence': seq}
+            for sid, ds, seq in conn.execute('SELECT id, dataset, sequence FROM sequences')
+        }
+    existing_metadata = db.get_sequencing_metadata_for_ids()
+
+    inserts = []
+    metadata_inserts = []
+    metadata_updates = []
+    report = []
+    seen_ids = set()
+    for row in rows:
+        sequence_id = row['source_id']
+        if sequence_id in seen_ids:
+            report.append({
+                'source_row': row['source_row'], 'sequence_id': sequence_id,
+                'partner_id': row['partner_id'], 'result': 'REJECTED',
+                'detail': 'duplicate isolate identifier within workbook',
+            })
+            continue
+        seen_ids.add(sequence_id)
+        existing = existing_sequences.get(sequence_id)
+        metadata = existing_metadata.get(sequence_id)
+        if existing and existing['dataset'] and existing['dataset'] != dataset:
+            report.append({
+                'source_row': row['source_row'], 'sequence_id': sequence_id,
+                'partner_id': row['partner_id'], 'result': 'CONFLICT',
+                'detail': f"identifier already belongs to dataset {existing['dataset']!r}; not reassigned",
+            })
+            continue
+        if metadata:
+            old_partner = str(metadata.get('partner_id') or '').strip()
+            old_dataset = str(metadata.get('dataset') or '').strip()
+            if old_partner and old_partner.casefold() != row['partner_id'].casefold():
+                report.append({
+                    'source_row': row['source_row'], 'sequence_id': sequence_id,
+                    'partner_id': row['partner_id'], 'result': 'CONFLICT',
+                    'detail': f'identifier is already assigned to partner {old_partner!r}',
+                })
+                continue
+            if old_dataset and old_dataset != dataset:
+                report.append({
+                    'source_row': row['source_row'], 'sequence_id': sequence_id,
+                    'partner_id': row['partner_id'], 'result': 'CONFLICT',
+                    'detail': f'identifier metadata belongs to dataset {old_dataset!r}',
+                })
+                continue
+
+        project_metadata = dict((metadata or {}).get('project_metadata') or {})
+        project_metadata.update(row.get('project_metadata') or {})
+        project_metadata.update({
+            'registration_type': 'genome_only_partner_isolate',
+            'marker_sequence_status': 'NOT_IMPORTED_16S_IGNORED',
+            'partner_workbook_source': source_file,
+            'partner_workbook_sheet': sheet_name,
+            'partner_workbook_source_row': row['source_row'],
+            'partner_workbook_dataset': dataset,
+            'partner_workbook_partner_raw': row.get('partner_raw') or '',
+            'partner_culture_id': row.get('partner_culture_id') or '',
+        })
+
+        if not existing:
+            inserts.append((sequence_id, ''))
+        if metadata:
+            metadata_updates.append((
+                json.dumps(project_metadata, sort_keys=True, ensure_ascii=False), sequence_id,
+            ))
+            result = 'ALREADY_REGISTERED_UPDATED' if existing else 'METADATA_ADDED'
+        else:
+            metadata_inserts.append({
+                'id': sequence_id, 'partner_id': row['partner_id'], 'dataset': dataset,
+                'selected_for_sequencing': False,
+                # This field means that a genome is already available. The
+                # workbook registers the isolate; genome evidence is imported later.
+                'selected_for_wgs': False,
+                'source_id': sequence_id, 'source_file': source_file,
+                'raw_selected_value': '', 'raw_commitment_value': '',
+                'project_metadata': project_metadata,
+            })
+            result = 'INSERTED' if not existing else 'METADATA_ADDED'
+        report.append({
+            'source_row': row['source_row'], 'sequence_id': sequence_id,
+            'partner_id': row['partner_id'], 'result': result,
+            'partner_culture_id': row.get('partner_culture_id') or '',
+            'detail': 'Genome-only candidate registered; marker/16S sequence fields ignored. '
+                      'Genome assembly and QC evidence have not been imported by this step.',
+        })
+
+    if inserts or metadata_inserts or metadata_updates:
+        db.upsert_dataset_role(dataset, 'candidate', genomes_available=False)
+    if inserts:
+        db.insert_sequences(inserts, dataset=dataset)
+    if metadata_inserts:
+        db.upsert_sequencing_metadata(metadata_inserts)
+    if metadata_updates:
+        with db.connect() as conn:
+            conn.executemany(
+                'UPDATE sequencing_metadata SET project_metadata_json=? WHERE id=?',
+                metadata_updates,
+            )
+    return report
+
+
+def write_genome_only_partner_import_report(path: str | Path, rows: Iterable[dict]) -> str:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fields = ['source_row', 'sequence_id', 'partner_id', 'result', 'partner_culture_id', 'detail']
     with open(output, 'w', newline='') as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', extrasaction='ignore')
         writer.writeheader()

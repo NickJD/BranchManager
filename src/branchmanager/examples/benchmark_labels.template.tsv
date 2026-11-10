@@ -1,0 +1,5 @@
+case_id	method	isolate_id	rank	relevant
+cohort_A	BranchManager	Iso001	1	1
+cohort_A	BranchManager	Iso002	2	0
+cohort_A	ExpertPanel	Iso002	1	0
+cohort_A	ExpertPanel	Iso001	2	1

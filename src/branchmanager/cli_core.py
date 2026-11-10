@@ -4,9 +4,11 @@ Implements the BranchManager office workflow and technical reporting utilities.
 """
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -20,7 +22,7 @@ try:
     if src_root not in sys.path:
         sys.path.insert(0, src_root)
 except Exception:
-    pass
+    pass  # could not determine package path; continuing without modification
 
 from branchmanager.db.interface import Database
 from branchmanager.pipeline import (
@@ -59,20 +61,14 @@ from branchmanager.pipeline.workflow_helpers import (
     write_selection_summary_tsv,
     write_sequence_assessment_tsv,
 )
-from branchmanager.taxonomy import canonicalise_sequence_id, normalise_domain_query, taxonomy_matches_kingdom
+from branchmanager.taxonomy import (
+    canonicalise_sequence_id, normalise_domain_query, taxonomy_matches_kingdom,
+    compare_expected_taxon, parse_taxon_string, domain_designation,
+)
 from branchmanager.partner_metadata import load_partner_sequencing_metadata
 from branchmanager.run_manifest import RunManifest, utc_now, sha256_file
 from branchmanager.project_config import (
     apply_project_config_defaults, config_path_from_argv, load_project_config,
-)
-
-
-SEQUENCE_DOMAIN_CHOICES = (
-    'bacteria', 'bacterial',
-    'archaea', 'archaeal',
-    'fungi', 'fungal',
-    'eukaryota', 'eukarya',
-    'mixed', 'all', 'none',
 )
 
 def _find_tree_file_in_dir(d: str):
@@ -525,8 +521,23 @@ def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_shor
 
         matched_sources.add(str(mapped))
         existing_metadata = db.get_sequencing_metadata_for_ids([mapped]).get(str(mapped), {})
-        project_metadata = dict(existing_metadata.get('project_metadata') or {})
-        project_metadata.update(row.get('project_metadata') or {})
+        from branchmanager.partner_metadata import merge_partner_project_metadata
+        project_metadata, catalogue_is_gold = merge_partner_project_metadata(
+            existing_metadata.get('project_metadata') or {},
+            row.get('project_metadata') or {},
+        )
+        expected_taxon = str(
+            (project_metadata.get('partner_taxon_raw') if catalogue_is_gold else '')
+            or project_metadata.get('expected_taxon')
+            or row.get('expected_taxon') or ''
+        ).strip()
+        if expected_taxon:
+            project_metadata['expected_taxon'] = expected_taxon
+        elif not catalogue_is_gold and domain_designation((row.get('project_metadata') or {}).get('partner_taxon_raw')):
+            # A newly supplied generic domain label supersedes any stale
+            # specific-looking value previously stored for this isolate.
+            project_metadata.pop('expected_taxon', None)
+        project_metadata['expected_domain'] = str(row.get('expected_domain') or 'Bacteria').strip() or 'Bacteria'
         addition_method = row.get('addition_method')
         if str(mapped) in run_id_set and str(mapped) in maldi_sequence_ids:
             addition_method = 'both'
@@ -627,7 +638,7 @@ def _load_id_map_from_tsv(path: str | Path, db: Database | None = None):
                     if cid:
                         mapping[cid] = short
                 except Exception:
-                    pass
+                    pass  # could not resolve canonical ID for alias entry
     return mapping
 
 
@@ -651,7 +662,7 @@ def _find_preferred_id_map(directory: str | Path):
                 if cand.name != 'id_map.tsv':
                     return cand
     except Exception:
-        pass
+        pass  # could not glob ID map files in directory
     return None
 
 
@@ -714,9 +725,11 @@ def _write_detailed_output_guide(outdir: Path, rows):
     qc_section = [
         "## QC Filtering",
         "",
-        "QC happens before classification, novelty scoring, and tree building. "
-        "Sequences that fail QC are not included in downstream reports because they are too short "
-        "for reliable 16S placement or contain too many ambiguous bases.",
+        "Generic QC happens before classification, novelty scoring, and tree building. "
+        "By default, sequences below min_len or above max_n_percent are excluded. "
+        "However, an explicit APPROVE_FAIL_QC decision from the validated cohort marker-review file "
+        "can retain a failed marker for downstream assessment. Such a sequence remains technically FAIL_QC; "
+        "the reviewer override and original QC reasons are recorded separately.",
         "",
         "Filtering rules:",
         "",
@@ -731,15 +744,25 @@ def _write_detailed_output_guide(outdir: Path, rows):
             "",
             f"- Input sequences: `{stat('total_input')}`",
             f"- Kept after QC: `{stat('kept')}`",
+            f"- Passed the generic length/N filter: `{stat('passed_generic_qc')}`",
+            f"- Retained because of manual failed-QC approval: `{stat('retained_by_manual_override')}`",
             f"- Rejected total: `{stat('rejected_total', str(max(0, int(stat('total_input', '0')) - int(stat('kept', '0'))) if stat('total_input', '0').isdigit() and stat('kept', '0').isdigit() else 'NA'))}`",
             f"- Rejected as too short: `{stat('rejected_too_short')}`",
             f"- Rejected for too many `N` bases: `{stat('rejected_too_many_n')}`",
             "",
         ])
         if qc_rejections.exists():
-            qc_section.append(f"See `{_rel_output_path(outdir, qc_rejections)}` for every rejected sequence, its length, N count, and exact reason.")
+            qc_section.append(
+                f"See `{_rel_output_path(outdir, qc_rejections)}` for every sequence failing the generic filter, "
+                "including its disposition (`EXCLUDED` or `INCLUDED_BY_MANUAL_REVIEW`), length, N count, and exact reason."
+            )
         else:
             qc_section.append("Older runs may only include the summary file `qc.stats`; rerun to generate per-sequence `qc_rejections.tsv`.")
+        override_audit = outdir / 'assessment' / 'qc_manual_overrides.tsv'
+        if override_audit.is_file():
+            qc_section.append(
+                f"Explicit cohort approvals are listed separately in `{_rel_output_path(outdir, override_audit)}`."
+            )
         qc_section.append("")
     else:
         qc_section.extend([
@@ -758,13 +781,14 @@ def _write_detailed_output_guide(outdir: Path, rows):
         "",
         "## Recommended Reading Order",
         "",
-        "1. `assessment/sequencing_sets.tsv` - proposed primary, backup, and alternate isolates by GTDB species/local clade.",
+        "1. `assessment/sequencing_sets.tsv` - proposed primary, backup, and alternate isolates grouped by GTDB taxon rank and local tree clade.",
+        "1a. `assessment/pangenome_hierarchy.tsv` - independent species-to-domain pangenome summaries wherever catalogue lineage ranks are available.",
         "2. `assessment/selection_summary.tsv` - decision-facing per-isolate recommendations and evidence.",
         "3. `assessment/neighbourhoods/` - labelled local-clade figures linked from both reports.",
         "4. `assessment/sequence_assessment.tsv` - full per-sequence audit table.",
         "5. `baseline/baseline_hits.tsv`, `taxonomy/`, `tree/`, and `itol/` - supporting assignments and phylogeny.",
         "6. `assessment/novelty_metrics.tsv` - detailed component calculations.",
-        "7. `performance_review_dashboard.html` - compact linked view of the current Hiring Panel recommendations.",
+        "7. `performance_review_dashboard.html` - interactive, offline-capable dashboard for collection-level interpretation and per-isolate evidence exploration.",
         "",
         "## Directory Overview",
         "",
@@ -785,26 +809,27 @@ def _write_detailed_output_guide(outdir: Path, rows):
         "",
         "- `Recommendation`: primary, backup, secondary, review, target-met, or already-sequenced action; the reason is explicit in `RecommendationReason`.",
         "- `SequencingSetID`, `SelectionGroupType`, `SequencingSetRole`, `SequencingSetRank`: connect each isolate to its nine-member diversity panel. `BMEXT_*` identifies a baseline-pangenome extension; `BMSET_*` identifies a candidate-only group. `PRIMARY` rows fill the target, `BACKUP` rows protect against DNA-extraction failure, and redundancy/boundary rows are retained without a rank.",
-        "- `BaselineExtensionStatus`: explains whether exact GTDB species agreement, >=98.65% cultured-baseline identity, and >=95% query coverage support membership in a baseline-pangenome extension.",
+        "- `BaselineExtensionStatus`: records whether a species-level candidate also meets the cultured-baseline identity and query-coverage criteria for a baseline extension; this secondary evidence does not override the GTDB-defined pangenome taxon.",
+        "- `PartnerTaxon`, `PartnerTaxonRank`, `PangenomeRank`, `PangenomeTaxon`: the partner-catalogue declaration and the GTDB-derived rank/taxon used for pangenome grouping. `PartnerTaxon` controls pathway routing only; `GTDBGenomeTaxonomy` is the pangenome taxonomy source. `ClassifierGTDBDisagreement` flags marker-classifier versus GTDB discordance.",
+        "- `PangenomeCommittedGenomeCount`, `PangenomeBaselineGenomeCount`, `PangenomeTarget`, and `PangenomeGap`: coverage at the stated GTDB rank, subject to tree/clade concordance. See `pangenome_hierarchy.tsv` for parallel rank-level summaries.",
         "- `EvidenceQuality`: whether the marker classification and placement warnings are strong enough to support selection.",
         "- `MarkerQC`, `MarkerReview`: Paper Trail/Merge Meeting evidence and any explicit manual decision. Unreviewed warning/unverified markers cannot become PRIMARY/BACKUP.",
         "- `CulturedGap`: distance from the cultured baseline: large below 97 percent, moderate from 97 to below 98.65 percent, small at or above 98.65 percent.",
         "- `ProjectCoverage`: number of other partner candidates at or above 97 percent identity and 95 percent query coverage, including selected-for-sequencing partner isolates, the current rolling collection, and excluding the query itself.",
         "- `ReferenceContext`: divergence from the external reference using 94.5 and 98.65 percent full-length 16S heuristic boundaries.",
-        "- `CommittedGenomesSameAssessmentSpecies`, `SelectedPendingGenomesSameAssessmentSpecies`, `PangenomeTarget`, `PangenomeGap`: exact GTDB-species coverage and commitments. Baselines and completed partner genomes are available; selected pending isolates reserve planned slots. `SpeciesContext` adds a soft near-species or cluster-level note without relaxing the hard species gate.",
         "- `LocalTreeFigure`: relative path to the grouped local-clade PNG for visual inspection.",
         "",
         "These boundaries are decision-support heuristics, not declarations of a new species or genus. Genome analysis remains necessary for formal novelty claims.",
         "",
         "`assessment/sequence_assessment.tsv` is the main table. Important column groups:",
         "",
-        "- `GTDBTaxonomy`, `GTDBClassificationHit`, `GTDBClassificationIdentity`, `GTDBClassificationConfidence`, `GTDBQueryCoverage`: authoritative GTDB assignment and supporting alignment extent.",
-        "- `Taxonomy_<DB>`, `ClassificationHit_<DB>`, `Identity_<DB>`, `Confidence_<DB>`: assignment from additional databases such as GG2, SILVA, or NCBI.",
+        "- `GTDBTaxonomy`, `GTDBClassificationHit`, `GTDBClassificationIdentity`, `GTDBQueryCoverage`, `GTDBTargetCoverage`, `GTDBAlignmentLength`: GTDB's sequence-derived classifier assignment and the extent of its supporting alignment. These fields are classifier evidence, not the partner-isolate identity. `GTDBAssignmentEvidenceLevel`, `GTDBAlignmentEvidenceStatus`, `GTDBEvidenceTier`, and `GTDBEvidenceInterpretation` qualify that evidence.",
+        "- `Taxonomy_<DB>`, `ClassificationHit_<DB>`, `Identity_<DB>`, and `SourceClassifierConfidence_<DB>`: assignment from additional databases such as GG2, SILVA, or NCBI. Source classifier confidence is retained only when supplied by that classifier; it is never substituted with percentage identity.",
         "- `CulturedProjectNearestHit`, `CulturedProjectNearestHitDataset`, `CulturedProjectNearestHitTaxonomy`, `CulturedProjectNearestIdentity`, `CulturedProjectNearestQueryCoverage`: closest sequence in the combined cultured-project pool; inspect identity together with query coverage.",
         "- `ProjectNearestHit`, `ProjectNearestIdentity`, `ProjectNoveltyScore`: comparison against all partner candidates in the rolling project collection, excluding self.",
         "- `GTDBReferenceNearestHit`, `GTDBReferenceNearestIdentity`, `GTDBReferenceNoveltyScore`: nearest hit and context against the GTDB reference FASTA.",
-        "- `PartnerID`, `SelectedForGenomeSequencing`, `GenomeAlreadySequenced`, `BaselineGenomesSameAssessmentSpecies`, `SequencedPartnerGenomesSameAssessmentSpecies`, `SelectedPendingGenomesSameAssessmentSpecies`, `PangenomeGap`: rolling genome-collection context. Assessment species is GTDB for bacterial/archaeal Performance Reviews.",
-        "- `SequencingSet*`: proposed primary/backup membership based on pangenome gap, evidence quality, and phylogenetic spread.",
+        "- `PartnerTaxon`, `PartnerTaxonRank`, `PangenomeRank`, `PangenomeTaxon`: partner-catalogue declaration and GTDB-derived pangenome rank/taxon. `PartnerTaxon` controls domain/pathway routing only; `GTDBGenomeTaxonomy` supplies pangenome identity. `ClassifierGTDBDisagreement` and `ClassifierDatabaseConcordanceStatus` retain independent marker-classifier diagnostics. The legacy `*SameAssessmentSpecies` columns remain classifier-derived context; use `PangenomeCommittedGenomeCount`, `PangenomeTarget`, and `PangenomeGap` for GTDB-rank coverage.",
+        "- `SequencingSet*`: proposed primary/backup membership based on the GTDB rank-specific pangenome gap, marker evidence quality, and phylogenetic spread. `pangenome_hierarchy.tsv` contains parallel species-to-domain summaries.",
         "- `InTree`, `ClusterRepresentative`, `ClusterSize`, `ClusteredMembers`: whether the sequence itself entered the tree or was represented by another clustered sequence.",
         "- `PlacementFlags`: warnings such as low classification identity, low nearest identity, or novelty/classification disagreement.",
         "",
@@ -831,8 +856,10 @@ def _write_detailed_output_guide(outdir: Path, rows):
         "## Taxonomy Metrics",
         "",
         "- `ClassificationIdentity` is the vsearch percent identity to the best reference hit used for taxonomy assignment.",
-        "- `ClassificationConfidence` is derived from the assignment parser/classifier output; higher means stronger taxonomy support.",
-        "- `QueryCoverage`, `TargetCoverage`, `AlignmentLength`, `Mismatches`, and `Gaps` expose the alignment behind each best hit.",
+        "- `SourceClassifierConfidence` is retained only when the source classifier explicitly provides it. It is not inferred from percentage identity and should not be interpreted as a calibrated probability unless the source classifier documents that meaning.",
+        "- `QueryCoverage`, `TargetCoverage`, `AlignmentLength`, `QueryLength`, `TargetLength`, `Mismatches`, and `Gaps` expose the alignment behind each best hit. Identity is calculated only across the aligned region; coverage fields show how much of the query and reference that region spans. `AssignmentEvidenceLevel` and `EvidenceInterpretation` summarise the limitations without converting identity into a probability.",
+        "- `AssignmentEvidenceLevel` is an evidence category, not a probability: `HIGH` requires high identity (>=98%), >=95% query coverage, >=90% reference coverage, and a confident taxonomic consensus; `MODERATE` indicates intermediate alignment or provisional consensus; `LOW` indicates weak coverage/identity or contested taxonomy; `TENTATIVE` is diagnostic-only evidence; `UNRESOLVED` means alignment evidence is insufficient. These are reporting bands, not species-identification cut-offs.",
+        "- `TaxonomySupportPct` must be read with `TaxonomyCandidateCount`: 100% support from one reference is not independent confirmation. `EvidenceInterpretation` states the actual identity, query/reference coverage, search tier, and candidate count.",
         "- `taxonomy/all_databases.tsv` shows assignments across all configured databases in one place.",
         "- `taxonomy/input_warnings.tsv` flags mismatches between reference FASTA IDs and supplied taxonomy tables.",
         "",
@@ -871,7 +898,7 @@ def _write_detailed_output_guide(outdir: Path, rows):
     try:
         guide.write_text('\n'.join(lines))
     except Exception:
-        pass
+        logging.getLogger(__name__).debug('Could not write OUTPUT_GUIDE.md')
 
 
 def _write_output_explanations(outdir: str):
@@ -893,9 +920,12 @@ def _write_output_explanations(outdir: str):
         ('all_databases.tsv', 'Per-sequence taxonomic assignments from every configured reference database.'),
         ('baseline_hits.tsv', 'Nearest-hit report against baseline/provided datasets such as Hungate.'),
         ('nearest_project_hits_raw.tsv', 'Raw nearest-hit table produced for the newest submission; rolling project and baseline comparisons are summarised in novelty_metrics.tsv.'),
-        ('qc_rejections.tsv', 'Per-sequence QC rejection table. Columns: ID, Length, NCount, NPercent, Reasons, MinLength, MaxNPercent. Reasons explain exactly why each sequence was filtered before downstream analysis.'),
+        ('qc_rejections.tsv', 'Per-sequence generic QC decision table. Columns include ID, Length, NCount, NPercent, Reasons, MinLength, MaxNPercent, ManualReviewDecision, and Disposition. Manually approved failed-QC markers are retained and marked INCLUDED_BY_MANUAL_REVIEW; excluded records are marked EXCLUDED.'),
+        ('qc_manual_overrides.tsv', 'Audit table of explicit APPROVE_FAIL_QC decisions passed through the generic QC filter, including sequence length, N content, automatic QC reasons, and whether a manual override was needed or the sequence already passed the generic filter.'),
         ('partner_metadata_warnings.tsv', 'Warnings from --partner-metadata mapping. Rows indicate metadata IDs not found in the project database/current run, baseline IDs supplied as partner metadata, or current-run sequences missing from the metadata table.'),
+        ('expected_taxonomy_validation.tsv', 'Per-sequence comparison of the immutable partner-catalogue taxon with the VSEARCH-derived lineage. Classifier disagreements are reported but do not alter the catalogue taxon or exclude the isolate.'),
         ('marker_qc_provenance.tsv', 'Per-isolate bridge from Paper Trail/Merge Meeting raw reads and marker QC into Performance Review, including source checksums, manual review, and chimera call.'),
+        ('manual_qc_override_warnings.tsv', 'High-severity audit of manually approved isolates that still carry failed automated marker QC or chimera evidence. Confirmed chimera overrides are critical and remain excluded from automated selection.'),
         ('marker_replacement_report.tsv', 'Per-isolate replacement summary comparing prior and incoming QC class, length, read sources, final outcome, and which marker was retained.'),
         ('replaced_markers.fasta', 'Exact incoming marker sequences applied as replacements in this Performance Review run.'),
         ('marker_replacement_history.tsv', 'Append-only record of marker replacement attempts and successful replacements, including outcomes, old/new sequence hashes, QC reasons, and source paths. The project database retains this history across runs.'),
@@ -903,8 +933,8 @@ def _write_output_explanations(outdir: str):
         ('chimera_screen.tsv', 'Reference-UCHIME marker screen. CHIMERA, INDETERMINATE, SKIPPED, or NOT_RUN calls force selection evidence to review.'),
         ('decision_changes.tsv', 'Difference between the two latest stored assessment snapshots, including recommendation, set role, pangenome gap, and tracked evidence changes.'),
         ('run_manifest.json', 'Machine-readable workflow manifest with input/output SHA256 checksums, software/tool versions, stage status, timestamps, warnings, and failure details.'),
-        ('performance_review_dashboard.html', 'Compact linked decision dashboard for the current Performance Review/Hiring Panel.'),
-        ('qc.stats', 'QC summary with total input, kept count, rejection counts, min_len, max_n_percent, and pointer to qc_rejections.tsv when available.'),
+        ('performance_review_dashboard.html', 'Interactive, self-contained dashboard for collection-level interpretation, taxonomy evidence, pangenome coverage, and per-isolate exploration.'),
+        ('qc.stats', 'QC summary with total input, kept count, generic-QC passes, manually retained failed-QC markers, actual exclusions, min_len, max_n_percent, and pointers to the per-sequence QC audit tables.'),
         ('user_id_map.tsv', 'Mapping of runtime sequence IDs to original headers produced when inserting user sequences into the DB. When shortening is disabled these usually match.'),
         ('filing_cabinet_id_map.tsv', 'Mapping of Filing Cabinet runtime IDs back to original FASTA headers. Use this to trace tree labels back to source records.'),
         ('*_id_map.tsv', 'ID map mapping original headers to runtime DB ids. Useful for iTOL and metadata tracing.'),
@@ -916,20 +946,26 @@ def _write_output_explanations(outdir: str):
         ('current_dataset_collapsed.fasta', 'Optional collapsed tree-view FASTA; assessment and database rows still retain every current-dataset isolate ID.'),
         ('filing_cabinet_collapsed.fasta', 'Collapsed Filing Cabinet FASTA; representatives retained for tree building.'),
         ('novelty_matches.tsv', 'vsearch BLAST-like output used to compute nearest-neighbour novelty identities.'),
+        ('novelty_supplementary_reference_summary.tsv', 'Nearest-hit checks against supplementary 16S references such as GG2, SILVA, and NCBI. These confirm marker-sequence recognition only; they do not contribute to genome coverage or the primary novelty score.'),
+        ('novelty_marker_density_coverage_comparison.tsv', 'GTDB-reference and project density counts compared at 95% and 80% query coverage.'),
+        ('novelty_baseline_density_coverage_comparison.tsv', 'Hungate and secondary baseline density counts compared at 95% and 80% query coverage.'),
+        ('vsearch_search_audit.tsv', 'Per-invocation VSEARCH parameters, reference checksum, sequence counts, runtime, version, and raw hit count.'),
         ('novelty_metrics.tsv', (
             'Per-sequence novelty metrics. The leading Nearest*/NoveltyScore columns mirror the '
             'cultured-project comparison when available; explicit Hungate*, SecondaryBaseline*, and '
             'CulturedProject* columns separate baseline-tier evidence, and Project* columns compare against all partner candidates '
             'stored in the DB. Reference* columns compare against the external reference FASTA, usually '
-            'GTDB. GenomeCollection* and Pangenome* columns add rolling genome-coverage context. '
+            'GTDB. GenomeCollection* and Pangenome* columns add rolling genome-coverage context. PartnerTaxon is the immutable partner-catalogue gold standard; classifier disagreement is reported separately. '
             'DensitySource columns name the comparison pool.'
         )),
         ('sequence_assessment.tsv', (
             'Unified per-sequence assessment. '
             'COLUMN GROUPS: '
             '(1) TAXONOMY/CLASSIFICATION — GTDBTaxonomy, GTDBClassificationHit, '
-            'GTDBClassificationIdentity, GTDBClassificationConfidence: authoritative GTDB assignment. '
-            'Repeated as Taxonomy_<DB>, ClassificationHit_<DB>, Identity_<DB>, Confidence_<DB> '
+            'GTDBClassificationIdentity, GTDBQueryCoverage, GTDBTargetCoverage, GTDBAlignmentLength, ' 
+            'GTDBSourceClassifierConfidence, GTDBAssignmentEvidenceLevel, ' 
+            'GTDBAlignmentEvidenceStatus, GTDBEvidenceTier, GTDBEvidenceInterpretation: authoritative GTDB assignment and qualified alignment evidence. '
+            'Repeated as Taxonomy_<DB>, ClassificationHit_<DB>, Identity_<DB>, SourceClassifierConfidence_<DB> '
             'for each additional --alt-ref database. '
             '(2) NOVELTY — NearestHit, NearestIdentity, MatchesGE*, NoveltyScore, Crowding, '
             'SequencingPriority: baseline/cultured novelty when a baseline pool exists. '
@@ -950,11 +986,12 @@ def _write_output_explanations(outdir: str):
             'local-tree figure, and a short rationale. '
             'Use sequence_assessment.tsv for the full audit trail.'
         )),
+        ('pangenome_hierarchy.tsv', 'Rank-stratified pangenome assessment from species through domain using GTDB taxonomy and rank-matched tree/clade concordance. Marker-classifier disagreements are reported but never replace GTDB assignments.'),
         ('sequencing_sets.tsv', (
-            'Rolling clade-level nine-member genome-sequencing diversity panel. Every candidate is '
+            'Rolling GTDB-rank genome-sequencing diversity panel. Every candidate is '
             'placed in a BMEXT baseline-pangenome extension or a BMSET candidate-only group. A baseline '
-            'extension requires exact GTDB species agreement, close marker identity, and adequate query '
-            'coverage. PRIMARY rows '
+            'where classifier and catalogue species agree, baseline-extension evidence also considers marker identity and query coverage. '
+            'Classifier discordance is reported but does not reassign or remove the catalogue-defined group. PRIMARY rows '
             'fill the pangenome target; BACKUP and DIVERSITY_CANDIDATE rows preserve extraction-failure '
             'resilience and additional within-group spread. BASELINE_REDUNDANT rows remain auditable but '
             'are excluded using the reported identity and query-coverage thresholds; '
@@ -995,7 +1032,7 @@ def _write_output_explanations(outdir: str):
             try:
                 fp.unlink()
             except Exception:
-                pass
+                pass  # could not remove old .explain.txt file
             continue
         name = fp.name
         lname = name.lower()
@@ -1045,7 +1082,7 @@ def _write_output_explanations(outdir: str):
             for name, path, expl in rows:
                 ef.write(f"{name}\t{path}\t{expl}\n")
     except Exception:
-        pass
+        logging.getLogger(__name__).debug('Could not write OUTPUT_EXPLANATIONS.tsv')
     _write_detailed_output_guide(p, rows)
 
 
@@ -1056,7 +1093,7 @@ def _replace_path(src: Path, dst: Path):
         if src.resolve() == dst.resolve():
             return str(dst)
     except Exception:
-        pass
+        pass  # could not resolve paths for same-file check
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists():
         if dst.is_dir():
@@ -1092,7 +1129,7 @@ def _unlink_glob(outdir: Path, pattern: str):
             else:
                 src.unlink()
         except Exception:
-            pass
+            pass  # could not remove file during glob cleanup
 
 
 def _organise_run_outputs(outdir: str, *, primary_db_name: str | None = None):
@@ -1103,7 +1140,6 @@ def _organise_run_outputs(outdir: str, *, primary_db_name: str | None = None):
 
     # Remove transient classifier outputs that are represented in final reports.
     for patt in (
-        'matches*.tsv',
         'novelty_matches.tsv',
         'novelty_density_matches.tsv',
         'novelty_*_matches.tsv',
@@ -1124,10 +1160,14 @@ def _organise_run_outputs(outdir: str, *, primary_db_name: str | None = None):
         'novelty_metrics.tsv',
         'selection_summary.tsv',
         'sequencing_sets.tsv',
+        'pangenome_hierarchy.tsv',
         'rumen_functions_draft.tsv',
         'qc.stats',
         'qc_rejections.tsv',
+        'qc_manual_overrides.tsv',
+        'manual_qc_override_warnings.tsv',
         'partner_metadata_warnings.tsv',
+        'expected_taxonomy_validation.tsv',
         'rejected_before_assembly.tsv',
     ):
         _move_if_exists(out, name, 'assessment')
@@ -1151,14 +1191,15 @@ def _organise_run_outputs(outdir: str, *, primary_db_name: str | None = None):
     _move_if_exists(out, 'combined_taxonomy.tsv', 'taxonomy', 'tree_taxonomy.tsv')
     _move_if_exists(out, 'taxonomy_input_warnings.tsv', 'taxonomy', 'input_warnings.tsv')
     _move_if_exists(out, 'taxa_assignments_classout.tsv', 'taxonomy', 'input_assignments.tsv')
+    # Preserve the raw VSEARCH evidence, labelled by database, alongside the
+    # corresponding taxonomy assignment tables instead of deleting it as a temp file.
+    _move_if_exists(out, 'matches.tsv', 'taxonomy')
+    _move_glob(out, 'matches_*.tsv', 'taxonomy')
 
-    def _rename_taxonomy(src: Path):
-        stem = src.stem
-        if stem.startswith('taxonomy_'):
-            stem = stem[len('taxonomy_'):]
-        return f'{stem}.tsv'
-
-    _move_glob(out, 'taxonomy_*.tsv', 'taxonomy', rename=_rename_taxonomy)
+    # Keep the database-qualified filenames intact in the final report folder.
+    _move_glob(out, 'taxonomy_*.tsv', 'taxonomy')
+    _move_glob(out, 'taxonomy_conflicts_*.tsv', 'taxonomy')
+    _move_glob(out, 'classification_supporting_hits_*.tsv', 'taxonomy')
 
     # Tree/MSA deliverables for iTOL upload.
     for name in (
@@ -1215,7 +1256,7 @@ def _organise_run_outputs(outdir: str, *, primary_db_name: str | None = None):
         try:
             shutil.rmtree(baseline_filing_cabinet)
         except Exception:
-            pass
+            pass  # could not remove old baseline_filing_cabinet directory
 
     for name in (
         'qc.fasta',
@@ -1244,6 +1285,134 @@ def _organise_run_outputs(outdir: str, *, primary_db_name: str | None = None):
 
 def _classification_ids_matching_kingdom(classification_tsv: str, kingdom: str):
     return _classification_ids_matching_kingdom_helper(classification_tsv, kingdom)
+
+
+def _validate_partner_taxonomy(classification_tsv: str, partner_metadata_path: str,
+                               kingdom: str, outdir: str, input_fasta: str | None = None):
+    """Retain unclassified partner isolates, but reject explicit taxonomic conflict.
+
+    The partner catalogue's ``taxon`` column is an expected identification, not
+    a replacement for sequence-derived taxonomy. A missing VSEARCH assignment
+    therefore remains unverified rather than being treated as non-bacterial.
+    """
+    metadata_rows = load_partner_sequencing_metadata(partner_metadata_path)
+    metadata_by_id = {}
+    for row in metadata_rows:
+        sid = str(row.get('source_id') or '').strip()
+        if not sid:
+            continue
+        metadata_by_id[sid] = row
+        canonical = canonicalise_sequence_id(sid)
+        if canonical:
+            metadata_by_id.setdefault(canonical, row)
+
+    retained = set()
+    report_rows = []
+    requested_domain = normalise_domain_query(kingdom)
+    results_by_id = {}
+    for result in iter_classification_rows(classification_tsv):
+        result_id = str(result.get('qid') or '')
+        if result_id:
+            results_by_id[result_id] = result
+            canonical_result_id = canonicalise_sequence_id(result_id)
+            if canonical_result_id:
+                results_by_id.setdefault(canonical_result_id, result)
+
+    # VSEARCH/classifier outputs may omit queries with no accepted hit. Those
+    # sequences must still be evaluated: for partner isolate collections, a
+    # missing hit is unclassified evidence, not evidence of a non-bacterial
+    # sequence. Iterate the input FASTA so no-hit queries are retained under
+    # the declared bacterial expectation and explicitly reported.
+    if input_fasta:
+        from branchmanager.utils.fasta import read_fasta
+        query_ids = [str(qid) for qid, _sequence in read_fasta(input_fasta)]
+    else:
+        query_ids = list(dict.fromkeys(
+            str(row.get('qid') or '') for row in results_by_id.values() if row.get('qid')
+        ))
+
+    for qid in query_ids:
+        result = results_by_id.get(qid) or results_by_id.get(canonicalise_sequence_id(qid) or '')
+        result = result or {'qid': qid, 'tax': None}
+        qid = str(qid)
+        metadata = metadata_by_id.get(qid) or metadata_by_id.get(canonicalise_sequence_id(qid) or '')
+        expected_taxon = str((metadata or {}).get('expected_taxon') or '').strip()
+        expected_domain = str((metadata or {}).get('expected_domain') or 'Bacteria').strip() or 'Bacteria'
+        # Defensive normalisation for metadata already persisted in the project
+        # database before generic domain labels were normalised on import.
+        taxon_domain = domain_designation(expected_taxon)
+        if taxon_domain:
+            expected_domain = taxon_domain
+            expected_taxon = ''
+        observed_taxonomy = str(result.get('tax') or '').strip()
+        if observed_taxonomy.lower() in {'', 'na', 'none', 'unresolved'}:
+            status = 'UNCLASSIFIED_EXPECTED_BACTERIAL'
+            detail = 'No usable VSEARCH taxonomy; retained under the partner-isolate bacterial expectation'
+            retain = True
+        else:
+            observed_ranks = parse_taxon_string(observed_taxonomy)
+            explicit_domain = observed_ranks.get('d') or observed_ranks.get('k')
+            explicit_domain_matches = (
+                taxonomy_matches_kingdom(observed_taxonomy, requested_domain)
+                if explicit_domain else None
+            )
+            if explicit_domain and not explicit_domain_matches:
+                status = 'DOMAIN_DISAGREEMENT'
+                detail = (
+                    f'Classifier lineage conflicts with the requested {requested_domain} domain; '
+                    'partner-catalogue identity remains authoritative and the sequence is retained'
+                )
+                retain = True
+            elif expected_taxon:
+                comparison = compare_expected_taxon(expected_taxon, observed_taxonomy)
+                if comparison == 'DISAGREEMENT':
+                    status = 'TAXON_DISAGREEMENT'
+                    detail = (
+                        'Sequence-derived lineage conflicts with the partner-catalogue taxon; '
+                        'the catalogue value is retained as the gold-standard identity'
+                    )
+                    retain = True
+                elif comparison == 'LESS_SPECIFIC':
+                    status = 'COMPATIBLE_LESS_SPECIFIC'
+                    detail = 'Observed lineage is compatible but less specific than the partner-catalogue taxon'
+                    retain = True
+                else:
+                    status = 'CONFIRMED_COMPATIBLE' if explicit_domain_matches else 'TAXON_COMPATIBLE_DOMAIN_UNRESOLVED'
+                    detail = 'Observed lineage is compatible with the partner-catalogue taxon'
+                    retain = True
+            elif explicit_domain_matches:
+                status = 'ASSIGNED_REQUESTED_DOMAIN'
+                detail = 'Observed lineage explicitly belongs to the requested domain; no partner taxon was supplied'
+                retain = True
+            else:
+                status = 'UNRESOLVED_DOMAIN_EXPECTED_BACTERIAL'
+                detail = 'Taxonomy is present but does not provide an explicit conflicting domain; retained for review'
+                retain = True
+        if retain:
+            retained.add(qid)
+        report_rows.append({
+            'sequence_id': qid,
+            'expected_domain': expected_domain,
+            'expected_taxon': expected_taxon or 'NA',
+            'observed_taxonomy': observed_taxonomy or 'NA',
+            'status': status,
+            'retained': 'YES' if retain else 'NO',
+            'detail': detail,
+        })
+
+    report_path = Path(outdir) / 'expected_taxonomy_validation.tsv'
+    with open(report_path, 'w', encoding='utf-8', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=[
+            'sequence_id', 'expected_domain', 'expected_taxon',
+            'observed_taxonomy', 'status', 'retained', 'detail',
+        ], delimiter='\t')
+        writer.writeheader()
+        writer.writerows(report_rows)
+    logging.getLogger(__name__).info(
+        '[PERFORMANCE REVIEW] Expected-versus-observed taxonomy: %d retained, %d rejected; report=%s',
+        len(retained), len(report_rows) - len(retained), report_path,
+    )
+    return retained
 
 
 def _normalise_sequence_domain(value: str | None) -> str | None:
@@ -1482,6 +1651,14 @@ def _store_alt_taxonomy_in_db(db: Database, all_results: dict, main_db_name: str
                 'sequence_id': qid, 'ref_db': db_name, 'best_hit': row[0], 'identity': row[1],
                 'query_coverage': row[4], 'target_coverage': row[5], 'alignment_length': row[6],
                 'query_length': row[7], 'target_length': row[8], 'mismatches': row[9], 'gaps': row[10],
+                'source_classifier_confidence': row[3],
+                'assignment_status': row[11] if len(row) > 11 else None,
+                'taxonomy_support_pct': row[12] if len(row) > 12 else None,
+                'taxonomy_candidate_count': row[16] if len(row) > 16 else None,
+                'evidence_tier': row[15] if len(row) > 15 else None,
+                'alignment_evidence_status': row[17] if len(row) > 17 else None,
+                'assignment_evidence_level': row[18] if len(row) > 18 else None,
+                'evidence_interpretation': row[19] if len(row) > 19 else None,
             })
         db.upsert_classification_evidence(evidence)
 
@@ -1860,7 +2037,7 @@ def _cmd_filing_cabinet_impl(args):
                         if cid:
                             id_map[cid] = short
                     except Exception:
-                        pass
+                        pass  # could not resolve canonical ID for alias entry
         except Exception:
             id_map = {}
 
@@ -1888,7 +2065,7 @@ def _cmd_filing_cabinet_impl(args):
                 except Exception as e:
                     logging.getLogger(__name__).warning("[FILING CABINET] Functional annotations generation failed: %s", e)
         except Exception:
-            pass
+            pass  # functional annotation argument parsing failed
 
         if getattr(args, 'draft_rumen_functions', False):
             try:
@@ -1925,13 +2102,13 @@ def _cmd_filing_cabinet_impl(args):
         except Exception as e:
             logging.getLogger(__name__).warning("[FILING CABINET] Failed to write dataset iTOL colour strip: %s", e)
     except Exception:
-        pass
+        pass  # Filing Cabinet iTOL generation failed
 
     # write brief explanations for files produced by the Filing Cabinet
     try:
         _write_output_explanations(outdir)
     except Exception:
-        pass
+        pass  # could not write output explanations
 
 
 def cmd_filing_cabinet(args):
@@ -2197,12 +2374,24 @@ def _cmd_performance_review_impl(args):
                 'or establish it first with `branchmanager filing-cabinet`.'
             )
 
-    # QC
+    # QC. An explicit APPROVE_FAIL_QC decision must survive this generic
+    # length/N prefilter; otherwise a reviewer-approved short/high-N sequence
+    # would be silently removed before the marker-provenance workflow can use it.
+    manual_approved_ids = set()
+    review_path = getattr(args, 'marker_review', None)
+    if review_path:
+        from branchmanager.marker_provenance import _review_decisions
+        reviewed = _review_decisions(review_path)
+        manual_approved_ids = {
+            sequence_id for sequence_id, review in reviewed.items()
+            if str(review.get('decision') or '').upper() == 'APPROVE_FAIL_QC'
+        }
     qc_out = qc.run_qc(
         args.input,
         outdir,
         min_len=getattr(args, 'min_len', 800),
         max_n_percent=getattr(args, 'max_n_percent', 5.0),
+        manual_approved_ids=manual_approved_ids,
     )
 
     # Preserve every isolate ID, including exact marker-sequence duplicates.
@@ -2272,8 +2461,14 @@ def _cmd_performance_review_impl(args):
                     taxa_tsv=effective_taxa_tsv, threads=threads,
                     db_name=getattr(args, 'ref_name', None) or _classify_derive_db_name(effective_ref),
                 )
-                allowed_qids = _classification_ids_matching_kingdom(early_class_out, kingdom_text)
-                logging.getLogger(__name__).info("[PERFORMANCE REVIEW] Domain filter: %d QC-passing sequences match %s", len(allowed_qids), kingdom)
+                if getattr(args, 'partner_metadata', None):
+                    allowed_qids = _validate_partner_taxonomy(
+                        early_class_out, args.partner_metadata, kingdom_text, outdir,
+                        input_fasta=str(candidate_input),
+                    )
+                else:
+                    allowed_qids = _classification_ids_matching_kingdom(early_class_out, kingdom_text)
+                logging.getLogger(__name__).info("[PERFORMANCE REVIEW] Domain/taxon validation: %d QC-passing sequences retained for %s", len(allowed_qids), kingdom)
             except Exception as e:
                 raise SystemExit(f'[PERFORMANCE REVIEW] Domain classification/filtering failed: {e}')
 
@@ -2317,7 +2512,7 @@ def _cmd_performance_review_impl(args):
                     if canonical_id:
                         orig_to_short[canonical_id] = existing_id
                 except Exception:
-                    pass
+                    pass  # could not canonicalise sequence ID for orig_to_short
                 continue
             try:
                 db.assert_sequence_compatible(existing_id, s)
@@ -2354,6 +2549,8 @@ def _cmd_performance_review_impl(args):
                             review_path=getattr(args, 'marker_review', None),
                             id_map={h: existing_id},
                             accept_unverified=bool(getattr(args, 'accept_unverified_marker_qc', False)),
+                            unverified_override_authorizer=getattr(args, 'unverified_override_authorizer', ''),
+                            unverified_override_reason=getattr(args, 'unverified_override_reason', ''),
                         )
                         provenance_for_replacements[existing_id] = next(
                             (row for row in replacement_provenance if row.get('sequence_id') == existing_id),
@@ -2498,7 +2695,7 @@ def _cmd_performance_review_impl(args):
                     if cid:
                         orig_to_short[cid] = short
                 except Exception:
-                    pass
+                    pass  # could not canonicalise sequence ID for orig_to_short
                 skipped_existing += 1
                 continue
             incoming_files = _incoming_ab1_files(existing_id)
@@ -2510,6 +2707,8 @@ def _cmd_performance_review_impl(args):
                     review_path=getattr(args, 'marker_review', None),
                     id_map={h: existing_id},
                     accept_unverified=bool(getattr(args, 'accept_unverified_marker_qc', False)),
+                    unverified_override_authorizer=getattr(args, 'unverified_override_authorizer', ''),
+                    unverified_override_reason=getattr(args, 'unverified_override_reason', ''),
                 )
                 incoming = next(
                     (row for row in incoming_rows if row.get('sequence_id') == existing_id),
@@ -2568,7 +2767,7 @@ def _cmd_performance_review_impl(args):
                 if cid:
                     orig_to_short[cid] = short
             except Exception:
-                pass
+                pass  # could not canonicalise sequence ID for orig_to_short
             # Still add to mapped_records so it appears in the tree
             mapped_records.append((short, s))
         else:
@@ -2587,7 +2786,7 @@ def _cmd_performance_review_impl(args):
                 if cid:
                     orig_to_short[cid] = short
             except Exception:
-                pass
+                pass  # could not canonicalise sequence ID for orig_to_short
     if skipped_existing:
         logging.getLogger(__name__).info("[DB] Found %d sequences already in DB; keeping them for tree inclusion", skipped_existing)
     _write_marker_replacement_report(
@@ -2655,6 +2854,8 @@ def _cmd_performance_review_impl(args):
             review_path=getattr(args, 'marker_review', None),
             id_map=orig_to_short,
             accept_unverified=bool(getattr(args, 'accept_unverified_marker_qc', False)),
+            unverified_override_authorizer=getattr(args, 'unverified_override_authorizer', ''),
+            unverified_override_reason=getattr(args, 'unverified_override_reason', ''),
         )
         mapped_id_set = {short for short, _sequence in mapped_records}
         marker_provenance = [
@@ -2754,16 +2955,31 @@ def _cmd_performance_review_impl(args):
                 stored = conn.execute('SELECT sequence FROM sequences WHERE id=?', (sequence_id,)).fetchone()
             if stored and str(stored[0] or '').strip():
                 evidence_records.append((sequence_id, str(stored[0])))
-        inserted_evidence = upsert_active_marker_evidence(
-            db, evidence_records, marker_provenance,
-            source_type=source_type, dataset=run_dataset, source_file=str(Path(args.input).resolve()),
-        )
+        # A cohort FASTA may mix source types; a per-row source in the QC sidecar wins.
+        row_source = {
+            row['sequence_id']: str(row.get('marker_source_type') or '').upper()
+            for row in marker_provenance
+        }
+        evidence_groups: dict[str, list] = {}
+        for record in evidence_records:
+            evidence_groups.setdefault(row_source.get(record[0]) or source_type, []).append(record)
+        inserted_evidence = []
+        for group_source, group_records in evidence_groups.items():
+            inserted_evidence.extend(upsert_active_marker_evidence(
+                db, group_records, marker_provenance,
+                source_type=group_source, dataset=run_dataset, source_file=str(Path(args.input).resolve()),
+            ) or [])
         logging.getLogger(__name__).info(
             '[PERFORMANCE REVIEW] Registered %d marker evidence record(s) in the v1 evidence registry',
             len(inserted_evidence),
         )
     except Exception as exc:
         raise SystemExit(f'[PERFORMANCE REVIEW] Reference-based chimera screening failed: {exc}')
+
+    # Resolve alternate references once for every control-flow path. Novelty
+    # metrics consume this list even when classification is skipped because
+    # no sequences survived QC/domain filtering or assignments were supplied.
+    alt_databases = _build_alt_databases(args)
 
     # classify (or use external taxa assignments if provided)
     class_out = None
@@ -2779,7 +2995,7 @@ def _cmd_performance_review_impl(args):
         with open(class_out, 'w') as handle:
             handle.write('\t'.join(classify._classification_header(run_main_db_name)) + '\n')
         empty_databases = {run_main_db_name: {}}
-        for ref, _taxa, name in _build_alt_databases(args):
+        for _ref, _taxa, name in alt_databases:
             empty_databases.setdefault(name, {})
         primary_name = getattr(args, 'ref_name', None) or _classify_derive_db_name(effective_ref)
         empty_databases.setdefault(primary_name, {})
@@ -2833,7 +3049,6 @@ def _cmd_performance_review_impl(args):
         # Only run classification here if we did not already run an early
         # pre-insert classification for kingdom filtering and the user did
         # not supply taxa_assignments.
-        alt_databases = _build_alt_databases(args)
         ref_name = getattr(args, 'ref_name', None) or _classify_derive_db_name(effective_ref)
         run_main_db_name = getattr(args, 'main_ref', None) or ref_name
 
@@ -2847,6 +3062,11 @@ def _cmd_performance_review_impl(args):
                 "[PERFORMANCE REVIEW] Multi-database classification: primary=%s, alt=%s, main=%s",
                 ref_name, [n for _, _, n in alt_databases], run_main_db_name,
             )
+            logging.getLogger(__name__).info(
+                '[PERFORMANCE REVIEW][DIAG] CLASSIFICATION_ORCHESTRATOR_START input=%s primary=%s authoritative=%s alternatives=%s threads=%s',
+                current_dataset_fasta, ref_name, run_main_db_name,
+                [name for _ref, _taxa, name in alt_databases], threads,
+            )
             class_out, all_class_results = classify.run_all_classifications(
                 str(current_dataset_fasta), outdir,
                 primary_ref=effective_ref,
@@ -2856,7 +3076,13 @@ def _cmd_performance_review_impl(args):
                 threads=threads,
                 main_db=run_main_db_name,
             )
+            logging.getLogger(__name__).info(
+                '[PERFORMANCE REVIEW][DIAG] CLASSIFICATION_ORCHESTRATOR_COMPLETE primary_output=%s databases=%s result_sizes=%s',
+                class_out, list(all_class_results), {name: len(rows) for name, rows in all_class_results.items()},
+            )
+            logging.getLogger(__name__).info('[PERFORMANCE REVIEW][DIAG] ALT_TAXONOMY_DB_STORE_START')
             _store_alt_taxonomy_in_db(db, all_class_results, run_main_db_name)
+            logging.getLogger(__name__).info('[PERFORMANCE REVIEW][DIAG] ALT_TAXONOMY_DB_STORE_COMPLETE')
         elif early_class_out:
             class_out = early_class_out
         else:
@@ -2871,14 +3097,18 @@ def _cmd_performance_review_impl(args):
         and 'gtdb' not in str(run_main_db_name).lower()
     ):
         raise SystemExit(
-            '[PERFORMANCE REVIEW] bacterial/archaeal assessment requires GTDB as the authoritative database. '
+            '[PERFORMANCE REVIEW] bacterial/archaeal marker classification requires GTDB as the primary sequence-reference database. '
             'Name the GTDB reference with --ref-name GTDB or select it with --main-ref GTDB. '
-            'Other databases remain available through --alt-ref for reporting only.'
+            'Other databases remain available through --alt-ref for comparative reporting; partner-catalogue taxon controls pathway routing only, while GTDB/reference taxonomy controls pangenome grouping.'
         )
 
-    # Persist authoritative taxonomy before rolling novelty/genome coverage so
-    # current-run candidates can be counted by GTDB species immediately.
+    # Persist primary classifier evidence before rolling novelty/genome coverage.
+    # Partner-catalogue taxonomy is separately retained as the isolate identity standard.
     try:
+        logging.getLogger(__name__).info(
+            '[PERFORMANCE REVIEW][DIAG] AUTHORITATIVE_CLASSIFICATION_IMPORT_START path=%s database=%s',
+            class_out, run_main_db_name,
+        )
         tax_entries, dist_entries = load_classification_results_for_dataset(
             class_out or '',
             orig_to_short,
@@ -2887,6 +3117,10 @@ def _cmd_performance_review_impl(args):
         )
     except Exception as e:
         raise SystemExit(f'[PERFORMANCE REVIEW] Authoritative classification output could not be parsed: {e}')
+    logging.getLogger(__name__).info(
+        '[PERFORMANCE REVIEW][DIAG] AUTHORITATIVE_CLASSIFICATION_IMPORT_COMPLETE taxonomy_rows=%d distance_rows=%d',
+        len(tax_entries), len(dist_entries),
+    )
     if tax_entries:
         db.insert_taxonomy(tax_entries)
         logging.getLogger(__name__).info("[DB] Inserted/updated taxonomy for %d ids", len(tax_entries))
@@ -2905,7 +3139,14 @@ def _cmd_performance_review_impl(args):
             'query_coverage': row.get('query_coverage'), 'target_coverage': row.get('target_coverage'),
             'alignment_length': row.get('alignment_length'), 'query_length': row.get('query_length'),
             'target_length': row.get('target_length'), 'mismatches': row.get('mismatches'),
-            'gaps': row.get('gaps'),
+            'gaps': row.get('gaps'), 'source_classifier_confidence': row.get('confidence'),
+            'assignment_status': row.get('assignment_status'),
+            'taxonomy_support_pct': row.get('taxonomy_support_pct'),
+            'taxonomy_candidate_count': row.get('taxonomy_candidate_count'),
+            'evidence_tier': row.get('evidence_tier'),
+            'alignment_evidence_status': row.get('alignment_evidence_status'),
+            'assignment_evidence_level': row.get('assignment_evidence_level'),
+            'evidence_interpretation': row.get('evidence_interpretation'),
         })
     db.upsert_classification_evidence(classification_evidence)
 
@@ -2933,9 +3174,10 @@ def _cmd_performance_review_impl(args):
     # candidate and baseline in the database as rolling comparison context.
     metrics_query_fasta = str(current_dataset_fasta)
 
-    # novelty
+    # Novelty metrics establish the authoritative project nearest-hit evidence.
+    # Legacy novelty.tsv/novelty_matches.tsv are derived from that evidence below,
+    # avoiding a second, differently configured search against another project pool.
     target_fasta = getattr(args, 'target', None)
-    novelty_out = novelty.run_novelty(str(current_dataset_fasta), effective_ref, outdir, db=db, run_dataset=run_dataset, threads=threads, target_fasta=target_fasta)
     try:
         novelty_metrics_out = novelty.build_reference_novelty_metrics(
             metrics_query_fasta,
@@ -2946,11 +3188,17 @@ def _cmd_performance_review_impl(args):
             run_dataset=run_dataset,
             target_fasta=target_fasta,
             baseline_datasets=novelty_baseline_datasets,
+            supplementary_references=alt_databases,
             pangenome_target=getattr(
                 args, 'pangenome_target', _selection_sets.DEFAULT_PANGENOME_TARGET,
             ),
         )
         logging.getLogger(__name__).info("[NOVELTY] Wrote novelty metrics to %s", novelty_metrics_out)
+        novelty_out = novelty.run_novelty(
+            str(current_dataset_fasta), effective_ref, outdir,
+            db=db, run_dataset=run_dataset, threads=threads,
+            target_fasta=target_fasta,
+        )
     except Exception as e:
         raise SystemExit(f'[PERFORMANCE REVIEW] Required novelty metrics failed: {e}')
 
@@ -3055,8 +3303,8 @@ def _cmd_performance_review_impl(args):
                                                 phylum_ids.add(qid)
                                             break
                                 except Exception:
-                                    pass
-                
+                                    pass  # could not parse taxonomy for phylum filter
+
                 # Filter tree_fasta to only include sequences in phylum_ids
                 if phylum_ids:
                     filtered_fasta = Path(outdir) / f'tree_sequences_phylum_{phylum_filter}.fasta'
@@ -3068,7 +3316,7 @@ def _cmd_performance_review_impl(args):
                             if h in phylum_ids:
                                 filtered_records.append((h, s))
                     except Exception:
-                        pass
+                        pass  # could not read tree FASTA for phylum filtering
 
                     if filtered_records:
                         write_fasta(filtered_records, str(filtered_fasta))
@@ -3138,7 +3386,7 @@ def _cmd_performance_review_impl(args):
                 if cand is not None:
                     previous_review_ids = read_combined_taxonomy_ids(cand)
             except Exception:
-                previous_review_ids = None
+                pass  # could not read previous review combined taxonomy
 
         base_rows = collect_db_taxonomy_rows(db, previous_review_ids if previous_review_ids else None)
         merged_rows = merge_combined_taxonomy_rows(base_rows, class_out or '', orig_to_short, db)
@@ -3147,7 +3395,7 @@ def _cmd_performance_review_impl(args):
             order.append(rid)
     except Exception:
         # fallback: leave merged empty and continue
-        pass
+        pass  # could not build combined taxonomy from DB and classification
 
     # write merged combined taxonomy preserving order (DB-order first, then new)
     try:
@@ -3198,7 +3446,7 @@ def _cmd_performance_review_impl(args):
             except Exception as e:
                 logging.getLogger(__name__).warning("[ITOL] Functional annotations generation failed: %s", e)
     except Exception:
-        pass
+        pass  # functional annotation argument parsing failed
     # Draft rumen functional groups (auto-generated from output taxonomy)
     if getattr(args, 'draft_rumen_functions', False):
         try:
@@ -3330,10 +3578,14 @@ def _cmd_performance_review_impl(args):
                 # Collect alt-db taxonomy from DB for the run sequences
                 alt_ref_dbs: list = []
                 alt_taxonomies: dict = {}
+                alt_classification_evidence: dict = {}
                 try:
                     alt_ref_dbs = db.get_alt_ref_dbs()
                     if alt_ref_dbs:
                         alt_taxonomies = db.get_taxonomy_alt_for_ids(run_ids_for_assessment)
+                        all_classification_evidence = db.get_classification_evidence(run_ids_for_assessment)
+                        for (sequence_id, ref_db), evidence_row in all_classification_evidence.items():
+                            alt_classification_evidence.setdefault(sequence_id, {})[ref_db] = evidence_row
                         logging.getLogger(__name__).info(
                             "[PERFORMANCE REVIEW] Found alt-db taxonomy for ref_dbs: %s", alt_ref_dbs
                         )
@@ -3352,6 +3604,7 @@ def _cmd_performance_review_impl(args):
                     tree_ids=_tree_ids,
                     alt_taxonomies=alt_taxonomies,
                     alt_ref_dbs=alt_ref_dbs,
+                    alt_classification_evidence=alt_classification_evidence,
                 )
                 from branchmanager.marker_provenance import marker_qc_flag
                 project_provenance = db.get_sequence_provenance(run_ids_for_assessment)
@@ -3406,6 +3659,68 @@ def _cmd_performance_review_impl(args):
                         if chimera_flag not in flags:
                             flags.append(chimera_flag)
                         assessment_row['placement_flags'] = ';'.join(flags)
+
+                    # Explicitly surface manual approvals that coexist with
+                    # severe automated failures. Approval is an auditable
+                    # human decision, not evidence that a chimera/QC failure
+                    # has been biologically resolved.
+                    review_status = str(assessment_row.get('marker_manual_review_status') or '').upper()
+                    qc_class = str(assessment_row.get('marker_qc_class') or '').upper()
+                    qc_recommendation = str(assessment_row.get('marker_qc_recommendation') or '').upper()
+                    chimera_call = str(assessment_row.get('chimera_call') or 'NOT_RUN').upper()
+                    severe_reasons = []
+                    if chimera_call in {'CHIMERA', 'CHIMERA_CONFIRMED'}:
+                        severe_reasons.append('CHIMERA_DETECTED')
+                    elif chimera_call == 'INDETERMINATE':
+                        severe_reasons.append('CHIMERA_CHECK_INDETERMINATE')
+                    if qc_class == 'FAIL_QC' or qc_recommendation in {'RESEQUENCE', 'FAIL_QC'}:
+                        severe_reasons.append('MARKER_QC_FAIL_OR_RESEQUENCE')
+                    if review_status == 'APPROVED' and severe_reasons:
+                        assessment_row['manual_approval_warning'] = ';'.join(severe_reasons)
+                        flags = [
+                            flag for flag in str(assessment_row.get('placement_flags') or '').split(';')
+                            if flag
+                        ]
+                        if 'MANUAL_APPROVAL_SEVERE_QC_OVERRIDE' not in flags:
+                            flags.append('MANUAL_APPROVAL_SEVERE_QC_OVERRIDE')
+                        assessment_row['placement_flags'] = ';'.join(flags)
+
+                manual_override_warnings = [
+                    {
+                        'SequenceID': row.get('id', ''),
+                        'PartnerID': row.get('partner_id', ''),
+                        'ManualReviewStatus': row.get('marker_manual_review_status', ''),
+                        'ManualReviewDecision': row.get('marker_review_decision', ''),
+                        'MarkerQCClass': row.get('marker_qc_class', ''),
+                        'MarkerQCRecommendation': row.get('marker_qc_recommendation', ''),
+                        'ChimeraCall': row.get('chimera_call', ''),
+                        'ChimeraScore': row.get('chimera_score', ''),
+                        'WarningSeverity': (
+                            'CRITICAL' if 'CHIMERA_DETECTED' in str(row.get('manual_approval_warning') or '')
+                            else 'HIGH'
+                        ),
+                        'Warning': row.get('manual_approval_warning', ''),
+                        'Reviewer': row.get('marker_review_reviewer', ''),
+                        'ReviewNotes': row.get('marker_review_notes', ''),
+                    }
+                    for row in assessment_rows if row.get('manual_approval_warning')
+                ]
+                if manual_override_warnings:
+                    import csv as _csv
+                    warning_path = Path(outdir) / 'manual_qc_override_warnings.tsv'
+                    with warning_path.open('w', newline='', encoding='utf-8') as warning_handle:
+                        writer = _csv.DictWriter(
+                            warning_handle,
+                            fieldnames=list(manual_override_warnings[0]),
+                            delimiter='\t', lineterminator='\n',
+                        )
+                        writer.writeheader()
+                        writer.writerows(manual_override_warnings)
+                    logging.getLogger(__name__).warning(
+                        '[MARKER QC] %d manually approved isolate(s) retain severe automated QC/chimera failures; see %s',
+                        len(manual_override_warnings), warning_path,
+                    )
+
                 mwl_path = getattr(args, 'mwl', None)
                 mwl_entries = []
                 if mwl_path:
@@ -3493,8 +3808,8 @@ def _cmd_performance_review_impl(args):
                 except Exception as _ne:
                     raise RuntimeError(f'Local-clade figure generation failed: {_ne}') from _ne
 
-                # Propose rolling primary + backup isolates within each GTDB
-                # species or, where species is unresolved, each local tree clade.
+                # Propose rolling primary + backup isolates within the most-specific
+                # GTDB rank available, partitioned by local tree clade.
                 try:
                     sequencing_sets_path = _selection_sets.build_sequencing_sets(
                         assessment_rows,
@@ -3523,6 +3838,19 @@ def _cmd_performance_review_impl(args):
                             args, 'baseline_extension_min_query_coverage',
                             _selection_sets.DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE,
                         ),
+                    )
+                    hierarchy_path = _selection_sets.write_pangenome_hierarchy_tsv(
+                        assessment_rows,
+                        Path(outdir) / 'pangenome_hierarchy.tsv',
+                        tree_path=_tree_nwk if Path(_tree_nwk).exists() else None,
+                        db=db,
+                        pangenome_target=getattr(
+                            args, 'pangenome_target', _selection_sets.DEFAULT_PANGENOME_TARGET,
+                        ),
+                    )
+                    logging.getLogger(__name__).info(
+                        "[PANGENOME] Wrote rank-stratified catalogue-based analysis to %s",
+                        hierarchy_path,
                     )
                     logging.getLogger(__name__).info(
                         "[SELECTION SETS] Wrote rolling clade candidate sets to %s",
@@ -3711,7 +4039,7 @@ def _cmd_performance_review_impl(args):
                         sum(d == 'ALREADY SEQUENCED' for d in decisions),
                     )
                 except Exception:
-                    pass
+                    pass  # could not compute assessment summary counts
             except Exception as e:
                 raise RuntimeError(f'Required sequence assessment failed: {e}') from e
     except Exception as e:
@@ -3728,7 +4056,7 @@ def _cmd_performance_review_impl(args):
     try:
         _write_output_explanations(outdir)
     except Exception:
-        pass
+        pass  # could not write output explanations
 
 
 def cmd_performance_review(args):
@@ -3792,6 +4120,7 @@ def cmd_performance_review(args):
                 'full_assessment': outdir / 'assessment' / 'sequence_assessment.tsv',
                 'board_summary': outdir / 'assessment' / 'selection_summary.tsv',
                 'sequencing_sets': outdir / 'assessment' / 'sequencing_sets.tsv',
+                'pangenome_hierarchy': outdir / 'assessment' / 'pangenome_hierarchy.tsv',
                 'novelty_metrics': outdir / 'assessment' / 'novelty_metrics.tsv',
                 'tree': outdir / 'tree' / 'current_tree.nwk',
                 'alignment': outdir / 'tree' / 'current_alignment.fasta',
@@ -3803,16 +4132,39 @@ def cmd_performance_review(args):
                     required['taxonomy'] = taxonomy_candidates[0]
             for role, path in required.items():
                 manifest.add_output(path, role=role)
+            # Optional per-sequence QC audit outputs are useful even when no
+            # manual override was necessary; include whichever were produced.
+            for role, name in (
+                ('qc_summary', 'qc.stats'),
+                ('qc_rejections', 'qc_rejections.tsv'),
+                ('qc_manual_overrides', 'qc_manual_overrides.tsv'),
+                ('expected_taxonomy_validation', 'expected_taxonomy_validation.tsv'),
+            ):
+                path = outdir / 'assessment' / name
+                if path.is_file():
+                    manifest.add_output(path, role=role)
             missing = manifest.verify_required_outputs()
             if missing:
                 raise RuntimeError('required Performance Review outputs are missing: ' + ', '.join(missing))
 
-            from branchmanager.reporting import write_decision_changes, write_performance_review_dashboard
+            from branchmanager.reporting import (
+                write_decision_changes, write_genome_collection_assessment,
+                write_performance_review_dashboard,
+            )
             staged = Database(str(staged_db))
             changes = write_decision_changes(staged, outdir / 'assessment' / 'decision_changes.tsv')
             manifest.add_output(changes, role='decision_changes')
+            genome_assessment = write_genome_collection_assessment(
+                staged, outdir / 'assessment' / 'genome_collection_assessment.tsv',
+            )
+            manifest.add_output(genome_assessment, role='genome_collection_assessment')
             dashboard = write_performance_review_dashboard(
                 outdir / 'assessment' / 'selection_summary.tsv', outdir,
+                sequence_assessment=outdir / 'assessment' / 'sequence_assessment.tsv',
+                pangenome_hierarchy=outdir / 'assessment' / 'pangenome_hierarchy.tsv',
+                novelty_metrics=outdir / 'assessment' / 'novelty_metrics.tsv',
+                run_manifest=outdir / 'run_manifest.json',
+                genome_assessment=genome_assessment,
             )
             manifest.add_output(dashboard, role='performance_review_dashboard')
             manifest.add_stage('performance_review', 'COMPLETE')
@@ -4003,7 +4355,7 @@ def cmd_org_chart(args):
             except Exception as e:
                 log.warning("[ORG-CHART] Functional annotations generation failed: %s", e)
     except Exception:
-        pass
+        pass  # functional annotation argument parsing failed
     # Draft rumen functional groups
     if getattr(args, 'draft_rumen_functions', False):
         try:
@@ -4204,14 +4556,14 @@ def cmd_label_maker(args):
                             # file exists but only header or empty -> ignore
                             continue
                     except Exception:
-                        continue
+                        continue  # could not count lines in candidate taxonomy file
                 previous_review_ids = None
                 if previous_review_file is not None:
                     previous_review_ids = read_combined_taxonomy_ids(previous_review_file)
                 else:
                     previous_review_ids = None
             except Exception:
-                previous_review_ids = None
+                pass  # could not discover previous review taxonomy file
 
             previous_review_id_list = previous_review_ids if isinstance(previous_review_ids, list) else []
 
@@ -4266,7 +4618,7 @@ def cmd_label_maker(args):
             except Exception as e:
                 log.warning("[LABEL-MAKER] Functional annotations generation failed: %s", e)
     except Exception:
-        pass
+        pass  # functional annotation argument parsing failed
     # Draft rumen functional groups
     if getattr(args, 'draft_rumen_functions', False):
         try:
@@ -4292,1159 +4644,11 @@ def cmd_label_maker(args):
     try:
         _write_output_explanations(outdir)
     except Exception:
-        pass
+        pass  # could not write output explanations
 
 
-def build_parser():
-    _Fmt = type('_Fmt', (
-        argparse.ArgumentDefaultsHelpFormatter,
-        argparse.RawDescriptionHelpFormatter,
-    ), {'max_help_position': 40, 'width': 120})
-    paper_trail_policy = _paper_trail_module.DEFAULT_QC_POLICY
-    selection_target = _selection_sets.DEFAULT_PANGENOME_TARGET
-    selection_panel_size = _selection_sets.DEFAULT_CANDIDATE_SET_SIZE
-    baseline_redundancy_identity = _selection_sets.DEFAULT_BASELINE_REDUNDANCY_IDENTITY
-    baseline_redundancy_coverage = _selection_sets.DEFAULT_BASELINE_REDUNDANCY_QUERY_COVERAGE
-    baseline_extension_identity = _selection_sets.DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY
-    baseline_extension_coverage = _selection_sets.DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE
-    parser = argparse.ArgumentParser(
-        prog='branchmanager',
-        description=(
-            'BranchManager — marker-gene QC, taxonomy, novelty scoring, and isolate prioritisation toolkit.\n\n'
-            'Subcommands:\n'
-            '  mailroom           Inventory AB1 deliveries and build a batch map.\n'
-            '  interview          Run standalone AB1 QC from a Mailroom batch.\n'
-            '  background-check   Pre-classify reference collections once and reuse the evidence.\n'
-            '  genomic-16s-selection Extract genome-identifiable 16S representatives with Barrnap + VSEARCH + optional GTDB-Tk comparison.\n'
-            '  filing-cabinet     Register the cultured baseline and backbone tree.\n'
-            '  onboarding         Validate a partner submission before project state changes.\n'
-            '  paper-trail        Interpret chromatograms and assemble primer reads.\n'
-            '  sanger-studio      Inspect and assemble Sanger reads in a local browser GUI.\n'
-            '  performance-review Assess taxonomy, novelty, phylogeny, and sequencing candidates.\n'
-            '  status-meeting     Import factual isolate lifecycle changes.\n'
-            '  records-update     Import completed-genome, QC, GTDB, and ANI evidence.\n'
-            '  add-maldi-identifications Register partner isolates with MALDI-TOF taxonomy and no marker.\n'
-            '  import-partner-workbook Import partner metadata and MALDI status from an .xlsm workbook.\n'
-            '  quarterly-review   Nominate a later genome tranche from the complete project.\n'
-            '  exit-interview     Remove isolates from active project state with a retained audit.\n'
-            '  annual-report      Produce the cumulative end-of-project report.\n'
-            '  it-desk            Check dependencies and project inputs before production.\n'
-            '  assistant          Run the complete raw-trace-to-Hiring-Panel workflow.\n'
-            '  org-chart          Extract a focused tree and iTOL files for a specific taxon.\n'
-            '  label-maker        Regenerate iTOL annotation files from stored taxonomy.\n\n'
-            'Typical workflow:\n'
-            '  P. branchmanager mailroom --read-dir All_AB1 --manifest manifest.csv --dataset QUB_01 --forward-primer 63F -o QUB_01\n'
-            '  Q. branchmanager interview --mailroom QUB_01 -o QUB_01_interview\n'
-            '  0. branchmanager background-check --dataset hungate16s=hungate.fasta --ref gtdb.fna --taxa gtdb_tax.tsv -o background_check_out\n'
-            '  1. branchmanager filing-cabinet --fasta baseline.fasta --db project.db --dataset Hungate --taxa-assignments background_check_out/pipeline_taxonomy.tsv --build-tree -o filing_cabinet_out\n'
-            '  2. branchmanager performance-review --input new_seqs.fasta --partner-metadata new_seqs_metadata.tsv --db project.db --dataset Batch1 --ref gtdb.fna --mwl MWL.xlsx -o review_out\n'
-            '  3. branchmanager quarterly-review --db project.db --genome-budget 24 --tree review_out/tree/current_tree.nwk -o quarterly_review_01\n'
-            '  4. branchmanager org-chart --db project.db --taxon archaea --from-dir filing_cabinet_out -o archaea_out\n'
-            '  5. branchmanager genomic-16s-selection --genome-dir assemblies --reference gtdb_r232_bac_arch_ssu_reps.fna.gz --gtdb-summary gtdbtk.bac120.summary.tsv -o genomic_16s\n'
-
-        ),
-        formatter_class=_Fmt,
-    )
-    parser.add_argument('--config', help='Project profile JSON. Profile values provide defaults; command-line options override them.')
-    sub = parser.add_subparsers(dest='command')
-
-    def add_project_config_option(command_parser):
-        command_parser.add_argument('--config', help='Project profile JSON. Profile values provide defaults; command-line options override them.')
-
-    filing_cabinet_parser = sub.add_parser(
-        'filing-cabinet',
-        help='Filing Cabinet: register a cultured baseline and build the reference tree.',
-        description=(
-            'Filing Cabinet registers a baseline FASTA dataset (e.g. Hungate 16S) in the DB, optionally classifies\n'
-            'sequences against a reference (GTDB/SILVA), collapse near-identical sequences,\n'
-            'and build the backbone phylogenetic tree.\n\n'
-            'This is always the first step. All subsequent Performance Reviews measure novelty against\n'
-            'sequences stored by this command.'
-        ),
-        formatter_class=_Fmt,
-    )
-    add_project_config_option(filing_cabinet_parser)
-    filing_cabinet_parser.add_argument('--fasta', required=False,
-        help='Input FASTA file containing the baseline sequences to load.')
-    filing_cabinet_parser.add_argument('--db', required=True,
-        help='Path to the BranchManager SQLite database (created if it does not exist).')
-    filing_cabinet_parser.add_argument('-o', '--out', required=False, default='.',
-        help='Output directory for tree, iTOL files, and reports (default: current directory).')
-    filing_cabinet_parser.add_argument('--dataset', required=False,
-        help='Label for this dataset stored in the DB (e.g. Hungate). Used to colour iTOL strips.')
-    filing_cabinet_parser.add_argument('--baseline-tier', choices=['priority', 'secondary'], default=None,
-        help='Cultured baseline tier for this dataset: priority for Hungate, secondary for other project baseline genomes. Inferred from --dataset when omitted.')
-    filing_cabinet_parser.add_argument('--shorten-ids', dest='shorten_ids',
-        action=argparse.BooleanOptionalAction, default=False,
-        help='Replace input headers with compact IDs (e.g. HUN001). Default is to preserve the IDs exactly as supplied.')
-    filing_cabinet_parser.add_argument('--classify', action='store_true',
-        help='Classify sequences against --ref and store taxonomy in the DB. Requires --ref.')
-    filing_cabinet_parser.add_argument('--build-tree', action='store_true',
-        help='Build the backbone MAFFT + FastTree phylogenetic tree after loading.')
-    filing_cabinet_parser.add_argument('--ref', required=False,
-        help='Reference FASTA (GTDB/SILVA reps) for classification and tree orientation. Preferred over --taxa-assignments for externally classified inputs.')
-    filing_cabinet_parser.add_argument('--taxa', required=False,
-        help='Taxonomy table matching IDs in --ref (TSV/CSV, optionally .gz: id<TAB>lineage or id,lineage). Optional when --ref FASTA headers already contain lineages.')
-    filing_cabinet_parser.add_argument('--ref-name', dest='ref_name', required=False, default=None,
-        help='Display name for the primary reference database (default: derived from --ref filename). Used to label taxonomy columns.')
-    filing_cabinet_parser.add_argument('--alt-ref', dest='alt_ref', action='append', default=None, metavar='FASTA',
-        help='Additional reference FASTA to classify against (repeatable). Produces extra taxonomy columns in output files.')
-    filing_cabinet_parser.add_argument('--alt-taxa', dest='alt_taxa', action='append', default=None, metavar='TABLE',
-        help='Taxonomy TSV/CSV for the corresponding --alt-ref (positionally paired; repeatable; .gz accepted).')
-    filing_cabinet_parser.add_argument('--alt-ref-name', dest='alt_ref_name', action='append', default=None, metavar='NAME',
-        help='Display name for the corresponding --alt-ref (positionally paired; repeatable). Default: derived from filename.')
-    filing_cabinet_parser.add_argument('--main-ref', dest='main_ref', required=False, default=None,
-        help='Name of the reference database to use as the primary taxonomy source (default: primary --ref). Must match one of the --ref-name / --alt-ref-name values.')
-    filing_cabinet_parser.add_argument('--taxa-assignments',
-        dest='taxa_assignments', required=False,
-        help='Pre-computed taxonomy assignments for the INPUT sequences (TSV/CSV, optionally .gz: query_id + lineage, or a FASTA with embedded lineages). Use this instead of --classify when you already have taxonomy.')
-    filing_cabinet_parser.add_argument('--collapse', action='store_true',
-        help='Collapse sequences that share ≥ --collapse-threshold identity AND the same taxonomy into a single representative for the tree. Saves time and reduces visual clutter.')
-    filing_cabinet_parser.add_argument('--collapse-threshold', type=float, default=99.8,
-        help='Identity threshold (percent) for collapsing duplicate-like sequences (default: 99.8).')
-    filing_cabinet_parser.add_argument('--sequence-domain', '--organism-domain', dest='sequence_domain',
-        choices=SEQUENCE_DOMAIN_CHOICES, default=None,
-        help=(
-            'Sequence/domain profile for this Filing Cabinet. Default behaviour is bacteria. '
-            'Use archaea for archaeal 16S, fungi for fungal/eukaryotic runs with suitable refs/anchors, '
-            'or mixed/all/none to disable domain filtering.'
-        ))
-    filing_cabinet_parser.add_argument('--anchors', required=False, default=None,
-        help='Custom reference anchor FASTA for tree topology scaffolding. By default uses the bundled 26-sequence rumen/gut anchor set (src/branchmanager/data/rumen-gut_reference_anchors.fasta).')
-    filing_cabinet_parser.add_argument('--threads', type=int, required=False, default=4,
-        help='Number of CPU threads for MAFFT and VSEARCH (default: 4).')
-    filing_cabinet_parser.add_argument('--tree-method', dest='tree_method',
-        choices=['fasttree', 'iqtree', 'iqtree-fast'], default='fasttree',
-        help=(
-            'Phylogenetic tree-building backend (default: fasttree). '
-            'fasttree: approximate ML, GTR+CAT — fast. '
-            'iqtree: full ML, GTR+G+I — more accurate and stable topology (slower; '
-            'recommended for publication-quality trees or when FastTree produces unstable clades). '
-            'iqtree-fast: IQ-TREE 2 with -fast flag — good compromise for exploratory runs. '
-            'Requires iqtree2 in PATH when using iqtree/iqtree-fast.'
-        ),
-    )
-    filing_cabinet_parser.add_argument('--colours', required=False,
-        help='CSV file mapping sequence IDs to custom hex colours for iTOL (columns: id, colour).')
-    filing_cabinet_parser.add_argument(
-        '--group-phyla', dest='group_phyla', action='append', default=None, metavar='SPEC',
-        help=(
-            'Collapse multiple phyla into a single colour in iTOL legends. Repeatable. '
-            'Formats: "archaea" (all archaeal phyla), "bacteria" (all bacterial phyla), '
-            '"Bacillota,Bacillota_I" (explicit list; label = first name), '
-            '"Firmicutes:Bacillota,Bacillota_I" (named group).'
-        ),
-    )
-    filing_cabinet_parser.add_argument('--functional', dest='functional', required=False, default=None,
-        help=(
-            'TSV file mapping sequence IDs to functional attributes (pathways, functions, '
-            'traits, scores, etc.). Header row required; first column = sequence ID; '
-            'subsequent columns = one functional attribute each. '
-            'One iTOL file is generated per column: binary (0/1/yes/no) → DATASET_BINARY, '
-            'numeric → DATASET_SIMPLEBAR, categorical → DATASET_COLORSTRIP.'
-        ),
-    )
-    filing_cabinet_parser.add_argument('--draft-rumen-functions', dest='draft_rumen_functions',
-        action='store_true', default=False,
-        help=(
-            'Auto-generate a draft rumen functional-group annotation from the output taxonomy. '
-            'Maps each sequence to a broad ruminant microbiome functional category '
-            '(e.g. Cellulolytic/Fibrolytic, Methanogenic Archaea, Butyrate Producers) '
-            'and writes rumen_functions_draft.tsv + itol_func_Rumen_Functional_Group.itol. '
-            'The draft TSV can be edited and re-supplied via --functional in future runs.'
-        ),
-    )
-
-    performance_review_parser = sub.add_parser(
-        'performance-review',
-        help='Performance Review: assess taxonomy, novelty, phylogeny, and sequencing candidates.',
-        description=(
-            'Assess new partner 16S isolate sequences against the project baseline.\n\n'
-            'The workflow classifies against GTDB (primary), optionally cross-checks NCBI/GG2/SILVA\n'
-            'as --alt-ref databases, scores novelty against separate cultured-baseline and rolling partner\n'
-            'collections, updates the tree, and optionally matches GTDB taxonomy against\n'
-            'the Most Wanted List via --mwl.\n\n'
-            'Provide --baseline-fasta for context datasets such as Hungate when they have not already\n'
-            'been registered with `branchmanager filing-cabinet`. Novelty is always relative to YOUR submitted data,\n'
-            'not the full external reference. Each successive Performance Review extends the partner collection and\n'
-            'updates same-species genome coverage and candidate sets.'
-        ),
-        formatter_class=_Fmt,
-    )
-    add_project_config_option(performance_review_parser)
-    performance_review_parser.add_argument('--input', required=True,
-        help='FASTA file of new sequences to analyse.')
-    performance_review_parser.add_argument('--marker-source-type',
-        choices=['auto', 'SANGER_AB1', 'PARTNER_FASTA', 'PACBIO_HIFI', 'MIXED'],
-        default='auto',
-        help='Provenance of the marker sequence. Auto treats direct --input FASTA as PARTNER_FASTA; Assistant resolves Sanger/PacBio automatically.')
-    performance_review_parser.add_argument('--db', required=True,
-        help='Path to the BranchManager SQLite database (must have been initialised with `branchmanager filing-cabinet`).')
-    performance_review_parser.add_argument('-o', '--out', required=True,
-        help='Output directory for this run (sequence_assessment.tsv, novelty_metrics.tsv, tree, iTOL files, etc.).')
-    performance_review_parser.add_argument('--dataset', required=True,
-        help='Label for this batch of sequences stored in the DB (e.g. Batch1). Used in iTOL dataset-membership strip.')
-    performance_review_parser.add_argument('--ref', required=False,
-        help='Reference FASTA (GTDB/SILVA reps) used for classification and tree orientation. Use the same file as the Filing Cabinet.')
-    performance_review_parser.add_argument('--taxa', required=False,
-        help='Taxonomy table matching IDs in --ref (TSV/CSV, optionally .gz: id<TAB>lineage or id,lineage).')
-    performance_review_parser.add_argument('--ref-name', dest='ref_name', required=False, default=None,
-        help='Display name for the primary reference database (default: derived from --ref filename).')
-    performance_review_parser.add_argument('--alt-ref', dest='alt_ref', action='append', default=None, metavar='FASTA',
-        help='Additional reference FASTA to classify against (repeatable). Adds extra taxonomy columns to sequence_assessment.tsv and taxonomy_all_dbs.tsv.')
-    performance_review_parser.add_argument('--alt-taxa', dest='alt_taxa', action='append', default=None, metavar='TABLE',
-        help='Taxonomy TSV/CSV for the corresponding --alt-ref (positionally paired; repeatable; .gz accepted).')
-    performance_review_parser.add_argument('--alt-ref-name', dest='alt_ref_name', action='append', default=None, metavar='NAME',
-        help='Display name for the corresponding --alt-ref (positionally paired; repeatable).')
-    performance_review_parser.add_argument('--main-ref', dest='main_ref', required=False, default=None,
-        help='Name of the authoritative assessment database. Bacterial/archaeal Performance Review requires GTDB; other databases are reporting cross-checks.')
-    performance_review_parser.add_argument('--mwl', dest='mwl', required=False, default=None,
-        help='Most Wanted List workbook/TSV/CSV. GTDB taxonomy is matched against this list and MWL columns are added to sequence_assessment.tsv.')
-    performance_review_parser.add_argument('--mwl-sheet', dest='mwl_sheet', required=False, default='MWL_V1',
-        help='Sheet name to read from an MWL .xlsx workbook (default: MWL_V1).')
-    performance_review_parser.add_argument('--mwl-min-rank', dest='mwl_min_rank', required=False, default='p',
-        choices=['domain', 'd', 'phylum', 'p', 'class', 'c', 'order', 'o', 'family', 'f', 'genus', 'g', 'species', 's'],
-        help='Minimum matched rank required for an MWL hit (default: phylum). Domain-only MWL entries still match at domain.')
-    performance_review_parser.add_argument('--partner-metadata', '--sequencing-metadata', dest='partner_metadata', required=False, default=None,
-        help='Cumulative CSV/TSV ledger with sequence IDs, partner acronyms, optional selected_for_genome_sequencing, and required already_sequenced status. Selection is a commitment; already_sequenced means a genome is available. .gz is accepted.')
-    performance_review_parser.add_argument('--marker-qc', dest='marker_qc', default=None,
-        help='Paper Trail/Merge Meeting assembly_report.tsv sidecar. Auto-discovered beside --input when omitted.')
-    performance_review_parser.add_argument('--marker-review', dest='marker_review', default=None,
-        help='CSV/TSV manual-review decisions for PASS_WITH_WARNINGS or unverified marker sequences.')
-    performance_review_parser.add_argument('--accept-unverified-marker-qc', action='store_true', default=False,
-        help='Explicitly accept FASTA inputs lacking Paper Trail provenance. Recorded in the manifest and assessment; use only for independently validated sequences.')
-    performance_review_parser.add_argument('--baseline-fasta', dest='baseline_fasta', required=False, default=None,
-        help='Optional baseline/context FASTA to load before evaluating the new sequences (e.g. Hungate 16S).')
-    performance_review_parser.add_argument('--baseline-dataset', dest='baseline_dataset', required=False, default='Baseline',
-        help='Dataset label for --baseline-fasta in the DB and default cultured-baseline novelty pool (default: Baseline). Must differ from --dataset.')
-    performance_review_parser.add_argument('--baseline-tier', choices=['priority', 'secondary'], default=None,
-        help='Cultured baseline tier for --baseline-fasta: priority for Hungate, secondary for other project baseline genomes. Inferred from --baseline-dataset when omitted.')
-    performance_review_parser.add_argument('--novelty-baseline-dataset', dest='novelty_baseline_datasets', action='append', default=[],
-        help='Existing DB dataset label to include in the baseline/cultured novelty pool (repeatable; useful for Hungate plus other cultured isolate sets).')
-    performance_review_parser.add_argument('--baseline-taxa-assignments', dest='baseline_taxa_assignments', required=False, default=None,
-        help='Pre-computed taxonomy for --baseline-fasta (TSV/CSV, optionally .gz: sequence_id + lineage + optional confidence, or embedded-lineage FASTA). Skips baseline classification.')
-    performance_review_parser.add_argument('--baseline-skip-classify', dest='baseline_skip_classify', action='store_true', default=False,
-        help='Load --baseline-fasta into the DB without classifying it. Novelty still uses the baseline sequences, but taxonomy/iTOL context may be sparse.')
-    performance_review_parser.add_argument('--baseline-colours', dest='baseline_colours', required=False, default=None,
-        help='Optional CSV with baseline sequence colours, in the same format as filing-cabinet --colours.')
-    performance_review_parser.add_argument('--baseline-shorten-ids', dest='baseline_shorten_ids',
-        action=argparse.BooleanOptionalAction, default=False,
-        help='Replace baseline FASTA headers with compact IDs. Default is to preserve the IDs exactly as supplied.')
-    performance_review_parser.add_argument('--taxa-assignments',
-        dest='taxa_assignments', required=False,
-        help='Pre-computed taxonomy for the INPUT sequences (TSV/CSV, optionally .gz: query_id + lineage, or embedded-lineage FASTA).')
-    performance_review_parser.add_argument('--previous-review', dest='previous_review', required=False,
-        help='Path to the previous Filing Cabinet or Performance Review output directory. Used to seed the tree alignment so only new sequences need aligning.')
-    performance_review_parser.add_argument('--shorten-ids', dest='shorten_ids',
-        action=argparse.BooleanOptionalAction, default=False,
-        help='Replace input headers with compact IDs. Default is to preserve the IDs exactly as supplied.')
-    performance_review_parser.add_argument('--min-len', dest='min_len', type=int, default=800,
-        help='Minimum sequence length to retain (bp, default: 800). Shorter sequences are filtered out.')
-    performance_review_parser.add_argument('--max-n-percent', dest='max_n_percent', type=float, default=5.0,
-        help='Maximum percentage of ambiguous (N) bases allowed (default: 5.0).')
-    performance_review_parser.add_argument('--chimera-ref', dest='chimera_ref', default=None,
-        help='Curated chimera-free marker reference for UCHIME. Defaults to the primary classification reference.')
-    performance_review_parser.add_argument('--skip-chimera-check', dest='skip_chimera_check', action='store_true', default=False,
-        help='Explicitly skip reference-based chimera screening. The omission is recorded and marker evidence is downgraded.')
-    performance_review_parser.add_argument('--collapse', action='store_true',
-        help='Collapse near-identical same-taxonomy sequences into representatives for the tree.')
-    performance_review_parser.add_argument('--collapse-threshold', type=float, default=99.8,
-        help='Identity threshold (percent) for collapsing (default: 99.8).')
-    performance_review_parser.add_argument('--sequence-domain', '--organism-domain', dest='sequence_domain',
-        choices=SEQUENCE_DOMAIN_CHOICES, default=None,
-        help=(
-            'Sequence/domain profile for this Performance Review. Omitted means bacteria. '
-            'Use archaea for archaeal runs, fungi for fungal/eukaryotic runs with suitable references, '
-            'or mixed/all/none to disable domain filtering. Provide domain-specific --ref/--alt-ref, '
-            '--baseline-fasta, --previous-review, and --anchors as needed.'
-        ))
-    performance_review_parser.add_argument('--phylum', required=False,
-        help='Filter iTOL output to sequences assigned to this phylum (e.g. Bacillota). Does not affect novelty scoring.')
-    performance_review_parser.add_argument('--target', required=False, default=None,
-        help=(
-            'FASTA of sequences to measure novelty against instead of the DB. '
-            'Leave unset to use the full rolling partner-candidate collection, including this batch with self-hits removed (recommended).'
-        ),
-    )
-    performance_review_parser.add_argument('--force-rebuild', '--rebuild-tree', dest='force_rebuild', action='store_true', default=False,
-        help='Rebuild the entire tree from scratch even when an existing alignment is present. '
-             'When combined with --previous-review, ignores the previous alignment and jointly estimates '
-             'tree topology across all datasets. (--rebuild-tree is an alias for this flag.)')
-    performance_review_parser.add_argument('--anchors', required=False, default=None,
-        help='Custom reference anchor FASTA for tree scaffolding. By default uses the bundled 26-sequence rumen/gut anchor set.')
-    performance_review_parser.add_argument('--threads', dest='threads', type=int, default=4,
-        help='CPU threads for MAFFT and VSEARCH (default: 4).')
-    performance_review_parser.add_argument('--tree-method', dest='tree_method',
-        choices=['fasttree', 'iqtree', 'iqtree-fast'], default='fasttree',
-        help=(
-            'Phylogenetic tree-building backend (default: fasttree). '
-            'fasttree: approximate ML, GTR+CAT. '
-            'iqtree: full ML, GTR+G+I (recommended for production/publication runs). '
-            'iqtree-fast: IQ-TREE 2 with -fast flag (good for exploratory incremental runs).'
-        ),
-    )
-    performance_review_parser.add_argument(
-        '--neighbourhood-format', dest='neighbourhood_format',
-        choices=['png'], default='png',
-        help='Image format for local phylogenetic-neighbourhood figures (PNG only).',
-    )
-    performance_review_parser.add_argument(
-        '--pangenome-target', dest='pangenome_target', type=int, default=selection_target,
-        help='Target number of committed genomes per GTDB species/local pangenome group (default: 9). Baseline isolates count because their genomes are available.',
-    )
-    performance_review_parser.add_argument(
-        '--candidate-set-size', dest='candidate_set_size', type=int, default=selection_panel_size,
-        help='Maximum ranked diversity-panel candidates per GTDB species/local clade (default: 9).',
-    )
-    performance_review_parser.add_argument(
-        '--baseline-redundancy-identity', type=float, default=baseline_redundancy_identity,
-        help='Exclude uncommitted candidates at or above this nearest cultured-baseline marker identity when coverage also passes its threshold (default: 99.8).',
-    )
-    performance_review_parser.add_argument(
-        '--baseline-redundancy-min-query-coverage', type=float, default=baseline_redundancy_coverage,
-        help='Minimum query coverage required before baseline near-identity exclusion is applied (default: 95).',
-    )
-    performance_review_parser.add_argument(
-        '--baseline-extension-min-identity', type=float, default=baseline_extension_identity,
-        help='Minimum cultured-baseline 16S identity for a same-species candidate to enter a baseline-pangenome extension (default: 98.65).',
-    )
-    performance_review_parser.add_argument(
-        '--baseline-extension-min-query-coverage', type=float, default=baseline_extension_coverage,
-        help='Minimum query coverage for admission to a baseline-pangenome extension (default: 95).',
-    )
-    performance_review_parser.add_argument('--user-colours', dest='user_colours', required=False,
-        help='CSV file mapping sequence IDs to custom hex colours for iTOL (columns: id, colour).')
-    performance_review_parser.add_argument(
-        '--group-phyla', dest='group_phyla', action='append', default=None, metavar='SPEC',
-        help=(
-            'Collapse multiple phyla into one colour in iTOL legends. Repeatable. '
-            'Formats: "archaea", "bacteria", "Bacillota,Bacillota_I", "Firmicutes:Bacillota,Bacillota_I".'
-        ),
-    )
-    performance_review_parser.add_argument('--functional', dest='functional', required=False, default=None,
-        help=(
-            'TSV file mapping sequence IDs to functional attributes. '
-            'Header row required; first column = sequence ID; subsequent columns = functional attributes. '
-            'Generates one iTOL file per column (DATASET_BINARY / DATASET_SIMPLEBAR / DATASET_COLORSTRIP).'
-        ),
-    )
-    performance_review_parser.add_argument('--draft-rumen-functions', dest='draft_rumen_functions',
-        action='store_true', default=False,
-        help=(
-            'Auto-generate a draft rumen functional-group annotation from the output taxonomy. '
-            'Writes rumen_functions_draft.tsv and itol_func_Rumen_Functional_Group.itol. '
-            'The draft TSV can be edited and re-supplied via --functional in later runs.'
-        ),
-    )
-
-    quarterly_review_parser = sub.add_parser(
-        'quarterly-review',
-        help='Select the next project-wide genome tranche after rolling Performance Reviews.',
-        description=(
-            'Reconsider every accumulated partner isolate in one auditable selection round.\n\n'
-            'Residual nine-genome coverage gaps are filled first. Remaining budget is allocated\n'
-            'across species using marginal tree/marker diversity, existing genome representation,\n'
-            'cultured-baseline novelty, GTDB-reference context, and MWL evidence. Recommendations\n'
-            'never change already_sequenced status. Use genome ANI/phylogenomics to validate\n'
-            'strain-level diversity once genome data are available.'
-        ),
-        formatter_class=_Fmt,
-    )
-    add_project_config_option(quarterly_review_parser)
-    quarterly_review_parser.add_argument('--db', required=True,
-        help='Rolling BranchManager SQLite database containing all partner and baseline sequences.')
-    quarterly_review_parser.add_argument('-o', '--out', required=True,
-        help='Output directory for quarterly_review_summary.tsv, next_genome_set.tsv, and quarterly_review_manifest.tsv.')
-    quarterly_review_parser.add_argument('--genome-budget', type=int, required=False,
-        help='Number of new PRIMARY genomes to nominate in this round. This is intentionally explicit.')
-    quarterly_review_parser.add_argument('--backups-per-primary', type=int, default=1,
-        help='Number of extraction-failure/diversity backups to nominate per primary (default: 1).')
-    quarterly_review_parser.add_argument('--pangenome-target', type=int, default=selection_target,
-        help='Initial exact-GTDB-species/local-group coverage target before expansion (default: 9).')
-    quarterly_review_parser.add_argument('--baseline-redundancy-identity', type=float, default=baseline_redundancy_identity,
-        help='Exclude uncommitted candidates at or above this cultured-baseline marker identity (default: 99.8).')
-    quarterly_review_parser.add_argument('--baseline-redundancy-min-query-coverage', type=float, default=baseline_redundancy_coverage,
-        help='Minimum query coverage required for baseline redundancy exclusion (default: 95).')
-    quarterly_review_parser.add_argument('--baseline-extension-min-identity', type=float, default=baseline_extension_identity,
-        help='Minimum same-species cultured-baseline marker identity for baseline-pangenome extension membership (default: 98.65).')
-    quarterly_review_parser.add_argument('--baseline-extension-min-query-coverage', type=float, default=baseline_extension_coverage,
-        help='Minimum query coverage for baseline-pangenome extension membership (default: 95).')
-    quarterly_review_parser.add_argument('--assessment', action='append', default=None, metavar='TSV',
-        help='Import a full sequence_assessment.tsv before selection (repeatable; later files supersede earlier rows). Future Performance Reviews store snapshots automatically.')
-    quarterly_review_parser.add_argument('--partner-metadata', '--sequencing-metadata', dest='partner_metadata', default=None,
-        help='Optional cumulative metadata TSV/CSV used to refresh confirmed already_sequenced status before this round.')
-    quarterly_review_parser.add_argument('--tree', default=None,
-        help='Latest cumulative Newick tree. Enables marginal patristic-diversity ranking.')
-    quarterly_review_parser.add_argument('--alignment', default=None,
-        help='Latest cumulative MSA. Recomputes nearest currently available genome context after metadata updates.')
-    quarterly_review_parser.add_argument('--from-dir', default=None,
-        help='Latest Performance Review output directory; used to locate tree/current_tree.nwk when --tree is omitted.')
-    quarterly_review_parser.add_argument('--round-id', default=None,
-        help='Stable round label. Default: UTC timestamp such as quarterly_review_20260713T120000Z.')
-    quarterly_review_parser.add_argument('--neighbourhood-format', choices=['png'], default='png',
-        help='Image format for Quarterly Review local-neighbourhood figures (PNG only).')
-    quarterly_review_parser.add_argument('--include-moderate-evidence', action='store_true', default=False,
-        help='Allow MODERATE marker-evidence rows into the Quarterly Review. By default they are REVIEW only.')
-
-    label_maker_parser = sub.add_parser(
-        'label-maker',
-        help='Label Maker: regenerate iTOL annotation files from stored taxonomy.',
-        description=(
-            'Re-generate all iTOL colour strips (phylum, family, genus, dataset membership)\n'
-            'from the taxonomy already stored in the DB. Useful after changing --group-phyla\n'
-            'options or after manually editing the database.'
-        ),
-        formatter_class=_Fmt,
-    )
-    label_maker_parser.add_argument('--db', required=True,
-        help='Path to the BranchManager SQLite database.')
-    label_maker_parser.add_argument('-o', '--out', required=True,
-        help='Output directory where iTOL files will be written (normally a Filing Cabinet or Performance Review output directory).')
-    label_maker_parser.add_argument('--include-datasets', required=False,
-        help='Comma-separated list of dataset names to include (default: all datasets in the DB).')
-    label_maker_parser.add_argument('--sequence-domain', '--organism-domain', dest='sequence_domain',
-        choices=SEQUENCE_DOMAIN_CHOICES, default=None,
-        help='Optional domain profile filter for regenerated outputs: bacteria, archaea, fungi, or mixed/all/none.')
-    label_maker_parser.add_argument(
-        '--group-phyla', dest='group_phyla', action='append', default=None, metavar='SPEC',
-        help=(
-            'Collapse multiple phyla into one colour in iTOL legends. Repeatable. '
-            'Formats: "archaea", "bacteria", "Bacillota,Bacillota_I", "Firmicutes:Bacillota,Bacillota_I".'
-        ),
-    )
-    label_maker_parser.add_argument('--functional', dest='functional', required=False, default=None,
-        help=(
-            'TSV file mapping sequence IDs to functional attributes. '
-            'Generates one iTOL file per column (DATASET_BINARY / DATASET_SIMPLEBAR / DATASET_COLORSTRIP).'
-        ),
-    )
-    label_maker_parser.add_argument('--draft-rumen-functions', dest='draft_rumen_functions',
-        action='store_true', default=False,
-        help='Auto-generate rumen functional-group iTOL annotation from stored taxonomy.',
-    )
-
-    org_chart_parser = sub.add_parser(
-        'org-chart',
-        help='Org Chart: build a focused tree and iTOL files for a specific taxon.',
-        description=(
-            'Extract all sequences matching a given taxon from the DB and build a focused\n'
-            'phylogenetic tree for that group only.\n\n'
-            'Fast path: if --from-dir points to a directory containing current_alignment.fasta\n'
-            '(a Filing Cabinet or Performance Review output), sequences are sliced from the pre-built alignment and\n'
-            'FastTree is run directly — no MAFFT re-alignment needed (~seconds for hundreds of seqs).\n\n'
-            'Slow path: if no existing alignment is found, a full MAFFT + FastTree build is run.\n\n'
-            'Taxon formats accepted:\n'
-            '  archaea, bacteria          → all sequences at domain level\n'
-            '  Bacillota, Bacteroidota    → phylum name (auto-detected)\n'
-            '  p__Bacillota               → GTDB-prefixed phylum\n'
-            '  f__Lachnospiraceae         → GTDB-prefixed family\n'
-            '  g__Ruminococcus            → GTDB-prefixed genus\n'
-        ),
-        formatter_class=_Fmt,
-    )
-    org_chart_parser.add_argument('--db', required=True,
-        help='Path to the BranchManager SQLite database.')
-    org_chart_parser.add_argument('-o', '--out', required=True,
-        help='Output directory for the focused-tree results.')
-    org_chart_parser.add_argument('--taxon', required=True,
-        help='Taxon to extract (see description above for accepted formats).')
-    org_chart_parser.add_argument(
-        '--rank', required=False, default='auto',
-        choices=['auto', 'domain', 'd', 'phylum', 'p', 'class', 'c',
-                 'order', 'o', 'family', 'f', 'genus', 'g', 'species', 's'],
-        help='Taxonomic rank to filter on. Default "auto" detects the rank from the taxon name or prefix.',
-    )
-    org_chart_parser.add_argument('--from-dir', dest='from_dir', required=False, default=None,
-        help=(
-            'Existing Filing Cabinet or Performance Review output directory containing current_alignment.fasta. '
-            'Enables the fast path (sequences extracted from the existing MSA; no re-alignment).'
-        ),
-    )
-    org_chart_parser.add_argument('--ref', required=False,
-        help='Reference FASTA for orientation correction (slow-path full build only).')
-    org_chart_parser.add_argument('--anchors', required=False, default=None,
-        help='Custom reference anchor FASTA. By default uses the bundled 26-sequence rumen/gut anchor set (NCBI RefSeq).')
-    org_chart_parser.add_argument('--threads', type=int, default=4,
-        help='CPU threads for FastTree / MAFFT (default: 4).')
-    org_chart_parser.add_argument('--min-seqs', dest='min_seqs', type=int, default=3,
-        help='Minimum sequences required to proceed with tree building (default: 3).')
-    org_chart_parser.add_argument('--no-tree', dest='no_tree', action='store_true', default=False,
-        help='Skip tree building; only write taxonomy TSV, sequence list, and iTOL colour files.')
-    org_chart_parser.add_argument(
-        '--group-phyla', dest='group_phyla', action='append', default=None, metavar='SPEC',
-        help=(
-            'Collapse multiple phyla into one colour in iTOL legends. Repeatable. '
-            'Formats: "archaea", "bacteria", "Bacillota,Bacillota_I", "Firmicutes:Bacillota,Bacillota_I".'
-        ),
-    )
-    org_chart_parser.add_argument('--functional', dest='functional', required=False, default=None,
-        help=(
-            'TSV file mapping sequence IDs to functional attributes. Header row required; first column = sequence ID; subsequent columns = functional attributes. '
-            'Generates one iTOL file per column (DATASET_BINARY / DATASET_SIMPLEBAR / DATASET_COLORSTRIP).'
-        ),
-    )
-    org_chart_parser.add_argument('--draft-rumen-functions', dest='draft_rumen_functions',
-        action='store_true', default=False,
-        help='Auto-generate rumen functional-group iTOL annotation from stored taxonomy.',
-    )
-
-    paper_trail_parser = sub.add_parser(
-        'paper-trail',
-        help='Paper Trail and Merge Meeting: convert AB1 reads and assemble primer sequences.',
-        description=(
-            'Process Sanger chromatogram reads before Performance Review.\n\n'
-            'Inputs may be AB1/ABI files, FASTA, or FASTQ. AB1 files are base-called from '
-            'PBAS/PCON tags, quality-trimmed, oriented by primer direction, and optionally '
-            'assembled into one consensus 16S sequence per isolate. For example, 27F reads '
-            'are kept forward and 907R reads are reverse-complemented before overlap assembly.\n\n'
-            'If --sample-map is omitted, sequence IDs and primer names are '
-            'inferred from filenames such as Iso001_27F.ab1 and Iso001_907R.ab1.'
-        ),
-        formatter_class=_Fmt,
-    )
-    sanger_studio_parser = sub.add_parser(
-        'sanger-studio',
-        help='Open the local browser-based Sanger chromatogram inspector and assembler.',
-        description=(
-            'Launch a local-only browser interface for checking AB1 reads, correcting read maps, '
-            'reviewing trimming and overlap assembly, and recording manual warning decisions. '
-            'The project root must contain the sample map and all referenced reads.'
-        ),
-        formatter_class=_Fmt,
-    )
-    sanger_studio_parser.add_argument('--root', default='.',
-        help='Project root that contains the sample map and all AB1/ABI reads (default: current directory).')
-    sanger_studio_parser.add_argument('--sample-map', default=None,
-        help='Optional Mailroom or read map. If omitted, load a map or create one from selected AB1 files in the UI.')
-    sanger_studio_parser.add_argument('-o', '--out', default='sanger_studio_runs',
-        help='Directory for inspection runs and review decisions (default: sanger_studio_runs).')
-    sanger_studio_parser.add_argument('--port', type=int, default=8765,
-        help='Local web server port (default: 8765).')
-    sanger_studio_parser.add_argument('--no-browser', action='store_true',
-        help='Start the local server without opening a browser window.')
-    paper_trail_parser.add_argument(
-        '--input', nargs='+', required=False, default=[],
-        help='AB1/ABI/FASTA/FASTQ files or directories to process. Directories are searched recursively by default. Optional when --sample-map lists the read files.',
-    )
-    paper_trail_parser.add_argument('-o', '--out', required=True,
-        help='Output directory for assembled.fasta, read_qc.tsv, visual reports, and assembly_report.tsv.')
-    paper_trail_parser.add_argument(
-        '--sample-map', required=False, default=None,
-        help=(
-            'One CSV/TSV per partner batch. Prefer one row per read with sequence_id, read_file, '
-            'primer, direction, and processing_mode. Multiple rows may share a sequence_id when '
-            'different primer reads belong to one isolate. Relative paths are resolved next to the map.'
-        ),
-    )
-    paper_trail_parser.add_argument(
-        '--primer', dest='primers', action='append', default=None,
-        help='Primer name to recognise in filenames (repeatable). Defaults include common 16S primers such as 27F, 907R, and 1492R.',
-    )
-    paper_trail_parser.add_argument(
-        '--primer-sequence', dest='primer_sequences', action='append', default=None, metavar='NAME=SEQUENCE',
-        help='Primer oligonucleotide used for confident leading-primer removal (repeatable). Built-in common 16S primers are used by default.',
-    )
-    paper_trail_parser.add_argument('--trim-primers', dest='trim_primers',
-        action=argparse.BooleanOptionalAction, default=True,
-        help='Remove confidently matched primer sequence from the retained read (default: enabled).')
-    paper_trail_parser.add_argument('--secondary-peak-ratio', dest='secondary_peak_ratio', type=float, default=paper_trail_policy.secondary_peak_ratio,
-        help='Secondary/called chromatogram peak ratio considered mixed (default: 0.33).')
-    paper_trail_parser.add_argument('--max-mixed-peak-percent', dest='max_mixed_peak_percent', type=float, default=paper_trail_policy.max_mixed_peak_percent,
-        help='Maximum percent retained high-quality positions with mixed peaks before read QC failure (default: 15).')
-    paper_trail_parser.add_argument('--mixed-peak-min-quality', dest='mixed_peak_min_quality', type=int, default=paper_trail_policy.mixed_peak_min_quality,
-        help='Minimum Phred score for a mixed-peak position to count (default: 20).')
-    paper_trail_parser.add_argument('--screen-ref', dest='screen_ref', default=None,
-        help='Optional marker reference FASTA for independent per-primer taxonomy concordance screening; disagreements require manual review and retain the read-level assignments.')
-    paper_trail_parser.add_argument('--screen-taxa', dest='screen_taxa', default=None,
-        help='Optional taxonomy table corresponding to --screen-ref; FASTA header taxonomy is used when omitted.')
-    paper_trail_parser.add_argument('--threads', type=int, default=4,
-        help='CPU threads for optional primer-read taxonomy screening (default: 4).')
-    paper_trail_parser.add_argument('--min-quality', dest='min_quality', type=int, default=paper_trail_policy.min_quality,
-        help='Phred cutoff for Mott-style end trimming (default: 20).')
-    paper_trail_parser.add_argument('--min-length', dest='min_length', type=int, default=paper_trail_policy.min_final_length,
-        help='Minimum final sequence length to write to assembled.fasta (default: 800 bp).')
-    paper_trail_parser.add_argument('--min-read-length', dest='min_read_length', type=int, default=paper_trail_policy.min_read_length,
-        help='Minimum trimmed read length allowed to contribute to an assembly or best-read decision (default: 300 bp).')
-    paper_trail_parser.add_argument('--min-mean-quality', dest='min_mean_quality', type=float, default=paper_trail_policy.min_mean_quality,
-        help='Minimum mean Phred score after trimming/masking for read and final QC (default: 20).')
-    paper_trail_parser.add_argument('--mask-quality', dest='mask_quality', type=int, default=paper_trail_policy.mask_quality,
-        help='Mask internal bases below this Phred score to N before assembly (default: 20).')
-    paper_trail_parser.add_argument('--max-read-expected-errors', dest='max_read_expected_errors', type=float, default=paper_trail_policy.max_read_expected_errors,
-        help='Maximum expected base-call errors allowed per retained read (default: 8).')
-    paper_trail_parser.add_argument('--max-output-expected-errors', dest='max_output_expected_errors', type=float, default=paper_trail_policy.max_output_expected_errors,
-        help='Maximum expected base-call errors allowed in the final isolate sequence (default: 5).')
-    paper_trail_parser.add_argument('--warn-n-percent', dest='warn_n_percent', type=float, default=paper_trail_policy.warn_n_percent,
-        help='Percent N above which a passing sequence requires manual review (default: 3.0).')
-    paper_trail_parser.add_argument('--max-n-percent', dest='max_n_percent', type=float, default=paper_trail_policy.max_n_percent,
-        help='Maximum percent N allowed after masking before QC failure (default: 5.0).')
-    paper_trail_parser.add_argument('--warn-internal-lowq-run', dest='warn_internal_low_quality_run', type=int, default=paper_trail_policy.warn_internal_low_quality_run,
-        help='Internal low-quality run length above which manual review is required (default: 5 bp).')
-    paper_trail_parser.add_argument('--max-internal-lowq-run', dest='max_internal_low_quality_run', type=int, default=paper_trail_policy.max_internal_low_quality_run,
-        help='Maximum internal low-quality/ambiguous run length before read failure (default: 20 bp).')
-    paper_trail_parser.add_argument('--max-conflict-density', dest='max_conflict_density', type=float, default=paper_trail_policy.max_conflict_density,
-        help='Maximum overlap conflicts per 100 final bases before final QC failure (default: 1.0).')
-    paper_trail_parser.add_argument('--max-ambiguous-overlap-conflicts-without-review', dest='max_ambiguous_overlap_conflicts_without_review', type=int, default=paper_trail_policy.max_ambiguous_overlap_conflicts_without_review,
-        help='Unresolved overlap conflicts tolerated as N before manual review is required (default: 2).')
-    paper_trail_parser.add_argument('--quality-difference', dest='quality_difference', type=int, default=paper_trail_policy.quality_difference,
-        help='Minimum Phred-scaled posterior odds required to resolve a conflicting overlap base (default: 10).')
-    paper_trail_parser.add_argument('--allow-missing-quality', dest='allow_missing_quality',
-        action='store_true', default=False,
-        help='Allow AB1 reads missing PCON quality scores to pass with warnings. By default they fail QC.')
-    paper_trail_parser.add_argument('--min-overlap', dest='min_overlap', type=int, default=paper_trail_policy.min_overlap,
-        help='Minimum overlap length for assembling multiple primer reads (default: 80 bp).')
-    paper_trail_parser.add_argument('--min-overlap-identity', dest='min_overlap_identity', type=float, default=paper_trail_policy.min_overlap_identity,
-        help='Minimum overlap identity for assembly, 0-1 (default: 0.98).')
-    paper_trail_parser.add_argument('--assemble', dest='assemble',
-        action=argparse.BooleanOptionalAction, default=True,
-        help='Assemble multiple reads per sequence_id when possible (default). Use --no-assemble to keep the best read.')
-    paper_trail_parser.add_argument('--recursive', dest='recursive',
-        action=argparse.BooleanOptionalAction, default=True,
-        help='Search input directories recursively (default).')
-    paper_trail_parser.add_argument('--max-report-image-height', dest='max_report_image_height',
-        type=int, default=2400,
-        help='Maximum height in pixels for each visual-report PNG; larger reports are split into numbered pages (minimum: 600, default: 2400).')
-
-    replacement_parser = sub.add_parser(
-        'replace-selected-markers',
-        help='Replace selected future-genome markers with newly assembled Sanger 16S consensus sequences.',
-        formatter_class=_Fmt,
-    )
-    replacement_parser.add_argument('--sample-map', required=True,
-        help='CSV/TSV mapping selected isolate IDs to new forward/reverse Sanger AB1 reads.')
-    replacement_parser.add_argument('--db', required=True,
-        help='Existing BranchManager SQLite project database.')
-    replacement_parser.add_argument('--primer', dest='primers', action='append', default=None)
-    replacement_parser.add_argument('--primer-sequence', dest='primer_sequences', action='append', default=None,
-        metavar='NAME=SEQUENCE')
-    replacement_parser.add_argument('--min-overlap', type=int, default=paper_trail_policy.min_overlap)
-    replacement_parser.add_argument('--min-overlap-identity', type=float, default=paper_trail_policy.min_overlap_identity)
-    replacement_parser.add_argument('--threads', type=int, default=4)
-    replacement_parser.add_argument('--allow-missing-quality', action='store_true', default=False)
-    replacement_parser.add_argument('-o', '--out', required=True,
-        help='Output directory for Sanger QC, replacement audit, and replacement FASTA.')
-
-    from branchmanager.tools import (
-        benchmark_selection as _tool_benchmark, build_anchor_fasta as _tool_anchors,
-        id_sanitation as _tool_ids, metadata_to_diversity as _tool_diversity,
-        primers_to_manifest as _tool_manifest, genomic_16s_selection as _tool_genomic_16s,
-    )
-    for _name, _module, _help in (
-        ('primers-to-manifest', _tool_manifest,
-         "Tool: convert a partner 'Primer file mapping' Excel sheet into an AB1 manifest.csv (with ID sanitation)."),
-        ('metadata-to-diversity', _tool_diversity,
-         'Tool: extract diversity-metadata columns from a partner Excel template into a TSV.'),
-        ('benchmark-selection', _tool_benchmark,
-         'Tool: benchmark isolate rankings against adjudicated labels (precision@k, recall@k, MAP).'),
-        ('build-anchors', _tool_anchors,
-         'Tool: download NCBI RefSeq 16S tree-anchor sequences into rumen-gut_reference_anchors.fasta.'),
-        ('check-ids', _tool_ids,
-         'Tool: check (and optionally sanitise) sequence/isolate IDs in a CSV/TSV table or FASTA.'),
-        ('genomic-16s-selection', _tool_genomic_16s,
-         'Tool: run Barrnap, VSEARCH against GTDB SSU representatives, optional GTDB-Tk concordance, and select one 16S representative per genome.'),
-
-    ):
-        _tool_parser = sub.add_parser(_name, help=_help, description=_help, formatter_class=_Fmt)
-        _module.add_arguments(_tool_parser)
-        _tool_parser.set_defaults(_tool=_module, _tool_parser=_tool_parser)
-
-    mailroom_parser = sub.add_parser(
-        'mailroom',
-        help='Mailroom: validate a Sanger or PacBio partner delivery and build its batch map.',
-        description=(
-            'Sanger (the default) reconciles AB1/ABI chromatograms and writes ab1_map.tsv. '
-            'PacBio reconciles one segmented HiFi FASTQ per isolate, writes pacbio_map.tsv, '
-            'then runs PacBio 16S clustering and representative selection automatically.'
-        ),
-        formatter_class=_Fmt,
-    )
-    mailroom_parser.add_argument('--read-dir', required=True,
-        help='Directory containing Sanger AB1/ABI or segmented PacBio HiFi FASTQ files for one partner batch.')
-    mailroom_parser.add_argument('--manifest', required=True,
-        help='Manifest file. Sanger requires read ID, isolate ID, and direction; PacBio requires isolate ID and FASTQ filename.')
-    mailroom_parser.add_argument('--technology', choices=['sanger', 'pacbio'], default='sanger',
-        help='Delivery technology (default: sanger). PacBio triggers FASTQ clustering after validation.')
-    mailroom_parser.add_argument('--pacbio-library-prep', default='Kinnex 16S rRNA Kit',
-        help='PacBio library-preparation protocol retained in provenance.')
-    mailroom_parser.add_argument('--pacbio-threads', type=int, default=8,
-        help='CPU threads for PacBio vsearch clustering during automatic kinnex import (default: 8).')
-    mailroom_parser.add_argument('--pacbio-vsearch-strand', choices=['plus', 'both'], default='plus',
-        help='vsearch strand mode for PacBio clustering (default: plus).')
-    mailroom_parser.add_argument('--pacbio-vsearch-query-cov', type=float, default=0.0,
-        help='Optional PacBio vsearch --query_cov threshold from 0 to 1; 0 disables the flag (default: 0).')
-    mailroom_parser.add_argument('--pacbio-vsearch-maxaccepts', type=int, default=0,
-        help='PacBio vsearch --maxaccepts value for clustering; 0 keeps all accepted hits (default: 0).')
-    mailroom_parser.add_argument('--pacbio-vsearch-maxrejects', type=int, default=0,
-        help='PacBio vsearch --maxrejects value for clustering; 0 keeps the vsearch default behaviour for no reject cap (default: 0).')
-    mailroom_parser.add_argument('--dataset', required=True,
-        help='Stable batch label written to every map row, for example UoG_01.')
-    mailroom_parser.add_argument('--forward-primer', default=None,
-        help='Confirmed primer name applied to forward rows lacking a supplied/embedded primer.')
-    mailroom_parser.add_argument('--reverse-primer', default=None,
-        help='Confirmed primer name applied to reverse rows lacking a supplied/embedded primer.')
-    mailroom_parser.add_argument('--processing-mode', choices=['auto', 'assemble', 'best_read'], default='auto',
-        help='Default read handling. Auto selects assemble for multi-read isolates and best_read for single-read isolates.')
-    mailroom_parser.add_argument('--recursive', action=argparse.BooleanOptionalAction, default=True,
-        help='Search the AB1 directory recursively (default: enabled).')
-    mailroom_parser.add_argument('-o', '--out', required=True,
-        help='Output directory for ab1_map.tsv, AB1 inventory, discrepancy report, and summary.')
-
-    interview_parser = sub.add_parser(
-        'interview',
-        help='Interview: run standalone AB1 conversion, assembly, and QC from Mailroom output.',
-        description=(
-            'Run the same versioned AB1 QC policy used by Assistant, starting from a completed '
-            'Mailroom output directory or its ab1_map.tsv. Interview writes converted and assembled '
-            'FASTA files, QC tables, chromatogram and assembly PNGs, manual-review records, and '
-            'resequencing recommendations. It does not read or modify a BranchManager project database.'
-        ),
-        formatter_class=_Fmt,
-    )
-    interview_parser.add_argument(
-        '--mailroom', required=True,
-        help='Mailroom output directory, or its ab1_map.tsv file.',
-    )
-    interview_parser.add_argument(
-        '--primer-sequence', dest='primer_sequences', action='append', default=None,
-        metavar='NAME=SEQUENCE',
-        help='Confirmed primer oligonucleotide for leading-primer removal (repeatable).',
-    )
-    interview_parser.add_argument(
-        '--trim-primers', dest='trim_primers', action=argparse.BooleanOptionalAction,
-        default=True, help='Remove confidently matched leading primer sequences (default: enabled).',
-    )
-    interview_parser.add_argument(
-        '--screen-ref', dest='screen_ref', default=None,
-        help='Optional marker reference FASTA for independent per-read taxonomy concordance screening; disagreements trigger manual review and report each read assignment.',
-    )
-    interview_parser.add_argument(
-        '--screen-taxa', dest='screen_taxa', default=None,
-        help='Optional taxonomy table corresponding to --screen-ref.',
-    )
-    interview_parser.add_argument(
-        '--threads', type=int, default=4,
-        help='CPU threads for optional taxonomy screening (default: 4).',
-    )
-    interview_parser.add_argument(
-        '--allow-missing-quality', action='store_true', default=False,
-        help='Allow traces missing PCON quality scores to pass with warnings.',
-    )
-    interview_parser.add_argument(
-        '--allow-mailroom-review', action='store_true', default=False,
-        help='Process a REVIEW_REQUIRED Mailroom batch after an explicit review; FAIL batches are always rejected.',
-    )
-    interview_parser.add_argument(
-        '--max-report-image-height', type=int, default=2400,
-        help='Maximum PNG height before automatic pagination (minimum: 600, default: 2400).',
-    )
-    interview_parser.add_argument(
-        '-o', '--out', required=True,
-        help='Output directory for standalone AB1 QC, converted FASTA files, and visual reports.',
-    )
-
-    onboarding_parser = sub.add_parser(
-        'onboarding',
-        help='Onboarding: validate partner IDs, metadata, and either raw-read ownership or a supplied FASTA.',
-        formatter_class=_Fmt,
-    )
-    onboarding_inputs = onboarding_parser.add_mutually_exclusive_group(required=True)
-    onboarding_inputs.add_argument('--sample-map',
-        help='CSV/TSV mapping isolate IDs to raw read files for an AB1/primer-read submission.')
-    onboarding_inputs.add_argument('--fasta',
-        help='Partner-supplied marker FASTA to validate without running Paper Trail/Merge Meeting.')
-    onboarding_parser.add_argument('--partner-metadata', required=True,
-        help='Cumulative project metadata CSV/TSV. Required for every submission and updated as selection/genome statuses change.')
-    onboarding_parser.add_argument('--partner-id', default=None,
-        help='Expected partner acronym for this submission, used to validate cumulative-ledger ownership.')
-    onboarding_parser.add_argument('--dataset', default=None,
-        help='Unique partner batch label, for example QUB_01 or UoG_02.')
-    onboarding_parser.add_argument('--read-dir', default=None,
-        help='Optional base directory for relative read paths in the sample map.')
-    onboarding_parser.add_argument('--primer', dest='primers', action='append', default=None,
-        help='Primer column/name to recognise (repeatable).')
-    onboarding_parser.add_argument('-o', '--out', required=True,
-        help='Output directory for the normalised submission and Onboarding report.')
-
-    kinnex_parser = sub.add_parser(
-        'pacbio-16s-import',
-        help='PacBio 16S Import: cluster segmented HiFi FASTQs into one marker per isolate.',
-        formatter_class=_Fmt,
-    )
-    kinnex_parser.add_argument('--pacbio-map', required=True,
-        help='CSV/TSV with one row per isolate: sequence_id (or isolate_id) and file/fastq_file.')
-    kinnex_parser.add_argument('-o', '--out', required=True,
-        help='Output directory for representatives FASTA, marker-QC sidecar, and PacBio QC report.')
-    kinnex_parser.add_argument('--min-read-length', type=int, default=1000)
-    kinnex_parser.add_argument('--max-read-length', type=int, default=2000)
-    kinnex_parser.add_argument('--min-mean-quality', type=float, default=20.0)
-    kinnex_parser.add_argument('--cluster-identity', type=float, default=0.995)
-    kinnex_parser.add_argument('--min-reads', type=int, default=20)
-    kinnex_parser.add_argument('--min-dominant-fraction', type=float, default=0.80)
-    kinnex_parser.add_argument('--threads', type=int, default=1,
-        help='CPU threads for vsearch clustering (default: 1).')
-    kinnex_parser.add_argument('--vsearch-strand', choices=['plus', 'both'], default='plus',
-        help='vsearch strand mode for cluster_fast (default: plus).')
-    kinnex_parser.add_argument('--vsearch-query-cov', type=float, default=0.0,
-        help='Optional vsearch --query_cov threshold from 0 to 1; 0 disables the flag (default: 0).')
-    kinnex_parser.add_argument('--vsearch-maxaccepts', type=int, default=0,
-        help='vsearch --maxaccepts value for clustering; 0 keeps all accepted hits (default: 0).')
-    kinnex_parser.add_argument('--vsearch-maxrejects', type=int, default=0,
-        help='vsearch --maxrejects value for clustering; 0 keeps the vsearch default behaviour for no reject cap (default: 0).')
-    kinnex_parser.add_argument('--library-prep', default='Kinnex 16S rRNA Kit',
-        help='Library-preparation protocol to retain in PacBio QC provenance.')
-
-    status_meeting_parser = sub.add_parser(
-        'status-meeting',
-        help='Status Meeting: import factual isolate lifecycle changes into the project ledger.',
-        formatter_class=_Fmt,
-    )
-    status_meeting_parser.add_argument('--db', required=True)
-    status_meeting_parser.add_argument('--input', required=True,
-        help='CSV/TSV with sequence_id, status, and optional detail.')
-    status_meeting_parser.add_argument('-o', '--out', required=True)
-
-    records_update_parser = sub.add_parser(
-        'records-update',
-        help='Records Update: import completed genome/QC/GTDB/ANI evidence.',
-        formatter_class=_Fmt,
-    )
-    records_update_parser.add_argument('--db', required=True)
-    records_update_parser.add_argument('--input', required=True,
-        help='CSV/TSV with sequence_id, genome_id/accession, genome_status, QC, and optional GTDB/ANI fields.')
-    records_update_parser.add_argument('--min-completeness', type=float, default=90.0,
-        help='Minimum estimated genome completeness for automatic QC pass (default: 90).')
-    records_update_parser.add_argument('--max-contamination', type=float, default=5.0,
-        help='Maximum estimated contamination for automatic QC pass (default: 5).')
-    records_update_parser.add_argument('-o', '--out', required=True)
-
-    external_genomes_parser = sub.add_parser(
-        'add-external-genomes',
-        help='Register previously sequenced collection genomes, with optional 16S markers.',
-        formatter_class=_Fmt,
-    )
-    add_project_config_option(external_genomes_parser)
-    external_genomes_parser.add_argument('--db', required=True)
-    external_genomes_parser.add_argument('--input', required=True,
-        help='CSV/TSV with sequence_id, genome_id/accession, optional dataset/tier and genome-level taxonomy/QC fields.')
-    external_genomes_parser.add_argument('--marker-fasta', default=None,
-        help='Optional marker FASTA keyed by sequence_id; records without a marker remain genome-only.')
-    external_genomes_parser.add_argument('--dataset', default='ExternalGenomeBaseline')
-    external_genomes_parser.add_argument('--baseline-tier', choices=['priority', 'secondary'], default='secondary')
-    external_genomes_parser.add_argument('-o', '--out', required=True)
-
-    maldi_parser = sub.add_parser(
-        'add-maldi-identifications',
-        help='Register partner isolates identified by MALDI-TOF without marker sequences.',
-        formatter_class=_Fmt,
-    )
-    maldi_parser.add_argument('--db', required=True)
-    maldi_parser.add_argument('--input', required=True,
-        help='CSV/TSV with sequence_id, partner_id, and taxon_name or taxon_id; optional rank, score, instrument, library, date, and notes.')
-    maldi_parser.add_argument('--dataset', default='MALDI_TOF_Partner_Isolates')
-    maldi_parser.add_argument('-o', '--out', required=True)
-
-    partner_workbook_parser = sub.add_parser(
-        'import-partner-workbook',
-        help='Import isolate metadata and MALDI status from a partner .xlsm workbook.',
-        formatter_class=_Fmt,
-    )
-    partner_workbook_parser.add_argument('--db', required=True)
-    partner_workbook_parser.add_argument('--input', required=True,
-        help='Partner .xlsm workbook with a Bulk Upload Template sheet.')
-    partner_workbook_parser.add_argument('--sheet', default='Bulk Upload Template',
-        help='Worksheet containing the partner isolate records.')
-    partner_workbook_parser.add_argument('--dataset', default='PartnerWorkbook',
-        help='Dataset label for newly created markerless isolate records.')
-    partner_workbook_parser.add_argument('-o', '--out', required=True)
-
-    exit_interview_parser = sub.add_parser(
-        'exit-interview',
-        help='Exit Interview: withdraw sequences from active project analyses with an audit trail.',
-        description=(
-            'Preview or apply removal of one or more sequences from the project database. '
-            'Applying an Exit Interview removes active sequence, taxonomy, distance, assessment, '
-            'selection, provenance, status, and metadata records while retaining an immutable '
-            'tombstone. Baseline and genome-backed records are protected by default.'
-        ),
-        formatter_class=_Fmt,
-    )
-    exit_source = exit_interview_parser.add_mutually_exclusive_group(required=True)
-    exit_source.add_argument('--sequence-id', action='append',
-        help='Sequence/isolate ID to remove; repeat for multiple IDs.')
-    exit_source.add_argument('--input',
-        help='CSV/TSV, optionally gzipped, with sequence_id and reason columns.')
-    exit_interview_parser.add_argument('--db', required=True)
-    exit_interview_parser.add_argument('--reason', default='',
-        help='Required reason for direct IDs, or fallback reason for input rows.')
-    exit_interview_parser.add_argument('--apply', action='store_true', default=False,
-        help='Apply the reviewed plan. Without this flag, Exit Interview is preview-only.')
-    exit_interview_parser.add_argument('--allow-baseline', action='store_true', default=False,
-        help='Explicitly allow removal from a registered cultured baseline.')
-    exit_interview_parser.add_argument('--allow-genome-records', action='store_true', default=False,
-        help='Explicitly allow removal of an isolate that has genome evidence.')
-    exit_interview_parser.add_argument('--backup', action=argparse.BooleanOptionalAction, default=True,
-        help='Write project_before_exit_interview.sqlite before applying (default: enabled).')
-    exit_interview_parser.add_argument('-o', '--out', required=True)
-
-    marker_evidence_migrate_parser = sub.add_parser(
-        'marker-evidence-migrate',
-        help='Create/backfill the source-aware marker evidence registry for selection database v1.',
-        formatter_class=_Fmt,
-    )
-    marker_evidence_migrate_parser.add_argument('--db', required=True)
-    marker_evidence_migrate_parser.add_argument('--force', action='store_true', default=False,
-        help='Re-run the legacy backfill. Normally only run once after reviewing the existing records.')
-    marker_evidence_migrate_parser.add_argument('-o', '--out', required=True)
-
-    register_marker_evidence_parser = sub.add_parser(
-        'register-marker-evidence',
-        help='Register additional marker observations (e.g. Barrnap 16S) without replacing the active marker.',
-        formatter_class=_Fmt,
-    )
-    register_marker_evidence_parser.add_argument('--db', required=True)
-    register_marker_evidence_parser.add_argument('--fasta', required=True,
-        help='FASTA of supplemental genomic 16S sequences; first header token maps through metadata fasta_id/genome_id.')
-    register_marker_evidence_parser.add_argument('--metadata', required=True,
-        help='TSV mapping fasta_id/genome_id to an existing BranchManager sequence_id, source/tier, and genome/16S taxonomy evidence.')
-    register_marker_evidence_parser.add_argument('--source-type', default='GENOME_BARRNAP',
-        choices=['GENOME_BARRNAP'])
-    register_marker_evidence_parser.add_argument('--evidence-tier', default='MODERATE', choices=['MODERATE', 'LOW'])
-    register_marker_evidence_parser.add_argument('-o', '--out', required=True)
-
-    annual_report_parser = sub.add_parser(
-        'annual-report',
-        help='Annual Report: create a point-in-time project overview, ledgers, and decision-change report.',
-        formatter_class=_Fmt,
-    )
-    annual_report_parser.add_argument('--db', required=True)
-    annual_report_parser.add_argument('-o', '--out', required=True)
-
-    it_desk_parser = sub.add_parser(
-        'it-desk',
-        help='IT Desk: check dependencies, references, database integrity, and output location.',
-        formatter_class=_Fmt,
-    )
-    it_desk_parser.add_argument('--db', default=None)
-    it_desk_parser.add_argument('--ref', dest='references', action='append', default=[])
-    it_desk_parser.add_argument('--tree-method', choices=['fasttree', 'iqtree', 'iqtree-fast'], default='fasttree')
-    it_desk_parser.add_argument('-o', '--out', default='branchmanager_it_desk')
-    it_desk_parser.add_argument('--strict', action='store_true', default=False,
-        help='Return a non-zero exit status when any required check fails.')
-
-    assistant_parser = sub.add_parser(
-        'assistant',
-        help='Assistant to the Branch Manager: run Onboarding through the Hiring Panel.',
-        formatter_class=_Fmt,
-    )
-    add_project_config_option(assistant_parser)
-    # Config profiles may provide a per-run input path through data.sample_map
-    # (or assistant defaults), so enforce presence after config defaults load.
-    assistant_input = assistant_parser.add_mutually_exclusive_group(required=False)
-    assistant_input.add_argument('--sample-map', help='AB1/primer-read sample map; runs Paper Trail and Merge Meeting.')
-    assistant_input.add_argument('--fasta', help='Partner-supplied marker FASTA; bypasses Paper Trail and Merge Meeting.')
-    assistant_input.add_argument('--pacbio-map', help='One segmented PacBio HiFi FASTQ per isolate; clusters reads then continues as partner-sequenced markers.')
-    assistant_input.add_argument('--cohort-manifest',
-        help='CSV/TSV listing partner_id, dataset, sample_map, and optional read_dir/partner_workbook for a joint multi-partner assessment.')
-    assistant_parser.add_argument('--partner-metadata', required=True)
-    assistant_parser.add_argument('--partner-id', default=None,
-        help='Expected partner acronym for validation, for example QUB or UoG.')
-    assistant_parser.add_argument('--marker-source-type',
-        choices=['auto', 'SANGER_AB1', 'PARTNER_FASTA', 'PACBIO_HIFI', 'MIXED'], default='auto',
-        help='Evidence provenance for the marker imported by Assistant (default: infer from input mode).')
-    assistant_parser.add_argument('--read-dir', default=None)
-    assistant_parser.add_argument('--db', required=True)
-    assistant_parser.add_argument('--dataset', required=True)
-    assistant_parser.add_argument('--ref', required=True)
-    assistant_parser.add_argument('--taxa', default=None)
-    assistant_parser.add_argument('--ref-name', default='GTDB')
-    assistant_parser.add_argument('--alt-ref', action='append', default=[])
-    assistant_parser.add_argument('--alt-taxa', action='append', default=[])
-    assistant_parser.add_argument('--alt-ref-name', action='append', default=[])
-    assistant_parser.add_argument('--baseline-fasta', default=None)
-    assistant_parser.add_argument('--baseline-dataset', default='Baseline')
-    assistant_parser.add_argument('--baseline-tier', choices=['priority', 'secondary'], default=None)
-    assistant_parser.add_argument('--baseline-taxa-assignments', default=None)
-    assistant_parser.add_argument('--anchors', default=None,
-        help='Custom reference anchor FASTA for tree scaffolding. By default uses the bundled 26-sequence rumen/gut anchor set; configure this option to use a collection-specific set.')
-    assistant_parser.add_argument('--mwl', default=None)
-    assistant_parser.add_argument('--sequence-domain', choices=SEQUENCE_DOMAIN_CHOICES, default='bacteria')
-    assistant_parser.add_argument('--threads', type=int, default=4,
-        help='CPU threads for vsearch and MAFFT (default: 4).')
-    assistant_parser.add_argument('--tree-method', choices=['fasttree', 'iqtree', 'iqtree-fast'], default='fasttree')
-    assistant_parser.add_argument('--pangenome-target', type=int, default=selection_target)
-    assistant_parser.add_argument('--candidate-set-size', type=int, default=selection_panel_size)
-    assistant_parser.add_argument('--baseline-redundancy-identity', type=float, default=baseline_redundancy_identity)
-    assistant_parser.add_argument('--baseline-redundancy-min-query-coverage', type=float, default=baseline_redundancy_coverage)
-    assistant_parser.add_argument('--baseline-extension-min-identity', type=float, default=baseline_extension_identity)
-    assistant_parser.add_argument('--baseline-extension-min-query-coverage', type=float, default=baseline_extension_coverage)
-    assistant_parser.add_argument('--primer', dest='primers', action='append', default=None)
-    assistant_parser.add_argument('--primer-sequence', dest='primer_sequences', action='append', default=None,
-        metavar='NAME=SEQUENCE', help='Primer sequence used for IUPAC-aware trimming; repeatable.')
-    assistant_parser.add_argument('--trim-primers', dest='trim_primers',
-        action=argparse.BooleanOptionalAction, default=True)
-    assistant_parser.add_argument('--min-quality', type=int, default=paper_trail_policy.min_quality,
-        help='Phred cutoff for Mott-style end trimming (default: 20).')
-    assistant_parser.add_argument('--min-marker-length', dest='min_length', type=int, default=paper_trail_policy.min_final_length,
-        help='Minimum final assembled sequence length in bp (default: 800).')
-    assistant_parser.add_argument('--min-read-length', type=int, default=paper_trail_policy.min_read_length,
-        help='Minimum trimmed primer-read length allowed to contribute to an assembly (default: 300 bp).')
-    assistant_parser.add_argument('--min-mean-quality', type=float, default=paper_trail_policy.min_mean_quality,
-        help='Minimum mean Phred quality after trimming (default: 20.0).')
-    assistant_parser.add_argument('--mask-quality', type=int, default=paper_trail_policy.mask_quality,
-        help='Mask internal bases below this Phred score to N (default: 20).')
-    assistant_parser.add_argument('--max-read-expected-errors', type=float, default=paper_trail_policy.max_read_expected_errors,
-        help='Maximum expected errors per retained read (default: 8.0).')
-    assistant_parser.add_argument('--max-output-expected-errors', type=float, default=paper_trail_policy.max_output_expected_errors,
-        help='Maximum expected errors in the final assembled sequence (default: 5.0).')
-    assistant_parser.add_argument('--warn-n-percent', type=float, default=paper_trail_policy.warn_n_percent,
-        help='Percent N above which a passing sequence requires manual review (default: 3.0).')
-    assistant_parser.add_argument('--max-n-percent', type=float, default=paper_trail_policy.max_n_percent,
-        help='Maximum percent N bases allowed after masking before QC failure (default: 5.0).')
-    assistant_parser.add_argument('--warn-internal-lowq-run', dest='warn_internal_low_quality_run', type=int, default=paper_trail_policy.warn_internal_low_quality_run,
-        help='Internal low-quality run length above which manual review is required (default: 5 bp).')
-    assistant_parser.add_argument('--max-internal-lowq-run', dest='max_internal_low_quality_run', type=int, default=paper_trail_policy.max_internal_low_quality_run,
-        help='Maximum internal low-quality/ambiguous run before QC failure (default: 20 bp).')
-    assistant_parser.add_argument('--secondary-peak-ratio', type=float, default=paper_trail_policy.secondary_peak_ratio,
-        help='Secondary/called peak ratio threshold for mixed-base detection (default: 0.33).')
-    assistant_parser.add_argument('--max-mixed-peak-percent', type=float, default=paper_trail_policy.max_mixed_peak_percent,
-        help='Maximum percent mixed-peak positions before read QC failure (default: 15.0).')
-    assistant_parser.add_argument('--mixed-peak-min-quality', dest='mixed_peak_min_quality', type=int, default=paper_trail_policy.mixed_peak_min_quality,
-        help='Minimum Phred score for a mixed-peak position to count (default: 20).')
-    assistant_parser.add_argument('--max-conflict-density', type=float, default=paper_trail_policy.max_conflict_density,
-        help='Maximum overlap conflicts per 100 final bases before QC failure (default: 1.0).')
-    assistant_parser.add_argument('--max-ambiguous-overlap-conflicts-without-review', type=int, default=paper_trail_policy.max_ambiguous_overlap_conflicts_without_review,
-        help='Unresolved overlap conflicts tolerated as N before manual review is required (default: 2).')
-    assistant_parser.add_argument('--quality-difference', type=int, default=paper_trail_policy.quality_difference,
-        help='Phred-scaled posterior odds required to resolve an overlap conflict (default: 10).')
-    assistant_parser.add_argument('--allow-missing-quality', action='store_true', default=False,
-        help='Allow traces missing PCON quality scores to pass with warnings.')
-    assistant_parser.add_argument('--max-report-image-height', type=int, default=2400,
-        help='Maximum Paper Trail visual-report PNG height before automatic pagination (minimum: 600, default: 2400).')
-    assistant_parser.add_argument('--min-overlap', type=int, default=paper_trail_policy.min_overlap)
-    assistant_parser.add_argument('--min-overlap-identity', type=float, default=paper_trail_policy.min_overlap_identity)
-    assistant_parser.add_argument('--chimera-ref', default=None,
-        help='Curated reference FASTA for UCHIME; defaults to the primary reference.')
-    assistant_parser.add_argument('--skip-chimera-check', action='store_true', default=False,
-        help='Audited override: continue with all markers marked for review.')
-    assistant_parser.add_argument('--marker-qc', default=None,
-        help='Marker-QC sidecar for --fasta submissions, such as a reviewed assembly_report.tsv.')
-    assistant_parser.add_argument('--marker-review', default=None,
-        help='CSV/TSV decisions for PASS_WITH_WARNINGS markers, with sequence_id, decision, reviewer, and optional notes.')
-    assistant_parser.add_argument('--accept-unverified-marker-qc', action='store_true', default=False,
-        help='Audited acceptance of a partner FASTA without BranchManager marker-QC provenance.')
-    assistant_parser.add_argument('--pacbio-min-read-length', type=int, default=1000)
-    assistant_parser.add_argument('--pacbio-max-read-length', type=int, default=2000)
-    assistant_parser.add_argument('--pacbio-min-mean-quality', type=float, default=20.0)
-    assistant_parser.add_argument('--pacbio-cluster-identity', type=float, default=0.995)
-    assistant_parser.add_argument('--pacbio-min-reads', type=int, default=20)
-    assistant_parser.add_argument('--pacbio-min-dominant-fraction', type=float, default=0.80)
-    assistant_parser.add_argument('--pacbio-threads', type=int, default=1)
-    assistant_parser.add_argument('--pacbio-vsearch-strand', choices=['plus', 'both'], default='plus')
-    assistant_parser.add_argument('--pacbio-vsearch-query-cov', type=float, default=0.0)
-    assistant_parser.add_argument('--pacbio-vsearch-maxaccepts', type=int, default=0)
-    assistant_parser.add_argument('--pacbio-vsearch-maxrejects', type=int, default=0)
-    assistant_parser.add_argument('--pacbio-library-prep', default='Kinnex 16S rRNA Kit')
-    assistant_parser.add_argument('-o', '--out', required=True)
-
-    background_check_parser = sub.add_parser(
-        'background-check',
-        help='Background Check: pre-classify reference collections for reuse.',
-        description=(
-            'Classify one or more reference FASTA collections against a reference database\n'
-            'using vsearch and save the results so the main pipeline can reuse them without\n'
-            're-classifying on every run.\n\n'
-            'Known dataset names (use with --dataset NAME=FASTA):\n'
-            '  hungate16s / hungate   Hungate1000 curated rumen 16S sequences\n'
-            '  silva                  SILVA ribosomal RNA database\n'
-            '  rdp                    Ribosomal Database Project\n'
-            '  homd                   Human Oral Microbiome Database\n'
-            '  greengenes2 / gg2      GreenGenes2 16S reference\n'
-            '  ncbi16s                NCBI 16S rRNA RefSeq collection\n'
-            '  gtdb                   GTDB 16S representative sequences\n'
-            '  (any other name)       Treated as a custom dataset\n\n'
-            'Outputs written to --out:\n'
-            '  {name}_classification.tsv   Full classification (human-readable)\n'
-            '  {name}_taxonomy.tsv         Condensed per-dataset taxonomy\n'
-            '  {name}_taxonomic_disagreement.tsv  High-quality hits with conflicting taxa\n'
-            '  combined_taxonomy.tsv       All datasets merged (with Dataset column)\n'
-            '  pipeline_taxonomy.tsv       All datasets merged; pass to --taxa-assignments\n'
-            '  background_check_summary.txt  Plain-text summary with usage examples\n\n'
-            'Example:\n'
-            '  branchmanager background-check \\\n'
-            '    --dataset hungate16s=/data/hungate.fasta \\\n'
-            '    --dataset silva=/data/silva_16s.fasta \\\n'
-            '    --ref /data/gtdb_ssu_reps.fna \\\n'
-            '    --taxa /data/gtdb_taxonomy.tsv.gz \\\n'
-            '    --threads 8 -o background_check_out/\n\n'
-            'Then use the output in the Filing Cabinet:\n'
-            '  branchmanager filing-cabinet --fasta hungate.fasta \\\n'
-            '    --taxa-assignments background_check_out/pipeline_taxonomy.tsv \\\n'
-            '    --db project.db --dataset Hungate -o filing_cabinet_out/'
-        ),
-        formatter_class=_Fmt,
-    )
-    background_check_parser.add_argument(
-        '--dataset', dest='datasets', nargs='+', metavar='NAME FASTA',
-        required=True,
-        help=(
-            'One or more NAME FASTA pairs, e.g.: '
-            '--dataset Hungate /data/hun.fasta QUB /data/qub.fasta. '
-            'Alternatively use NAME=FASTA pairs (repeatable): '
-            '--dataset Hungate=/data/hun.fasta --dataset QUB=/data/qub.fasta. '
-            'Known names: hungate16s, silva, rdp, homd, greengenes2, ncbi16s, gtdb. '
-            'Any other name is treated as a custom dataset.'
-        ),
-    )
-    background_check_parser.add_argument(
-        '--ref', required=True,
-        help='Reference FASTA (e.g. GTDB/SILVA reps) used by vsearch for classification.',
-    )
-    background_check_parser.add_argument(
-        '--taxa', required=False, default=None,
-        help='Taxonomy table matching IDs in --ref (TSV/CSV, optionally .gz: id<TAB>lineage or id,lineage). '
-             'If omitted, taxonomy is parsed directly from reference FASTA headers.',
-    )
-    background_check_parser.add_argument(
-        '-o', '--out', required=True,
-        help='Output directory where all classification files will be written.',
-    )
-    background_check_parser.add_argument(
-        '--threads', type=int, default=4,
-        help='CPU threads for vsearch (default: 4).',
-    )
-    background_check_parser.add_argument(
-        '--min-identity', dest='min_identity', type=float, default=0.80,
-        help='Minimum vsearch alignment identity threshold 0–1 (default: 0.80 = 80%%).',
-    )
-    background_check_parser.add_argument(
-        '--max-hits', dest='max_hits', type=int, default=10,
-        help=(
-            'Number of candidate hits vsearch collects per query '
-            '(--maxaccepts / --maxhits).  The best hit by %% identity is '
-            'selected after collection.  Higher values are more thorough but '
-            'slower (default: 10).'
-        ),
-    )
-    background_check_parser.add_argument(
-        '--max-rejects', dest='max_rejects', type=int, default=256,
-        help=(
-            'vsearch --maxrejects: maximum number of non-matching candidate '
-            'sequences examined before giving up on a query.  Raising this '
-            'above vsearch\'s default of 32 helps classify ambiguous sequences '
-            '(e.g. those with many N\'s) (default: 256).'
-        ),
-    )
-    background_check_parser.add_argument(
-        '--low-confidence-threshold', dest='low_confidence_threshold',
-        type=float, default=0.97,
-        help=(
-            'Identity threshold below which a classified hit is flagged as low-confidence '
-            'and written to *_low_confidence.tsv for manual review. '
-            '0–1 (default: 0.97 = 97%%, the traditional species-level cutoff).'
-        ),
-    )
-
-    return parser
-
+# build_parser() moved to branchmanager.cli.parser (1,217 lines extracted)
+# Imported at top of file.
 
 def cmd_background_check(args):
     """Run the reusable Background Check classification workflow."""
@@ -5691,6 +4895,7 @@ def cmd_paper_trail(args):
             mixed_peak_min_quality=int(setting('mixed_peak_min_quality', policy.mixed_peak_min_quality)),
             screen_ref=getattr(args, 'screen_ref', None),
             screen_taxa=getattr(args, 'screen_taxa', None),
+            selected_read_ids=getattr(args, 'selected_read_ids', None),
             threads=int(setting('threads', 4)),
             min_quality=int(setting('min_quality', policy.min_quality)),
             min_length=int(setting('min_length', policy.min_final_length)),
@@ -6276,6 +5481,7 @@ def cmd_import_partner_workbook(args):
     import sqlite3
     from branchmanager.project_state import (
         import_partner_workbook, write_partner_workbook_import_report,
+        import_genome_only_partner_workbook, write_genome_only_partner_import_report,
     )
 
     root = Path(args.out).expanduser().resolve()
@@ -6294,24 +5500,40 @@ def cmd_import_partner_workbook(args):
                 source.backup(target)
             db = Database(str(staged))
             db.initialise()
-            results = import_partner_workbook(
-                db, args.input, sheet_name=args.sheet, dataset=args.dataset,
-            )
-            report = write_partner_workbook_import_report(
-                root / 'partner_workbook_import_report.tsv', results,
-            )
+            if args.genome_only:
+                results = import_genome_only_partner_workbook(
+                    db, args.input, sheet_name=args.sheet, dataset=args.dataset,
+                )
+                report = write_genome_only_partner_import_report(
+                    root / 'genome_only_partner_import_report.tsv', results,
+                )
+                inserted = sum(row.get('result') == 'INSERTED' for row in results)
+                conflicts = sum(row.get('result') == 'CONFLICT' for row in results)
+                rejected = sum(row.get('result') == 'REJECTED' for row in results)
+                mode_label = 'genome-only partner registration'
+                detail = (f'{len(results)} workbook row(s); {inserted} new isolate(s); '
+                          f'{conflicts} conflict(s); {rejected} rejected')
+            else:
+                results = import_partner_workbook(
+                    db, args.input, sheet_name=args.sheet, dataset=args.dataset,
+                )
+                report = write_partner_workbook_import_report(
+                    root / 'partner_workbook_import_report.tsv', results,
+                )
+                inserted = sum(row.get('metadata_result') == 'INSERTED_ISOLATE' for row in results)
+                maldi_imported = sum(row.get('maldi_result') == 'SOFT_TAXON_CONTEXT_IMPORTED' for row in results)
+                needs_review = sum(row.get('maldi_result') in {
+                    'MALDI_RESULT_NEEDS_REVIEW', 'MALDI_SELECTED_NO_RESULT',
+                    'MALDI_FIELDS_WITHOUT_SELECTION',
+                } for row in results)
+                conflicts = 0
+                rejected = 0
+                mode_label = 'partner workbook import'
+                detail = (f'{len(results)} isolate rows; {inserted} inserted; '
+                          f'{maldi_imported} MALDI context records; {needs_review} MALDI row(s) need review')
             manifest.add_output(report, role='partner_workbook_import_report')
-            inserted = sum(row.get('metadata_result') == 'INSERTED_ISOLATE' for row in results)
-            maldi_imported = sum(row.get('maldi_result') == 'SOFT_TAXON_CONTEXT_IMPORTED' for row in results)
-            needs_review = sum(row.get('maldi_result') in {
-                'MALDI_RESULT_NEEDS_REVIEW', 'MALDI_SELECTED_NO_RESULT',
-                'MALDI_FIELDS_WITHOUT_SELECTION',
-            } for row in results)
-            status = 'COMPLETE_WITH_WARNINGS' if needs_review else 'COMPLETE'
-            manifest.add_stage(
-                'partner_workbook_import', status,
-                detail=f'{len(results)} isolate rows; {inserted} inserted; {maldi_imported} MALDI context records; {needs_review} MALDI row(s) need review',
-            )
+            status = 'COMPLETE_WITH_WARNINGS' if conflicts or rejected or (not args.genome_only and needs_review) else 'COMPLETE'
+            manifest.add_stage(mode_label, status, detail=detail)
             manifest.finish(status)
             db.record_project_run(
                 f'partner-workbook-import:{manifest.data["started_at"]}',
@@ -6333,11 +5555,17 @@ def cmd_import_partner_workbook(args):
             raise
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-    print(
-        f'[partner-workbook] {len(results)} isolate row(s); {inserted} inserted; '
-        f'{maldi_imported} soft MALDI context record(s); {needs_review} need review.\n'
-        f'  Report: {report}'
-    )
+    if args.genome_only:
+        print(
+            f'[partner-workbook] {len(results)} row(s); {inserted} new genome-only isolate(s); '
+            f'{conflicts} conflict(s); {rejected} rejected.\n  Report: {report}'
+        )
+    else:
+        print(
+            f'[partner-workbook] {len(results)} isolate row(s); {inserted} inserted; '
+            f'{maldi_imported} soft MALDI context record(s); {needs_review} need review.\n'
+            f'  Report: {report}'
+        )
 
 
 def cmd_exit_interview(args):
@@ -6471,20 +5699,196 @@ def cmd_exit_interview(args):
 
 
 def cmd_marker_evidence_migrate(args):
-    """Create the v1 marker-evidence registry and conservatively backfill legacy rows."""
-    from branchmanager.marker_evidence import ensure_marker_evidence_schema, backfill_legacy_marker_evidence
+    """Create the v1 marker-evidence registry, conservatively backfill legacy rows, and report."""
+    import json
+    import shutil
+    from branchmanager.marker_evidence import (
+        ensure_marker_evidence_schema, backfill_legacy_marker_evidence,
+        sync_registry_with_sequences, marker_evidence_migration_report,
+    )
+    source = Path(args.db).expanduser().resolve()
+    output = Path(args.out).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    if source.is_file():
+        backup = output / (source.name + '.pre_marker_evidence_migration.bak')
+        if not backup.exists():
+            shutil.copy2(source, backup)
     db = Database(args.db)
     db.initialise()
     ensure_marker_evidence_schema(db)
     counts = backfill_legacy_marker_evidence(db, force=bool(args.force))
-    output = Path(args.out).expanduser().resolve()
-    output.mkdir(parents=True, exist_ok=True)
+    counts['synced_from_sequences'] = sync_registry_with_sequences(db)
     report = output / 'marker_evidence_backfill.tsv'
     with open(report, 'w') as handle:
         handle.write('Category\tCount\n')
         for key, value in counts.items():
             handle.write(f'{key}\t{value}\n')
+    summary = marker_evidence_migration_report(db)
+    (output / 'marker_evidence_migration_report.json').write_text(json.dumps(summary, indent=2, sort_keys=True, default=str))
+    with open(output / 'marker_evidence_migration_report.tsv', 'w') as handle:
+        handle.write('Category\tCount\n')
+        for key, value in summary.items():
+            if isinstance(value, dict):
+                for k2, v2 in value.items():
+                    handle.write(f'{key}:{k2}\t{v2}\n')
+            else:
+                handle.write(f'{key}\t{value}\n')
     print(f'[marker-evidence-migrate] Evidence registry ready. Report: {report}')
+
+
+def _run_on_staged_database(args, label, work):
+    """Run ``work(db, root, manifest)`` on a staged DB copy; publish only after integrity_check."""
+    import fcntl
+    import sqlite3
+
+    root = Path(args.out).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    original = Path(args.db).expanduser().resolve()
+    if not original.is_file():
+        raise SystemExit(f'[{label}] Project database does not exist: {original}')
+    manifest = RunManifest(root, label.replace('-', '_'))
+    staged = root / f'.{label}_project.sqlite'
+    with open(original.with_name(original.name + '.lock'), 'a+') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            staged.unlink(missing_ok=True)
+            with sqlite3.connect(str(original)) as src, sqlite3.connect(str(staged)) as dst:
+                src.backup(dst)
+            db = Database(str(staged))
+            db.initialise()
+            result = work(db, root, manifest)
+            with sqlite3.connect(str(staged)) as conn:
+                check = conn.execute('PRAGMA integrity_check').fetchone()[0]
+            if check != 'ok':
+                raise RuntimeError(f'Staged database failed integrity_check: {check}')
+            if not getattr(args, 'dry_run', False):
+                publish = original.with_name(original.name + '.publishing')
+                publish.unlink(missing_ok=True)
+                with sqlite3.connect(str(staged)) as src, sqlite3.connect(str(publish)) as dst:
+                    src.backup(dst)
+                os.replace(publish, original)
+            staged.unlink(missing_ok=True)
+            manifest.finish('COMPLETE')
+            return result
+        except BaseException as exc:
+            manifest.finish('FAILED', error=exc)
+            raise
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def cmd_import_genome_results(args):
+    from branchmanager.genome_evidence_import import import_precomputed_genome_results
+
+    def work(db, root, manifest):
+        manifest.add_input(args.results_tsv, role='precomputed_genome_results')
+        result = import_precomputed_genome_results(
+            db, args.results_tsv, dry_run=args.dry_run,
+        )
+        report_path = root / 'genome_results_import_summary.json'
+        report_path.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
+        manifest.add_output(report_path, role='genome_results_import_summary')
+        manifest.add_stage(
+            'precomputed_genome_results_import', 'COMPLETE',
+            detail=f"{result['records']} genome record(s) imported across {len(result['datasets'])} dataset(s)",
+        )
+        return result
+
+    result = _run_on_staged_database(args, 'import-genome-results', work)
+    print(json.dumps(result, indent=2))
+
+
+def cmd_import_genome_evidence(args):
+    from branchmanager.genome_evidence_import import (
+        import_partner_genome_evidence, write_genome_evidence_report,
+    )
+
+    def work(db, root, manifest):
+        for path, role in (
+            (args.workbook, 'partner_workbook'),
+            (args.gtdbtk, 'gtdbtk_summary'), (args.checkm2, 'checkm2_quality_report'),
+        ):
+            manifest.add_input(path, role=role)
+        genome_dir = Path(args.genome_dir).expanduser().resolve()
+        for fasta in sorted(genome_dir.iterdir()):
+            if fasta.is_file() and re.search(r'\.(?:fa|fna|fasta)(?:\.gz)?$', fasta.name, re.I):
+                manifest.add_input(fasta, role='genome_fasta')
+        rows = import_partner_genome_evidence(
+            db, workbook=args.workbook, genome_dir=args.genome_dir,
+            gtdbtk=args.gtdbtk, checkm2=args.checkm2, dataset=args.dataset,
+            sheet_name=args.sheet, min_completeness=args.min_completeness,
+            max_contamination=args.max_contamination,
+            gtdbtk_version=args.gtdbtk_version, checkm2_version=args.checkm2_version,
+            dry_run=args.dry_run,
+        )
+        report = write_genome_evidence_report(root / 'genome_evidence_import_report.tsv', rows)
+        manifest.add_output(report, role='genome_evidence_import_report')
+        imported = sum(r.get('result') in {'IMPORTED', 'DRY_RUN_READY'} for r in rows)
+        incomplete = sum(r.get('result') == 'INCOMPLETE' for r in rows)
+        manifest.add_stage('partner_genome_evidence_import', 'COMPLETE_WITH_WARNINGS' if incomplete else 'COMPLETE',
+                           detail=f'{imported} genome(s) ready/imported; {incomplete} incomplete')
+        return rows
+
+    rows = _run_on_staged_database(args, 'import-genome-evidence', work)
+    imported = sum(r.get('result') in {'IMPORTED', 'DRY_RUN_READY'} for r in rows)
+    incomplete = sum(r.get('result') == 'INCOMPLETE' for r in rows)
+    print(f'[import-genome-evidence] {imported} genome(s) ready/imported; {incomplete} incomplete. '
+          f"Report: {Path(args.out).expanduser().resolve() / 'genome_evidence_import_report.tsv'}")
+
+
+def cmd_import_genome_16s(args):
+    from branchmanager.genome_16s_import import import_genome_16s
+
+    def work(db, root, manifest):
+        gdir = Path(args.genomic_dir).expanduser().resolve()
+        for name in ('genome_16s_summary.tsv', 'best_16s_per_genome.fna', 'run_manifest.json'):
+            if (gdir / name).is_file():
+                manifest.add_input(gdir / name, role=f'genomic_16s:{name}')
+        gm = gdir / 'run_manifest.json'
+        if gm.is_file():
+            try:
+                gdata = json.loads(gm.read_text())
+                manifest.set_reference_identity(
+                    genomic_16s_manifest=str(gm),
+                    reference=json.dumps({k: v for k, v in gdata.items() if 'sha256' in k.lower() or 'reference' in k.lower() or 'gtdb' in k.lower()}, default=str)[:2000],
+                )
+            except (OSError, ValueError):
+                pass
+        if args.genome_metadata:
+            manifest.add_input(args.genome_metadata, role='genome_metadata')
+        return import_genome_16s(
+            db, gdir, root, genome_metadata=args.genome_metadata,
+            dataset=args.dataset, partner_id=args.partner_id,
+            genome_id_isolate_id=args.genome_id_isolate_id,
+        )
+
+    results = _run_on_staged_database(args, 'import-genome-16s', work)
+    warnings = sum(bool(r.get('warning')) for r in results)
+    print(f'[import-genome-16s] {len(results)} genome(s) processed; {warnings} GTDB-Tk/16S disagreement warning(s).')
+
+
+def cmd_marker_review_apply(args):
+    from branchmanager.marker_evidence import apply_marker_review_decisions
+
+    def work(db, root, manifest):
+        manifest.add_input(args.decisions, role='marker_review_decisions')
+        results = apply_marker_review_decisions(db, args.decisions, dry_run=bool(args.dry_run))
+        with open(root / 'marker_review_apply_report.tsv', 'w', newline='') as handle:
+            fields = sorted({k for r in results for k in r}) or ['sequence_id', 'result']
+            writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(results)
+        errors = [r for r in results if r.get('result') == 'ERROR']
+        if errors:
+            raise SystemExit(
+                f'[marker-review-apply] {len(errors)} invalid decision row(s); nothing was applied. '
+                f'See {root / "marker_review_apply_report.tsv"}'
+            )
+        return results
+
+    results = _run_on_staged_database(args, 'marker-review-apply', work)
+    applied = sum(r.get('result') == 'APPLIED' for r in results)
+    print(f'[marker-review-apply] {applied} decision(s) applied of {len(results)} row(s).')
 
 
 def cmd_register_marker_evidence(args):
@@ -6549,17 +5953,58 @@ def cmd_it_desk(args):
         raise SystemExit(2)
 
 
+_COHORT_INPUT_TYPES = {'sanger', 'partner_fasta', 'pacbio_hifi', 'genome_16s'}
+_COHORT_INPUT_ALIASES = {
+    'sanger_ab1': 'sanger', 'ab1': 'sanger', 'fasta': 'partner_fasta', 'marker_fasta': 'partner_fasta',
+    'pacbio': 'pacbio_hifi', 'genome': 'genome_16s', 'genomic_16s': 'genome_16s',
+    'barrnap': 'genome_16s', 'genome_barrnap': 'genome_16s',
+}
+_COHORT_MARKER_SOURCE = {'sanger': 'SANGER_AB1', 'partner_fasta': 'PARTNER_FASTA', 'pacbio_hifi': 'PACBIO_HIFI'}
+_COHORT_REVIEW_FIELDS = [
+    'sequence_id', 'decision', 'reviewer', 'reviewed_at', 'notes', 'review_type',
+    'eligible_for_manual_acceptance', 'candidate_fasta', 'candidate_source',
+    'candidate_read_id', 'candidate_length', 'candidate_n_percent', 'qc_class', 'qc_reasons',
+    'taxonomy_concordance', 'read_taxonomy_assignments', 'output_length', 'n_percent',
+    'read_level_evidence', 'quality_status', 'manual_acceptance_basis', 'manual_acceptance_reason',
+    'minimum_acceptable_length', 'length_deficit_bp', 'allowed_decisions',
+    'fallback_read_options', 'recommended_read_id', 'selected_read_id',
+    'read_selection_source', 'fallback_reason', 'processing_mode', 'assembly_status', 'output_type',
+    'partner_id', 'dataset', 'marker_source_type',
+]
+_COHORT_ALLOWED = {
+    'WARNING_REVIEW': 'APPROVE|REJECT|RESEQUENCE',
+    'FAILED_QC_REVIEW': 'APPROVE_FAIL_QC|REJECT|RESEQUENCE',
+    'UNVERIFIED_QC_REVIEW': 'APPROVE_UNVERIFIED|REJECT|RESEQUENCE',
+}
+_COHORT_STATE_NAME = 'cohort_prepare_state.json'
+# Bump this when review-template inclusion rules change; it invalidates cached Paper Trail output.
+_COHORT_REVIEW_TEMPLATE_POLICY_VERSION = '10_consistent_read_selection_and_output_provenance'
+
+
 def _read_assistant_cohort_manifest(path: str | Path) -> list[dict[str, str]]:
+    """Read a typed cohort manifest; relative paths resolve against the manifest directory."""
     manifest_path = Path(path).expanduser().resolve()
     with open(manifest_path, newline='') as handle:
         sample = handle.read(4096)
         handle.seek(0)
-        delimiter = '\t' if manifest_path.suffix.lower() in {'.tsv', '.txt'} else ','
-        try:
-            delimiter = csv.Sniffer().sniff(sample, delimiters=',\t').delimiter
-        except Exception:
-            pass
+        suffix = manifest_path.suffix.lower()
+        if suffix in {'.tsv', '.txt'}:
+            delimiter = '\t'
+        elif suffix == '.csv':
+            delimiter = ','
+        else:
+            try:
+                delimiter = csv.Sniffer().sniff(sample, delimiters=',\t').delimiter
+            except csv.Error:
+                delimiter = '\t'
         raw_rows = list(csv.DictReader(handle, delimiter=delimiter))
+
+    def resolve(value: str) -> str:
+        if not value:
+            return ''
+        candidate = Path(value).expanduser()
+        return str((candidate if candidate.is_absolute() else manifest_path.parent / candidate).resolve())
+
     rows = []
     seen_datasets = set()
     for line_number, raw in enumerate(raw_rows, start=2):
@@ -6568,14 +6013,38 @@ def _read_assistant_cohort_manifest(path: str | Path) -> list[dict[str, str]]:
                 str(value or '').strip()
             for key, value in raw.items() if key is not None
         }
+        if not any(row.values()):
+            continue
         partner = row.get('partner_id') or row.get('partner') or row.get('partner_acronym')
         dataset = row.get('dataset') or row.get('batch_id')
         sample_map = row.get('sample_map') or row.get('ab1_map') or row.get('mailroom_map')
-        if not any(row.values()):
-            continue
-        missing = [name for name, value in (
-            ('partner_id', partner), ('dataset', dataset), ('sample_map', sample_map),
-        ) if not value]
+        marker_fasta = row.get('marker_fasta') or row.get('fasta')
+        genome_dir = row.get('genome_dir') or row.get('genomic_16s_dir')
+        maldi_file = row.get('maldi_file') or row.get('maldi')
+        input_type = (row.get('input_type') or '').lower().replace('-', '_')
+        input_type = _COHORT_INPUT_ALIASES.get(input_type, input_type)
+        if not input_type:
+            input_type = (
+                'sanger' if sample_map else 'partner_fasta' if marker_fasta
+                else 'genome_16s' if genome_dir else ('maldi_only' if maldi_file else '')
+            )
+        missing = [name for name, value in (('partner_id', partner), ('dataset', dataset)) if not value]
+        if input_type and input_type not in _COHORT_INPUT_TYPES | {'maldi_only'}:
+            raise ValueError(
+                f'Cohort manifest row {line_number} has unsupported input_type {input_type!r}; '
+                f'use one of {", ".join(sorted(_COHORT_INPUT_TYPES))}'
+            )
+        required = {
+            'sanger': ('sample_map', sample_map), 'partner_fasta': ('marker_fasta', marker_fasta),
+            'pacbio_hifi': ('marker_fasta', marker_fasta), 'genome_16s': ('genome_dir', genome_dir),
+            'maldi_only': ('maldi_file', maldi_file),
+        }
+        if not input_type:
+            missing.append('input_type (or a sample_map/marker_fasta/genome_dir/maldi_file)')
+        else:
+            name, value = required[input_type]
+            if not value:
+                missing.append(f'{name} (required for input_type {input_type})')
         if missing:
             raise ValueError(
                 f'Cohort manifest row {line_number} is missing required field(s): {", ".join(missing)}'
@@ -6583,24 +6052,27 @@ def _read_assistant_cohort_manifest(path: str | Path) -> list[dict[str, str]]:
         if dataset.casefold() in seen_datasets:
             raise ValueError(f'Cohort manifest repeats dataset {dataset!r} on row {line_number}')
         seen_datasets.add(dataset.casefold())
-        rows.append({
-            'partner_id': partner,
-            'dataset': dataset,
-            'sample_map': str(Path(sample_map).expanduser().resolve()
-                              if Path(sample_map).expanduser().is_absolute()
-                              else (manifest_path.parent / sample_map).resolve()),
-            'read_dir': str(
-                (manifest_path.parent / row.get('read_dir')).resolve()
-                if row.get('read_dir') and not Path(row.get('read_dir')).expanduser().is_absolute()
-                else Path(row.get('read_dir')).expanduser().resolve()
-            ) if row.get('read_dir') else '',
-            'partner_workbook': str(
-                (manifest_path.parent / (row.get('partner_workbook') or row.get('metadata_workbook'))).resolve()
-                if not Path(row.get('partner_workbook') or row.get('metadata_workbook')).expanduser().is_absolute()
-                else Path(row.get('partner_workbook') or row.get('metadata_workbook')).expanduser().resolve()
-            ) if (row.get('partner_workbook') or row.get('metadata_workbook')) else '',
+        workbook = row.get('partner_workbook') or row.get('metadata_workbook')
+        entry = {
+            'partner_id': partner, 'dataset': dataset, 'input_type': input_type,
+            'sample_map': resolve(sample_map) if input_type == 'sanger' else '',
+            'read_dir': resolve(row.get('read_dir')) if input_type == 'sanger' else '',
+            'marker_fasta': resolve(marker_fasta) if input_type in {'partner_fasta', 'pacbio_hifi'} else '',
+            'marker_qc': resolve(row.get('marker_qc')) if input_type in {'partner_fasta', 'pacbio_hifi'} else '',
+            'maldi_file': resolve(maldi_file),
+            'genome_metadata': resolve(row.get('genome_metadata')) if input_type == 'genome_16s' else '',
+            'genome_id_isolate_id': str(row.get('genome_id_isolate_id') or '').strip().lower() in {'1', 'true', 'yes'},
+            'gtdb_summary': resolve(row.get('gtdb_summary')) if input_type == 'genome_16s' else '',
+            'genome_dir': resolve(genome_dir) if input_type == 'genome_16s' else '',
+            'partner_workbook': resolve(workbook),
             'partner_workbook_sheet': row.get('partner_workbook_sheet') or 'Bulk Upload Template',
-        })
+        }
+        for key in ('marker_fasta', 'marker_qc', 'maldi_file', 'genome_metadata', 'gtdb_summary'):
+            if entry[key] and not Path(entry[key]).is_file():
+                raise ValueError(f'Cohort manifest row {line_number}: {key} not found: {entry[key]}')
+        if entry['genome_dir'] and not Path(entry['genome_dir']).is_dir():
+            raise ValueError(f'Cohort manifest row {line_number}: genome_dir not found: {entry["genome_dir"]}')
+        rows.append(entry)
     if not rows:
         raise ValueError(f'Cohort manifest contains no partner batches: {manifest_path}')
     return rows
@@ -6625,102 +6097,371 @@ def _merge_tsv_files(paths: list[str | Path], output: str | Path) -> list[dict]:
     return rows
 
 
-def cmd_assistant_cohort(args):
-    """QC partner batches independently, then assess all passing markers together."""
-    import fcntl
-    import sqlite3
-    import re
-    from branchmanager.onboarding import validate_submission, write_onboarding_outputs
-    from branchmanager.partner_metadata import load_partner_sequencing_metadata
+def _cohort_write_rows(path: Path, fields: list[str], rows: list[dict]) -> Path:
+    with open(path, 'w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def _cohort_read_rows(path: Path) -> list[dict]:
+    with open(path, newline='', encoding='utf-8-sig') as handle:
+        return [dict(row) for row in csv.DictReader(handle, delimiter='\t')]
+
+
+def _cohort_paper_trail_outputs_complete(trace_dir: Path) -> tuple[bool, str]:
+    """Check that cached Paper Trail results include a complete review hand-off.
+
+    An assembly report alone is insufficient: older/incomplete runs could contain
+    all isolate rows and candidate FASTAs while marker_review_template.tsv was
+    header-only.  PREPARE must rebuild those outputs rather than reuse them.
+    """
+    trace_dir = Path(trace_dir)
+    required = {
+        'assembly_report.tsv': trace_dir / 'assembly_report.tsv',
+        'marker_review_template.tsv': trace_dir / 'marker_review_template.tsv',
+        'failed_review_candidates.fasta': trace_dir / 'failed_qc_sequences' / 'failed_review_candidates.fasta',
+        'failed_qc_manifest.tsv': trace_dir / 'failed_qc_sequences' / 'failed_qc_manifest.tsv',
+        'failed_read_manifest.tsv': trace_dir / 'failed_qc_sequences' / 'failed_read_manifest.tsv',
+    }
+    missing_files = [name for name, path in required.items() if not path.is_file()]
+    if missing_files:
+        return False, 'missing required output(s): ' + ', '.join(missing_files)
+
+    assembly_rows = _cohort_read_rows(required['assembly_report.tsv'])
+    if not assembly_rows:
+        return False, 'assembly_report.tsv contains no isolate records'
+    review_rows = _cohort_read_rows(required['marker_review_template.tsv'])
+    expected_review_ids = {
+        _cohort_row_get(row, 'SequenceID', 'sequence_id')
+        for row in assembly_rows
+        if _cohort_row_get(row, 'QCClass', 'qc_class').upper() == 'FAIL_QC'
+        or _cohort_row_get(row, 'Recommendation', 'recommendation').upper() == 'MANUAL_REVIEW'
+    }
+    observed_review_ids = {
+        _cohort_row_get(row, 'sequence_id')
+        for row in review_rows if _cohort_row_get(row, 'sequence_id')
+    }
+    missing_review_ids = sorted(expected_review_ids - observed_review_ids)
+    if missing_review_ids:
+        return False, (
+            f'marker_review_template.tsv is incomplete ({len(missing_review_ids)} of '
+            f'{len(expected_review_ids)} required review records missing; examples: '
+            + ', '.join(missing_review_ids[:8]) + ')'
+        )
+
+    from branchmanager.utils.fasta import read_fasta
+    candidate_records = {
+        str(header).split()[0]: ''.join(str(sequence).split()).upper()
+        for header, sequence in read_fasta(str(required['failed_review_candidates.fasta']))
+    }
+    missing_candidate_ids = []
+    for row in review_rows:
+        if _cohort_row_get(row, 'qc_class').upper() != 'FAIL_QC':
+            continue
+        eligible = _cohort_row_get(row, 'eligible_for_manual_acceptance').lower() in {'yes', 'true', '1'}
+        if not eligible:
+            continue
+        sid = _cohort_row_get(row, 'sequence_id')
+        candidate_sequence = candidate_records.get(sid, '') if sid else ''
+        if not candidate_sequence:
+            missing_candidate_ids.append(sid or '(blank sequence_id)')
+            continue
+        declared_length = _cohort_row_get(row, 'candidate_length')
+        if declared_length:
+            try:
+                if int(float(declared_length)) != len(candidate_sequence):
+                    missing_candidate_ids.append(f'{sid} (candidate length does not match FASTA)')
+            except (TypeError, ValueError):
+                missing_candidate_ids.append(f'{sid} (invalid candidate_length)')
+    if missing_candidate_ids:
+        return False, (
+            'manual-approval eligibility is set but the failed-review candidate FASTA '
+            'does not contain sequence(s): ' + ', '.join(missing_candidate_ids[:8])
+        )
+    return True, ''
+
+
+def _cohort_row_get(row: dict, *names: str) -> str:
+    lowered = {str(k).strip().lower().replace('_', ''): v for k, v in row.items() if k is not None}
+    for name in names:
+        value = lowered.get(name.lower().replace('_', ''))
+        if value not in (None, ''):
+            return str(value).strip()
+    return ''
+
+
+def _cohort_read_fallback_option_ids(row: dict) -> set[str]:
+    raw = str(row.get('fallback_read_options') or '').strip()
+    if not raw:
+        return set()
+    try:
+        options = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return set()
+    if not isinstance(options, list):
+        return set()
+    return {
+        str(option.get('read_id') or '').strip()
+        for option in options
+        if isinstance(option, dict) and str(option.get('read_id') or '').strip()
+    }
+
+
+def _cohort_manual_read_selections(decisions_path: str | Path | None) -> dict[str, str]:
+    """Read manual fallback read choices from a saved Studio review TSV."""
+    if not decisions_path:
+        return {}
+    source = Path(decisions_path).expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f'Previous cohort review decisions file not found: {source}')
+    selections: dict[str, str] = {}
+    for row in _cohort_read_rows(source):
+        sequence_id = str(row.get('sequence_id') or '').strip()
+        selected_read_id = str(row.get('selected_read_id') or '').strip()
+        source_type = str(row.get('read_selection_source') or '').strip().upper()
+        if not sequence_id or not selected_read_id or source_type != 'MANUAL':
+            continue
+        previous = selections.get(sequence_id)
+        if previous and previous != selected_read_id:
+            raise ValueError(
+                f'Conflicting manual fallback reads for {sequence_id!r} in {source}: '
+                f'{previous!r} and {selected_read_id!r}'
+            )
+        selections[sequence_id] = selected_read_id
+    return selections
+
+
+def _cohort_restore_review_state(
+    review_rows: list[dict],
+    template_path: Path,
+    decisions_path: str | Path | None = None,
+) -> int:
+    """Carry reviewer decisions and still-valid manual read choices forward.
+
+    New QC evidence always wins. A manual selected_read_id is restored only if
+    that read remains among the newly generated fallback candidates for the
+    isolate; stale choices are discarded in favour of the current recommendation.
+    """
+    previous = {
+        row.get('sequence_id', ''): row
+        for row in _cohort_read_rows(template_path)
+        if row.get('sequence_id')
+    } if template_path.is_file() else {}
+
+    saved = {}
+    if decisions_path:
+        source = Path(decisions_path).expanduser().resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f'Previous cohort review decisions file not found: {source}')
+        saved = {
+            row.get('sequence_id', ''): row
+            for row in _cohort_read_rows(source)
+            if row.get('sequence_id')
+        }
+
+    restored = 0
+    for row in review_rows:
+        sequence_id = str(row.get('sequence_id') or '')
+        source_row = saved.get(sequence_id) if sequence_id in saved else previous.get(sequence_id)
+        if not source_row:
+            continue
+        has_decision = bool(str(source_row.get('decision') or '').strip())
+        for key in ('decision', 'reviewer', 'reviewed_at', 'notes'):
+            if key in source_row:
+                row[key] = source_row.get(key, '')
+
+        current_options = _cohort_read_fallback_option_ids(row)
+        previous_selected = str(source_row.get('selected_read_id') or '').strip()
+        previous_source = str(source_row.get('read_selection_source') or '').strip().upper()
+        if previous_source == 'MANUAL' and previous_selected in current_options:
+            row['selected_read_id'] = previous_selected
+            row['read_selection_source'] = 'MANUAL'
+        else:
+            row['selected_read_id'] = str(row.get('recommended_read_id') or '') if current_options else ''
+            row['read_selection_source'] = 'AUTO_LONGEST_USABLE_READ' if current_options else ''
+        restored += int(has_decision)
+    return restored
+
+
+def _cohort_failed_qc_candidate(sequence: str) -> tuple[bool, float]:
+    """Return whether a failed marker has a non-empty candidate for human review.
+
+    Automated length and N-content thresholds determine the technical QC class,
+    but do not prevent a human reviewer from considering a failed marker.
+    Approval remains explicit and is validated against this prepared candidate
+    sequence at cohort-resume time.
+    """
+    sequence = ''.join(str(sequence or '').split()).upper()
+    if not sequence:
+        return False, 100.0
+    n_percent = 100.0 * sequence.count('N') / len(sequence)
+    return True, n_percent
+
+
+def _cohort_batch_fingerprint(args, batch: dict, selected_read_ids: dict[str, str] | None = None) -> str:
+    import hashlib
+    digest = hashlib.sha256()
+    digest.update(_COHORT_REVIEW_TEMPLATE_POLICY_VERSION.encode())
+    digest.update(sha256_file(batch['sample_map']).encode())
+    digest.update(json.dumps(selected_read_ids or {}, sort_keys=True, separators=(',', ':')).encode())
+    if batch['read_dir'] and Path(batch['read_dir']).is_dir():
+        base = Path(batch['read_dir'])
+        for path in sorted(p for p in base.rglob('*') if p.is_file()):
+            info = path.stat()
+            digest.update(f'{path.relative_to(base)}|{info.st_size}|{info.st_mtime_ns}'.encode())
+    skip = {'out', 'db', 'cohort_manifest', 'cohort_resume', 'cohort_prepare_only', 'marker_review', 'config', 'command'}
+    digest.update(json.dumps({k: v for k, v in sorted(vars(args).items()) if k not in skip}, default=str, sort_keys=True).encode())
+    return digest.hexdigest()
+
+
+def _cohort_register_and_import(project_db, batches, batch_ids, report_dir: Path) -> dict:
+    """Register isolates and replay MALDI/workbook/genome sidecars on a project DB copy."""
+    from branchmanager.genome_16s_import import import_genome_16s
     from branchmanager.project_state import (
-        import_partner_workbook, write_partner_workbook_import_report,
+        import_maldi_identifications, import_partner_workbook,
+        write_maldi_import_report, write_partner_workbook_import_report,
     )
+    reports: dict[str, list[str]] = {'maldi': [], 'genome': [], 'workbook': []}
+    for index, batch in enumerate(batches, start=1):
+        if batch['partner_workbook']:
+            imported = import_partner_workbook(
+                project_db, batch['partner_workbook'], sheet_name=batch['partner_workbook_sheet'],
+                dataset=batch['dataset'],
+            )
+            reports['workbook'].append(str(write_partner_workbook_import_report(
+                report_dir / f'{index:02d}_{batch["dataset"]}_workbook_import.tsv', imported)))
+    by_dataset: dict[str, list[tuple[str, str]]] = {}
+    for sequence_id, dataset in batch_ids.items():
+        existing = project_db.resolve_sequence_id(sequence_id)
+        if existing:
+            with project_db.connect() as conn:
+                stored = conn.execute('SELECT sequence, dataset FROM sequences WHERE id=?', (existing,)).fetchone()
+            if not stored:
+                continue
+            if str(stored[1] or '') in project_db.get_dataset_names_by_role('baseline'):
+                raise ValueError(f'Partner isolate {sequence_id!r} resolves to a registered baseline')
+            if not str(stored[0] or '').strip():
+                with project_db.connect() as conn:
+                    conn.execute('UPDATE sequences SET dataset=? WHERE id=?', (dataset, existing))
+            continue
+        by_dataset.setdefault(dataset, []).append((sequence_id, ''))
+    for dataset, records in by_dataset.items():
+        project_db.upsert_dataset_role(dataset, 'candidate', genomes_available=False)
+        project_db.insert_sequences(records, dataset=dataset)
+    for index, batch in enumerate(batches, start=1):
+        if batch['maldi_file']:
+            results = import_maldi_identifications(project_db, batch['maldi_file'], default_dataset=batch['dataset'])
+            reports['maldi'].append(str(write_maldi_import_report(
+                report_dir / f'{index:02d}_{batch["dataset"]}_maldi_import.tsv', results)))
+    for index, batch in enumerate(batches, start=1):
+        if batch['input_type'] == 'genome_16s':
+            gdir = report_dir / f'{index:02d}_{batch["dataset"]}_genome_16s'
+            import_genome_16s(
+                project_db, batch['genome_dir'], gdir, genome_metadata=batch['genome_metadata'] or None,
+                dataset=batch['dataset'], partner_id=batch['partner_id'],
+                genome_id_isolate_id=batch['genome_id_isolate_id'],
+            )
+            reports['genome'].append(str(gdir / 'genome_16s_import_report.tsv'))
+    return reports
+
+
+def _cohort_copy_db(original_db: Path, target: Path) -> None:
+    import sqlite3
+    target.unlink(missing_ok=True)
+    with sqlite3.connect(str(original_db)) as source, sqlite3.connect(str(target)) as dest:
+        source.backup(dest)
+
+
+def _cohort_prepare(args, root: Path, batches: list[dict]) -> Path:
+    """Stage 1: onboarding, QC, review template and evidence manifest. No Hiring Panel, no publish."""
+    import fcntl
+    from branchmanager.onboarding import validate_submission, write_onboarding_outputs
     from branchmanager.utils.fasta import read_fasta, write_fasta
 
-    root = Path(args.out).expanduser().resolve()
     prep_root = root / '00_cohort_preparation'
-    joint_root = root / '01_joint_assistant'
     prep_root.mkdir(parents=True, exist_ok=True)
-    batches = _read_assistant_cohort_manifest(args.cohort_manifest)
-    run_manifest = RunManifest(root, 'assistant_cohort')
-    run_manifest.add_input(args.cohort_manifest, role='cohort_manifest')
-    run_manifest.add_input(args.partner_metadata, role='cumulative_partner_catalogue')
-    if getattr(args, 'marker_review', None):
-        run_manifest.add_input(args.marker_review, role='marker_review_decisions')
+    manual_read_selections = _cohort_manual_read_selections(getattr(args, 'marker_review', None))
+    if manual_read_selections:
+        print(
+            f'[assistant-cohort] Applying {len(manual_read_selections)} reviewer-selected fallback read(s) '
+            'where a valid consensus cannot be formed.'
+        )
+    manifest = RunManifest(prep_root, 'assistant_cohort_prepare')
+    manifest.add_input(args.cohort_manifest, role='cohort_manifest')
+    manifest.add_input(args.partner_metadata, role='cumulative_partner_catalogue')
     for batch in batches:
-        run_manifest.add_input(batch['sample_map'], role=f"sample_map:{batch['dataset']}")
+        for key in ('sample_map', 'marker_fasta', 'marker_qc', 'maldi_file', 'genome_metadata', 'gtdb_summary', 'partner_workbook'):
+            if batch[key]:
+                manifest.add_input(batch[key], role=f'{key}:{batch["dataset"]}')
         if batch['read_dir']:
-            run_manifest.add_input(batch['read_dir'], role=f"raw_reads:{batch['dataset']}")
-        if batch['partner_workbook']:
-            run_manifest.add_input(batch['partner_workbook'], role=f"partner_workbook:{batch['partner_id']}")
-
-    original_db = Path(args.db).expanduser().resolve()
-    if not original_db.is_file():
-        raise SystemExit(f'[assistant-cohort] Project database does not exist: {original_db}')
-    working_db = prep_root / '.assistant_cohort_project.sqlite'
-    lock_path = original_db.with_name(original_db.name + '.lock')
-    source_manifest_rows = []
-    assembled_fastas = []
-    assembly_reports = []
-    marker_review_templates = []
-    failed_manifests = []
-    batch_ids: dict[str, str] = {}
+            manifest.add_input(batch['read_dir'], role=f'raw_reads:{batch["dataset"]}')
+        if batch['genome_dir']:
+            manifest.add_input(batch['genome_dir'], role=f'genomic_16s_output:{batch["dataset"]}')
+        if batch['gtdb_summary']:
+            manifest.set_reference_identity(**{f'gtdb_summary_sha256:{batch["dataset"]}': sha256_file(batch['gtdb_summary'])})
     try:
-        with open(lock_path, 'a+') as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            try:
-                working_db.unlink(missing_ok=True)
-                with sqlite3.connect(str(original_db)) as source, sqlite3.connect(str(working_db)) as target:
-                    source.backup(target)
-                project_db = Database(str(working_db))
-                project_db.initialise()
-
-                for index, batch in enumerate(batches, start=1):
-                    if batch['partner_workbook']:
-                        imported = import_partner_workbook(
-                            project_db, batch['partner_workbook'],
-                            sheet_name=batch['partner_workbook_sheet'],
-                            dataset=batch['dataset'],
-                        )
-                        import_report = write_partner_workbook_import_report(
-                            prep_root / f'{index:02d}_{batch["dataset"]}_workbook_import.tsv', imported,
-                        )
-                        run_manifest.add_output(import_report, role=f"partner_workbook_report:{batch['dataset']}")
-
-                    onboard_dir = prep_root / f'{index:02d}_{batch["dataset"]}_onboarding'
-                    result = validate_submission(
-                        batch['sample_map'], partner_metadata=args.partner_metadata,
-                        read_dir=batch['read_dir'] or None, primers=args.primers or (),
-                        expected_partner_id=batch['partner_id'], dataset=batch['dataset'],
+        batch_ids: dict[str, str] = {}
+        results = []
+        for index, batch in enumerate(batches, start=1):
+            res = {'batch': batch, 'qc_rows': [], 'review_rows': [], 'passing_fasta': '', 'failed_fasta': '',
+                   'failed_manifest': ''}
+            source = _COHORT_MARKER_SOURCE.get(batch['input_type'], '')
+            if batch['input_type'] == 'sanger':
+                onboard_dir = prep_root / f'{index:02d}_{batch["dataset"]}_onboarding'
+                result = validate_submission(
+                    batch['sample_map'], partner_metadata=args.partner_metadata,
+                    read_dir=batch['read_dir'] or None, primers=args.primers or (),
+                    expected_partner_id=batch['partner_id'], dataset=batch['dataset'],
+                )
+                outputs = write_onboarding_outputs(onboard_dir, result)
+                manifest.add_output(outputs['report'], role=f"onboarding_report:{batch['dataset']}")
+                if result['status'] != 'PASS':
+                    raise RuntimeError(
+                        f"Onboarding failed for {batch['partner_id']} / {batch['dataset']}; inspect {outputs['report']}"
                     )
-                    onboarding_outputs = write_onboarding_outputs(onboard_dir, result)
-                    run_manifest.add_output(onboarding_outputs['report'], role=f"onboarding_report:{batch['dataset']}")
-                    if result['status'] != 'PASS':
-                        raise RuntimeError(
-                            f"Onboarding failed for {batch['partner_id']} / {batch['dataset']}; "
-                            f"inspect {onboarding_outputs['report']}"
+                for row in result['normalised']:
+                    sequence_id = str(row['sequence_id'])
+                    if sequence_id in batch_ids:
+                        raise ValueError(
+                            f"Isolate {sequence_id!r} appears in multiple cohort batches "
+                            f"({batch_ids[sequence_id]!r} and {batch['dataset']!r})"
                         )
-                    for row in result['normalised']:
-                        sequence_id = str(row['sequence_id'])
-                        if sequence_id in batch_ids:
-                            raise ValueError(
-                                f"Isolate {sequence_id!r} appears in multiple cohort batches "
-                                f"({batch_ids[sequence_id]!r} and {batch['dataset']!r})"
-                            )
-                        batch_ids[sequence_id] = batch['dataset']
-                        source_manifest_rows.append({
-                            'sequence_id': sequence_id, 'partner_id': batch['partner_id'],
-                            'dataset': batch['dataset'],
-                        })
-
-                    trace_dir = prep_root / f'{index:02d}_{batch["dataset"]}_paper_trail'
+                    batch_ids[sequence_id] = batch['dataset']
+                batch_sequence_ids = {str(row['sequence_id']) for row in result['normalised']}
+                batch_manual_read_selections = {
+                    sid: read_id for sid, read_id in manual_read_selections.items()
+                    if sid in batch_sequence_ids
+                }
+                trace_dir = prep_root / f'{index:02d}_{batch["dataset"]}_paper_trail'
+                fingerprint = _cohort_batch_fingerprint(args, batch, batch_manual_read_selections)
+                state_file = trace_dir / '.prepared.json'
+                outputs_complete, outputs_problem = _cohort_paper_trail_outputs_complete(trace_dir)
+                try:
+                    fingerprint_matches = (
+                        state_file.is_file()
+                        and json.loads(state_file.read_text()).get('fingerprint') == fingerprint
+                    )
+                except (OSError, ValueError, json.JSONDecodeError):
+                    fingerprint_matches = False
+                reusable = (
+                    fingerprint_matches
+                    and (trace_dir / 'assembled.fasta').is_file()
+                    and outputs_complete
+                )
+                if reusable:
+                    print(f'[assistant-cohort] Reusing unchanged, complete Paper Trail output for {batch["dataset"]}')
+                else:
+                    if state_file.is_file() and not outputs_complete:
+                        print(
+                            f'[assistant-cohort] Rebuilding incomplete Paper Trail output for {batch["dataset"]}: '
+                            f'{outputs_problem}'
+                        )
                     trace_args = argparse.Namespace(**vars(args))
                     trace_args.command = 'paper-trail'
                     trace_args.input = []
-                    # Paper Trail needs one row per read, including its primer and
-                    # orientation. `normalised` is the isolate-level summary and
-                    # collapses paired reads, losing the reverse-read direction.
-                    trace_args.sample_map = onboarding_outputs['read_map']
+                    trace_args.sample_map = outputs['read_map']
                     trace_args.out = str(trace_dir)
                     trace_args.read_dir = batch['read_dir'] or None
                     trace_args.screen_ref = args.ref
@@ -6729,168 +6470,693 @@ def cmd_assistant_cohort(args):
                     trace_args.mailroom_status = 'PASS'
                     trace_args.assemble = True
                     trace_args.recursive = True
+                    trace_args.selected_read_ids = batch_manual_read_selections
                     cmd_paper_trail(trace_args)
-                    assembled = trace_dir / 'assembled.fasta'
-                    assembly_report = trace_dir / 'assembly_report.tsv'
-                    failed_manifest = trace_dir / 'failed_qc_sequences' / 'failed_qc_manifest.tsv'
-                    assembled_fastas.append(assembled)
-                    assembly_reports.append(assembly_report)
-                    review_template = trace_dir / 'marker_review_template.tsv'
-                    if review_template.is_file():
-                        marker_review_templates.append(review_template)
-                    if failed_manifest.is_file():
-                        failed_manifests.append(failed_manifest)
+                    outputs_complete, outputs_problem = _cohort_paper_trail_outputs_complete(trace_dir)
+                    if not outputs_complete:
+                        raise RuntimeError(
+                            f'Paper Trail did not produce a complete review hand-off for {batch["dataset"]}: '
+                            f'{outputs_problem}. The cohort review template has not been generated.'
+                        )
+                    state_file.write_text(json.dumps({'fingerprint': fingerprint}))
+                res['passing_fasta'] = str(trace_dir / 'assembled.fasta')
+                res['failed_fasta'] = str(trace_dir / 'failed_qc_sequences' / 'failed_review_candidates.fasta')
+                res['qc_rows'] = _cohort_read_rows(trace_dir / 'assembly_report.tsv')
+                template = trace_dir / 'marker_review_template.tsv'
+                res['review_rows'] = _cohort_read_rows(template) if template.is_file() else []
+                failed_manifest = trace_dir / 'failed_qc_sequences' / 'failed_qc_manifest.tsv'
+                res['failed_manifest'] = str(failed_manifest) if failed_manifest.is_file() else ''
+            elif source:
+                bdir = prep_root / f'{index:02d}_{batch["dataset"]}_marker_input'
+                bdir.mkdir(parents=True, exist_ok=True)
+                records = [(str(h).split()[0], str(s).upper()) for h, s in read_fasta(batch['marker_fasta'])]
+                seen = set()
+                for sequence_id, sequence in records:
+                    if sequence_id in seen or sequence_id in batch_ids:
+                        raise ValueError(f'Duplicate marker ID {sequence_id!r} in cohort batch {batch["dataset"]!r}')
+                    if not sequence:
+                        raise ValueError(f'Marker {sequence_id!r} in {batch["dataset"]!r} has an empty sequence')
+                    seen.add(sequence_id)
+                    batch_ids[sequence_id] = batch['dataset']
+                qc_by_id = {}
+                if batch['marker_qc']:
+                    for row in _cohort_read_rows(Path(batch['marker_qc'])):
+                        sid = _cohort_row_get(row, 'SequenceID', 'sequence_id', 'id')
+                        if sid:
+                            qc_by_id[sid] = row
+                passing, failed = [], []
+                for sequence_id, sequence in records:
+                    row = qc_by_id.get(sequence_id)
+                    if row is None:
+                        qc_class, recommendation, reasons = 'QUALITY_UNVERIFIED', 'MANUAL_REVIEW', 'no_marker_qc_sidecar'
+                        row = {}
+                    else:
+                        qc_class = (_cohort_row_get(row, 'QCClass', 'qc_class') or 'QUALITY_UNVERIFIED').upper()
+                        recommendation = _cohort_row_get(row, 'Recommendation') or 'MANUAL_REVIEW'
+                        reasons = _cohort_row_get(row, 'Reasons')
+                    qc_row = dict(row)
+                    qc_row.update({'SequenceID': sequence_id, 'QCClass': qc_class,
+                                   'Recommendation': recommendation, 'Reasons': reasons,
+                                   'OutputLength': len(sequence)})
+                    res['qc_rows'].append(qc_row)
+                    (failed if qc_class == 'FAIL_QC' else passing).append((sequence_id, sequence))
+                    if qc_class == 'PASS_HIGH_CONFIDENCE' and recommendation != 'MANUAL_REVIEW':
+                        continue
 
-                combined_records = []
-                used_ids = set()
-                for source_fasta in assembled_fastas:
-                    for sequence_id, sequence in read_fasta(source_fasta):
+                    min_candidate_length = int(getattr(args, 'min_length', 800))
+                    failed_candidate, n_percent = _cohort_failed_qc_candidate(sequence)
+                    review_type = (
+                        'FAILED_QC_REVIEW' if qc_class == 'FAIL_QC'
+                        else 'UNVERIFIED_QC_REVIEW' if qc_class == 'QUALITY_UNVERIFIED' else 'WARNING_REVIEW'
+                    )
+                    # Every non-passing marker is listed for a common manual review.
+                    # Failed markers with any non-empty candidate sequence can be
+                    # explicitly approved by the reviewer, regardless of the QC
+                    # threshold(s) failed. No candidate means no approval option.
+                    eligible = failed_candidate if qc_class == 'FAIL_QC' else bool(sequence)
+                    manual_acceptance_basis = (
+                        'HUMAN_REVIEW_OVERRIDE'
+                        if qc_class == 'FAIL_QC' and eligible else ''
+                    )
+                    manual_acceptance_reason = (
+                        f'Candidate sequence is available ({len(sequence)} bp; {n_percent:.3f}% Ns). '
+                        f'Automated QC class remains FAIL_QC. Recorded reason(s): {reasons}. '
+                        'The reviewer may explicitly approve this marker regardless of which automated QC '
+                        'threshold(s) failed. Inspect all read, chromatogram, sequence and taxonomy evidence; '
+                        'a named reviewer and explanatory notes are mandatory. This is a human override, '
+                        'not an automated pass.'
+                        if manual_acceptance_basis else ''
+                    )
+                    res['review_rows'].append({
+                        'sequence_id': sequence_id, 'review_type': review_type,
+                        'eligible_for_manual_acceptance': 'yes' if eligible else 'no', 'qc_class': qc_class,
+                        'qc_reasons': reasons, 'output_length': len(sequence), 'n_percent': f'{n_percent:.3f}',
+                        'quality_status': 'PARTNER_SUPPLIED_QC' if row else 'NO_QC_PROVENANCE',
+                        'manual_acceptance_basis': manual_acceptance_basis,
+                        'manual_acceptance_reason': manual_acceptance_reason,
+                        'minimum_acceptable_length': '',
+                        'length_deficit_bp': max(0, min_candidate_length - len(sequence)),
+                        'candidate_fasta': str(bdir / ('failed_markers.fasta' if qc_class == 'FAIL_QC' else 'passing_markers.fasta')),
+                    })
+                write_fasta(passing, str(bdir / 'passing_markers.fasta'))
+                write_fasta(failed, str(bdir / 'failed_markers.fasta'))
+                res['passing_fasta'] = str(bdir / 'passing_markers.fasta')
+                res['failed_fasta'] = str(bdir / 'failed_markers.fasta')
+            for qc_row in res['qc_rows']:
+                qc_row['marker_source_type'] = source
+                qc_row['partner_id'] = batch['partner_id']
+                qc_row['cohort_dataset'] = batch['dataset']
+            for review_row in res['review_rows']:
+                review_row['marker_source_type'] = source
+                review_row['partner_id'] = batch['partner_id']
+                review_row['dataset'] = batch['dataset']
+                allowed = _COHORT_ALLOWED.get(review_row.get('review_type', ''), '')
+                if str(review_row.get('eligible_for_manual_acceptance', '')).lower() != 'yes':
+                    allowed = 'REJECT|RESEQUENCE'
+                review_row['allowed_decisions'] = allowed
+            results.append(res)
+
+        combined_records, used_ids, failed_records, source_by_id = [], set(), {}, {}
+        for res in results:
+            for fasta_key, bucket in (('passing_fasta', None), ('failed_fasta', failed_records)):
+                path = res[fasta_key]
+                if not path or not Path(path).is_file():
+                    continue
+                for sequence_id, sequence in read_fasta(path):
+                    sequence_id = str(sequence_id).split()[0]
+                    if bucket is None:
                         if sequence_id in used_ids:
                             raise ValueError(f'Cohort contains duplicate passing marker ID {sequence_id!r}')
                         used_ids.add(sequence_id)
                         combined_records.append((sequence_id, sequence))
-                combined_fasta = prep_root / 'cohort_passing_markers.fasta'
-                write_fasta(combined_records, str(combined_fasta))
-                combined_qc = prep_root / 'cohort_marker_qc.tsv'
-                _merge_tsv_files(assembly_reports, combined_qc)
-                combined_review_template = prep_root / 'cohort_marker_review_template.tsv'
-                if marker_review_templates:
-                    _merge_tsv_files(marker_review_templates, combined_review_template)
+                    else:
+                        bucket[sequence_id] = sequence
+        combined_fasta = prep_root / 'cohort_passing_markers.fasta'
+        write_fasta(combined_records, str(combined_fasta))
+        qc_rows = [row for res in results for row in res['qc_rows']]
+        qc_fields = []
+        for row in qc_rows:
+            qc_fields.extend(k for k in row if k not in qc_fields and not str(k).startswith('_'))
+        combined_qc = _cohort_write_rows(prep_root / 'cohort_marker_qc.tsv', qc_fields or ['SequenceID', 'QCClass'], qc_rows)
+
+        review_rows = [row for res in results for row in res['review_rows']]
+        for row in review_rows:
+            allowed = _COHORT_ALLOWED.get(row.get('review_type', ''), '')
+            if str(row.get('eligible_for_manual_acceptance', '')).lower() != 'yes':
+                allowed = 'REJECT|RESEQUENCE'
+            row['allowed_decisions'] = allowed
+        template_path = prep_root / 'cohort_marker_review_template.tsv'
+        restored_decisions = _cohort_restore_review_state(
+            review_rows, template_path, getattr(args, 'marker_review', None),
+        )
+        restored_read_selections = sum(
+            str(row.get('read_selection_source') or '').upper() == 'MANUAL'
+            and bool(str(row.get('selected_read_id') or '').strip())
+            for row in review_rows
+        )
+        if getattr(args, 'marker_review', None):
+            manifest.add_input(args.marker_review, role='previous_cohort_review_decisions')
+        _cohort_write_rows(template_path, _COHORT_REVIEW_FIELDS, review_rows)
+        if restored_decisions:
+            print(f'[assistant-cohort] Restored {restored_decisions} existing manual review decision(s) into the regenerated template.')
+        if restored_read_selections:
+            print(
+                f'[assistant-cohort] Preserved {restored_read_selections} manual fallback read selection(s) '
+                'in the combined cohort review template.'
+            )
+
+        recoverable = [(sid, failed_records[sid]) for sid in sorted(failed_records)
+                       if any(r['sequence_id'] == sid
+                              and r.get('review_type') == 'FAILED_QC_REVIEW'
+                              and str(r.get('eligible_for_manual_acceptance', '')).lower() == 'yes'
+                              for r in review_rows)]
+        recoverable_fasta = prep_root / 'cohort_recoverable_failed_markers.fasta'
+        write_fasta(recoverable, str(recoverable_fasta))
+        failed_manifests = [res['failed_manifest'] for res in results if res['failed_manifest']]
+        failed_rows = _merge_tsv_files(failed_manifests, prep_root / 'cohort_failed_qc_manifest.tsv') if failed_manifests else []
+        if not failed_manifests:
+            (prep_root / 'cohort_failed_qc_manifest.tsv').write_text('SequenceID\tQCClass\tRecommendation\tStatus\tReasons\n')
+        failure_reasons = {}
+        for row in failed_rows:
+            sid = str(row.get('SequenceID') or '').strip()
+            if sid:
+                failure_reasons[sid] = str(row.get('Reasons') or row.get('Status') or 'failed_qc')
+        for row in qc_rows:
+            if str(row.get('QCClass') or '').upper() == 'FAIL_QC' and row.get('SequenceID'):
+                failure_reasons.setdefault(row['SequenceID'], str(row.get('Reasons') or 'failed_qc'))
+
+        review_ids = {r['sequence_id'] for r in review_rows}
+        recoverable_ids = {sid for sid, _ in recoverable}
+        evidence_rows = []
+        for res in results:
+            for row in res['qc_rows']:
+                sid, qc_class = row['SequenceID'], str(row.get('QCClass') or '').upper()
+                if qc_class == 'PASS_HIGH_CONFIDENCE':
+                    status = 'INCLUDED_PASSING'
+                elif qc_class == 'FAIL_QC':
+                    if sid in recoverable_ids:
+                        status = 'FAILED_RECOVERABLE_PENDING_REVIEW'
+                    elif sid in review_ids:
+                        status = 'FAILED_PENDING_REVIEW'
+                    else:
+                        status = 'FAILED_UNRECOVERABLE'
+                elif sid in review_ids:
+                    status = 'PENDING_REVIEW'
                 else:
-                    with open(combined_review_template, 'w') as handle:
-                        handle.write(
-                            'sequence_id\tdecision\treviewer\tnotes\tqc_reasons\t'
-                            'taxonomy_concordance\tread_taxonomy_assignments\toutput_length\tn_percent\n'
-                        )
-                failed_rows = _merge_tsv_files(
-                    failed_manifests, prep_root / 'cohort_failed_qc_manifest.tsv',
-                ) if failed_manifests else []
-                if not failed_manifests:
-                    with open(prep_root / 'cohort_failed_qc_manifest.tsv', 'w') as handle:
-                        handle.write('SequenceID\tQCClass\tRecommendation\tStatus\tReasons\n')
-                failure_reasons = {}
-                for row in failed_rows:
-                    sequence_id = str(row.get('SequenceID') or '').strip()
-                    if sequence_id:
-                        failure_reasons[sequence_id] = str(row.get('Reasons') or row.get('Status') or 'failed_qc')
-                failure_path = prep_root / 'cohort_qc_failures.tsv'
-                with open(failure_path, 'w', newline='') as handle:
-                    writer = csv.DictWriter(handle, fieldnames=['ID', 'Reasons'], delimiter='\t')
-                    writer.writeheader()
-                    writer.writerows({'ID': sid, 'Reasons': reason} for sid, reason in sorted(failure_reasons.items()))
+                    status = 'INCLUDED_UNREVIEWED'
+                evidence_rows.append({
+                    'sequence_id': sid, 'partner_id': res['batch']['partner_id'], 'dataset': res['batch']['dataset'],
+                    'source_type': row['marker_source_type'], 'qc_class': qc_class, 'status': status,
+                    'in_vsearch_fasta': 'yes' if sid in used_ids else 'no',
+                })
+        for res in results:
+            if res['batch']['input_type'] == 'genome_16s':
+                evidence_rows.append({
+                    'sequence_id': '*', 'partner_id': res['batch']['partner_id'], 'dataset': res['batch']['dataset'],
+                    'source_type': 'GENOME_BARRNAP', 'qc_class': 'GENOME_DERIVED', 'status': 'SUPPLEMENTARY_SECONDARY_POOL',
+                    'in_vsearch_fasta': 'no',
+                })
+        evidence_manifest = _cohort_write_rows(
+            prep_root / 'cohort_marker_evidence_manifest.tsv',
+            ['sequence_id', 'partner_id', 'dataset', 'source_type', 'qc_class', 'status', 'in_vsearch_fasta'], evidence_rows)
+        failure_path = prep_root / 'cohort_qc_failures.tsv'
+        _cohort_write_rows(failure_path, ['ID', 'Reasons'],
+                           [{'ID': k, 'Reasons': v} for k, v in sorted(failure_reasons.items())])
 
-                # Register each isolate under its own batch before the joint run.
-                # Performance Review then attaches the passing marker to this ID,
-                # retaining the partner's dataset label in the rolling database.
-                by_dataset: dict[str, list[tuple[str, str]]] = {}
-                for sequence_id, dataset in batch_ids.items():
-                    existing = project_db.resolve_sequence_id(sequence_id)
-                    if existing:
-                        with project_db.connect() as conn:
-                            stored = conn.execute('SELECT sequence, dataset FROM sequences WHERE id=?', (existing,)).fetchone()
-                        if not stored:
-                            continue
-                        if str(stored[1] or '') in project_db.get_dataset_names_by_role('baseline'):
-                            raise ValueError(f'Partner isolate {sequence_id!r} resolves to a registered baseline')
-                        if not str(stored[0] or '').strip():
-                            with project_db.connect() as conn:
-                                conn.execute('UPDATE sequences SET dataset=? WHERE id=?', (dataset, existing))
-                        continue
-                    by_dataset.setdefault(dataset, []).append((sequence_id, ''))
-                for dataset, records in by_dataset.items():
-                    project_db.upsert_dataset_role(dataset, 'candidate', genomes_available=False)
-                    project_db.insert_sequences(records, dataset=dataset)
+        # Import sidecars on a scratch copy only to produce reports; the live DB is never touched here.
+        original_db = Path(args.db).expanduser().resolve()
+        sidecar_reports: dict[str, list[str]] = {'maldi': [], 'genome': [], 'workbook': []}
+        if original_db.is_file() and any(b['maldi_file'] or b['genome_dir'] or b['partner_workbook'] for b in batches):
+            scratch = prep_root / '.prepare_scratch.sqlite'
+            with open(original_db.with_name(original_db.name + '.lock'), 'a+') as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
+                try:
+                    _cohort_copy_db(original_db, scratch)
+                finally:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            try:
+                scratch_db = Database(str(scratch))
+                scratch_db.initialise()
+                sidecar_reports = _cohort_register_and_import(scratch_db, batches, batch_ids, prep_root)
+            finally:
+                scratch.unlink(missing_ok=True)
+        for kind, name in (('maldi', 'cohort_maldi_import_report.tsv'), ('genome', 'cohort_genome_import_report.tsv')):
+            if sidecar_reports[kind]:
+                _merge_tsv_files(sidecar_reports[kind], prep_root / name)
+            else:
+                (prep_root / name).write_text('result\tdetail\nNOT_APPLICABLE\tno input of this kind in the cohort manifest\n')
 
-                if combined_records:
+        outputs = {
+            'passing_markers': combined_fasta, 'marker_qc': combined_qc, 'review_template': template_path,
+            'recoverable_failed': recoverable_fasta, 'evidence_manifest': evidence_manifest,
+            'qc_failures': failure_path, 'maldi_report': prep_root / 'cohort_maldi_import_report.tsv',
+            'genome_report': prep_root / 'cohort_genome_import_report.tsv',
+        }
+        for role, path in outputs.items():
+            manifest.add_output(path, role=f'cohort_{role}')
+        checksums = {name: sha256_file(path) for name, path in outputs.items() if name != 'review_template'}
+        (prep_root / _COHORT_STATE_NAME).write_text(json.dumps({
+            'batches': batches,
+            'batch_ids': batch_ids,
+            'checksums': {k: [str(outputs[k]), v] for k, v in checksums.items()},
+            'marker_source_by_id': {r['SequenceID']: r['marker_source_type'] for r in qc_rows},
+            'review_template_policy_version': _COHORT_REVIEW_TEMPLATE_POLICY_VERSION,
+            'failed_qc_review_policy': {
+                'manual_approval': 'REVIEWER_OVERRIDE_FOR_ANY_NONEMPTY_CANDIDATE',
+                'minimum_length': int(getattr(args, 'min_length', 800)),
+                'maximum_n_percent': float(getattr(args, 'max_n_percent', 5.0)),
+                'minimum_mean_quality': float(getattr(args, 'min_mean_quality', 20.0)),
+                'maximum_output_expected_errors': float(getattr(args, 'max_output_expected_errors', 5.0)),
+                'maximum_conflict_density': float(getattr(args, 'max_conflict_density', 1.0)),
+                'note': 'These are automated QC thresholds, not manual-approval eligibility gates. Any non-empty prepared candidate can be approved with reviewer identity and notes.',
+            },
+        }, indent=2, sort_keys=True))
+        status = 'COMPLETE_WITH_WARNINGS' if review_rows or failure_reasons else 'COMPLETE'
+        manifest.add_stage('cohort_prepare', status,
+                           detail=f'{len(batches)} batch(es); {len(used_ids)} marker(s) for assessment; '
+                                  f'{len(review_rows)} awaiting review; {len(failure_reasons)} QC failure(s)')
+        manifest.finish(status)
+        print(
+            f'[assistant-cohort] PREPARE {status}: {len(batches)} batch(es), {len(batch_ids)} isolate(s), '
+            f'{len(review_rows)} manual-review row(s).\n'
+            f'  Review template: {template_path}\n'
+            f'  Next: fill decisions, then run `branchmanager assistant --cohort-resume {root} --marker-review <decisions.tsv> ...`'
+        )
+    except BaseException as exc:
+        manifest.finish('FAILED', error=exc)
+        raise
+    return prep_root
+
+
+
+
+def _cohort_validate_decisions(prep_root: Path, decisions_path: Path | None):
+    """Validate manual-review decisions against the prepared cohort evidence."""
+    from branchmanager.marker_evidence import REVIEW_DECISIONS, validate_review_decision
+    from branchmanager.utils.fasta import read_fasta
+
+    template = {
+        r['sequence_id']: r
+        for r in _cohort_read_rows(prep_root / 'cohort_marker_review_template.tsv')
+        if r.get('sequence_id')
+    }
+    if not decisions_path:
+        return [], []
+
+    recoverable_path = prep_root / 'cohort_recoverable_failed_markers.fasta'
+    recoverable = {
+        str(header).split()[0]: ''.join(str(sequence).split()).upper()
+        for header, sequence in read_fasta(str(recoverable_path))
+    } if recoverable_path.is_file() else {}
+
+    qc_by_id = {
+        _cohort_row_get(row, 'SequenceID', 'sequence_id'): row
+        for row in _cohort_read_rows(prep_root / 'cohort_marker_qc.tsv')
+        if _cohort_row_get(row, 'SequenceID', 'sequence_id')
+    }
+
+    # Manual approval is deliberately reviewer-controlled. The parent resume
+    # routine has already verified the preparation checksums; this validator
+    # verifies that a candidate exists, but does not impose a second automated
+    # QC pass gate.
+
+    errors, accepted, seen = [], [], set()
+    for line, row in enumerate(_cohort_read_rows(decisions_path), start=2):
+        sid = _cohort_row_get(row, 'sequence_id')
+        decision = _cohort_row_get(row, 'decision', 'review_decision').upper()
+        if not sid or not decision:
+            continue
+        if sid in seen:
+            errors.append(f'line {line}: duplicate decision for {sid}')
+            continue
+        seen.add(sid)
+
+        if sid not in template:
+            errors.append(f'line {line}: {sid} is not in the cohort review template')
+            continue
+        if decision not in REVIEW_DECISIONS:
+            errors.append(f'line {line}: {sid} has unsupported decision {decision!r}')
+            continue
+
+        info = template[sid]
+        review_type = str(info.get('review_type') or '').upper()
+        qc_class = str(info.get('qc_class') or '').upper()
+        qc_row = qc_by_id.get(sid, {})
+        prepared_qc_class = _cohort_row_get(qc_row, 'QCClass', 'qc_class').upper()
+        if prepared_qc_class and qc_class != prepared_qc_class:
+            errors.append(
+                f'line {line}: {sid} QC class was changed in the review template '
+                f'({qc_class!r}; prepared value is {prepared_qc_class!r})'
+            )
+            continue
+
+        expected_review_type = {
+            'APPROVE': {'WARNING_REVIEW'},
+            'APPROVE_FAIL_QC': {'FAILED_QC_REVIEW'},
+            'APPROVE_UNVERIFIED': {'UNVERIFIED_QC_REVIEW'},
+        }
+        if decision in expected_review_type and review_type not in expected_review_type[decision]:
+            errors.append(
+                f'line {line}: {decision} is not valid for review_type {review_type or "(blank)"!r}'
+            )
+            continue
+
+        expected_type_for_qc = {
+            'FAIL_QC': 'FAILED_QC_REVIEW',
+            'QUALITY_UNVERIFIED': 'UNVERIFIED_QC_REVIEW',
+            'PASS_WITH_WARNINGS': 'WARNING_REVIEW',
+        }
+        expected_type = expected_type_for_qc.get(qc_class)
+        if expected_type and review_type != expected_type:
+            errors.append(
+                f'line {line}: {sid} review_type {review_type!r} does not match prepared QC class {qc_class!r}'
+            )
+            continue
+
+        has_candidate = str(info.get('eligible_for_manual_acceptance', '')).lower() == 'yes'
+        if review_type == 'FAILED_QC_REVIEW':
+            if qc_class != 'FAIL_QC':
+                errors.append(f'line {line}: {sid} is FAILED_QC_REVIEW but its QC class is {qc_class!r}')
+                continue
+            # Failed records can always be rejected or marked for resequencing.
+            # Explicit approval is permitted for any non-empty candidate in the
+            # checksummed recoverable FASTA, regardless of the failed QC metric(s).
+            if decision == 'APPROVE_FAIL_QC':
+                sequence = recoverable.get(sid, '')
+                if not sequence:
+                    errors.append(
+                        f'line {line}: {sid} has no non-empty candidate in '
+                        'cohort_recoverable_failed_markers.fasta; it cannot be approved'
+                    )
+                    continue
+                has_candidate = True
+
+        error = validate_review_decision(
+            decision, qc_class, reviewer=_cohort_row_get(row, 'reviewer'),
+            notes=_cohort_row_get(row, 'notes', 'review_notes'),
+            has_consensus=has_candidate,
+        )
+        if error:
+            errors.append(f'line {line}: {sid}: {error}')
+            continue
+
+        accepted.append({
+            'sequence_id': sid,
+            'decision': decision,
+            'reviewer': _cohort_row_get(row, 'reviewer'),
+            'notes': _cohort_row_get(row, 'notes', 'review_notes'),
+            'reviewed_at': _cohort_row_get(row, 'reviewed_at'),
+            'qc_class': qc_class,
+            'review_type': review_type,
+            'candidate_fasta': info.get('candidate_fasta', ''),
+        })
+    return accepted, errors
+
+
+
+def _cohort_review_application_audit_rows(
+    template_rows: list[dict],
+    decisions: list[dict],
+    passing_sequences: dict[str, str],
+    failed_sequences: dict[str, str],
+    included_ids: set[str],
+    decisions_source: str = '',
+) -> list[dict]:
+    """Build a per-isolate audit of how validated human decisions were applied."""
+    decided = {str(row.get('sequence_id') or ''): row for row in decisions}
+    output = []
+    for info in template_rows:
+        sid = str(info.get('sequence_id') or '').strip()
+        if not sid:
+            continue
+        decision = decided.get(sid, {})
+        value = str(decision.get('decision') or '').upper()
+        sequence = passing_sequences.get(sid) or failed_sequences.get(sid) or ''
+        included = sid in included_ids
+        if value == 'APPROVE_FAIL_QC' and included:
+            status = 'INCLUDED_BY_MANUAL_FAILED_QC_OVERRIDE'
+            reason = 'Non-empty failed-QC candidate included following validated reviewer approval; technical QC remains FAIL_QC'
+        elif value == 'APPROVE' and included:
+            status = 'INCLUDED_AFTER_MANUAL_APPROVAL'
+            reason = 'Warning-level marker included following validated reviewer approval'
+        elif value == 'APPROVE_UNVERIFIED' and included:
+            status = 'INCLUDED_AFTER_MANUAL_UNVERIFIED_APPROVAL'
+            reason = 'Marker without an automated QC sidecar included following validated reviewer approval'
+        elif value == 'RESEQUENCE':
+            status = 'EXCLUDED_RESEQUENCE'
+            reason = 'Reviewer requested resequencing; marker excluded from joint assessment'
+        elif value == 'REJECT':
+            status = 'EXCLUDED_REJECTED'
+            reason = 'Reviewer rejected the marker; marker excluded from joint assessment'
+        elif included:
+            status = 'INCLUDED_WITHOUT_MANUAL_REVIEW'
+            reason = 'Marker entered the joint set without an individual manual-review decision'
+        else:
+            status = 'EXCLUDED_PENDING_REVIEW'
+            reason = 'No valid approval decision was supplied for this review-required marker'
+        output.append({
+            'sequence_id': sid,
+            'partner_id': info.get('partner_id', ''),
+            'dataset': info.get('dataset', ''),
+            'review_type': info.get('review_type', ''),
+            'prepared_qc_class': info.get('qc_class', ''),
+            'qc_reasons': info.get('qc_reasons', ''),
+            'decision': value,
+            'reviewer': decision.get('reviewer', ''),
+            'reviewed_at': decision.get('reviewed_at', ''),
+            'notes': decision.get('notes', ''),
+            'candidate_available': 'YES' if sequence else 'NO',
+            'candidate_length': len(sequence),
+            'candidate_sha256': hashlib.sha256(sequence.encode('ascii', errors='replace')).hexdigest() if sequence else '',
+            'included_in_joint_assessment': 'YES' if included else 'NO',
+            'application_status': status,
+            'application_reason': reason,
+            'decision_source_file': decisions_source,
+        })
+    return output
+
+
+def _cohort_assess(args, root: Path) -> None:
+    """Stage 2: validate decisions, build the joint marker set, assess once, publish after integrity checks."""
+    import fcntl
+    import hashlib
+    import sqlite3
+    from branchmanager.marker_evidence import record_review_decisions
+    from branchmanager.partner_metadata import load_partner_sequencing_metadata
+    from branchmanager.utils.fasta import read_fasta, write_fasta
+
+    prep_root = root / '00_cohort_preparation'
+    joint_root = root / '01_joint_assistant'
+    state_path = prep_root / _COHORT_STATE_NAME
+    if not state_path.is_file():
+        raise SystemExit(f'[assistant-cohort] No completed preparation found in {prep_root}; run the prepare stage first.')
+    state = json.loads(state_path.read_text())
+    for name, (path, expected) in state['checksums'].items():
+        if not Path(path).is_file() or sha256_file(path) != expected:
+            raise SystemExit(
+                f'[assistant-cohort] Preparation output {name} changed since it was prepared ({path}); '
+                'rerun the prepare stage rather than resuming.'
+            )
+    batches, batch_ids = state['batches'], state['batch_ids']
+    decisions_path = Path(args.marker_review).expanduser().resolve() if getattr(args, 'marker_review', None) else None
+    decisions, errors = _cohort_validate_decisions(prep_root, decisions_path)
+    if errors:
+        raise SystemExit('[assistant-cohort] Invalid manual-review decision(s); nothing was changed:\n  ' + '\n  '.join(errors))
+
+    manifest = RunManifest(root, 'assistant_cohort')
+    manifest.add_input(prep_root / _COHORT_STATE_NAME, role='cohort_prepare_state')
+    manifest.add_input(prep_root / 'cohort_marker_review_template.tsv', role='cohort_marker_review_template')
+    if decisions_path:
+        manifest.add_input(decisions_path, role='marker_review_decisions')
+        history = root / 'review_history'
+        history.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(decisions_path.read_bytes()).hexdigest()[:12]
+        kept = history / f'{digest}_{decisions_path.name}'
+        if not kept.exists():
+            kept.write_bytes(decisions_path.read_bytes())
+    approved_failed = {d['sequence_id'] for d in decisions if d['decision'] == 'APPROVE_FAIL_QC'}
+    decided = {d['sequence_id']: d for d in decisions}
+
+    # Warning-level and quality-unverified markers need an explicit approval before they are assessed.
+    template_rows = {r['sequence_id']: r for r in _cohort_read_rows(prep_root / 'cohort_marker_review_template.tsv')
+                     if r.get('sequence_id')}
+    held_back = {}
+    for sid, info in template_rows.items():
+        if info.get('review_type') == 'FAILED_QC_REVIEW':
+            continue
+        decision = decided.get(sid, {}).get('decision', '')
+        if decision not in {'APPROVE', 'APPROVE_UNVERIFIED'}:
+            held_back[sid] = f'manual_review_{decision.lower() or "pending"}'
+    records = [(str(h).split()[0], s) for h, s in read_fasta(str(prep_root / 'cohort_passing_markers.fasta'))
+               if str(h).split()[0] not in held_back]
+    failed_pool = {str(h).split()[0]: s for h, s in read_fasta(str(prep_root / 'cohort_recoverable_failed_markers.fasta'))}
+    missing_approved_failed = sorted(approved_failed - set(failed_pool))
+    if missing_approved_failed:
+        raise SystemExit(
+            '[assistant-cohort] Approved failed-QC marker(s) are missing from the prepared recoverable FASTA: '
+            + ', '.join(missing_approved_failed)
+            + '. No database changes were made; rerun PREPARE and review the regenerated template.'
+        )
+    present = {sid for sid, _ in records}
+    for sid in sorted(approved_failed):
+        if sid not in present:
+            records.append((sid, failed_pool[sid]))
+    joint_inputs = root / '01_joint_inputs'
+    joint_inputs.mkdir(parents=True, exist_ok=True)
+    joint_fasta = joint_inputs / 'cohort_joint_markers.fasta'
+    write_fasta(records, str(joint_fasta))
+    included = {sid for sid, _ in records}
+
+    failure_rows = _cohort_read_rows(prep_root / 'cohort_qc_failures.tsv')
+    failure_reasons = {r['ID']: r.get('Reasons', '') for r in failure_rows if r.get('ID') and r['ID'] not in included}
+    failure_reasons.update({sid: reason for sid, reason in held_back.items() if sid not in included})
+    failure_path = joint_inputs / 'cohort_qc_failures.tsv'
+    _cohort_write_rows(failure_path, ['ID', 'Reasons'], [{'ID': k, 'Reasons': v} for k, v in sorted(failure_reasons.items())])
+    qc_rows = _cohort_read_rows(prep_root / 'cohort_marker_qc.tsv')
+    qc_fields = list(qc_rows[0].keys()) if qc_rows else ['SequenceID', 'QCClass']
+    joint_qc = _cohort_write_rows(joint_inputs / 'cohort_joint_marker_qc.tsv', qc_fields,
+                                  [r for r in qc_rows if r.get('SequenceID') in included])
+
+    passing_pool = {
+        str(h).split()[0]: str(sequence).upper()
+        for h, sequence in read_fasta(str(prep_root / 'cohort_passing_markers.fasta'))
+    }
+    review_template_rows = _cohort_read_rows(prep_root / 'cohort_marker_review_template.tsv')
+    review_audit_rows = _cohort_review_application_audit_rows(
+        review_template_rows, decisions, passing_pool, failed_pool, included,
+        str(decisions_path or ''),
+    )
+    review_audit_path = joint_inputs / 'cohort_review_application_audit.tsv'
+    audit_fields = [
+        'sequence_id', 'partner_id', 'dataset', 'review_type', 'prepared_qc_class',
+        'qc_reasons', 'decision', 'reviewer', 'reviewed_at', 'notes',
+        'candidate_available', 'candidate_length', 'candidate_sha256',
+        'included_in_joint_assessment', 'application_status', 'application_reason',
+        'decision_source_file',
+    ]
+    _cohort_write_rows(review_audit_path, audit_fields, review_audit_rows)
+
+    original_db = Path(args.db).expanduser().resolve()
+    if not original_db.is_file():
+        raise SystemExit(f'[assistant-cohort] Project database does not exist: {original_db}')
+    working_db = prep_root / '.assistant_cohort_project.sqlite'
+    try:
+        with open(original_db.with_name(original_db.name + '.lock'), 'a+') as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                _cohort_copy_db(original_db, working_db)
+                project_db = Database(str(working_db))
+                project_db.initialise()
+                _cohort_register_and_import(project_db, batches, batch_ids, joint_inputs)
+                if records:
                     joint_args = argparse.Namespace(**vars(args))
                     joint_args.cohort_manifest = None
+                    joint_args.cohort_resume = None
+                    joint_args.cohort_prepare_only = False
                     joint_args.command = 'assistant'
                     joint_args.sample_map = None
                     joint_args.pacbio_map = None
-                    joint_args.fasta = str(combined_fasta)
-                    joint_args.marker_qc = str(combined_qc)
-                    # Cohort FASTA is assembled from the Sanger sample_map batches
-                    # above; do not mislabel these consensuses as partner-supplied FASTA.
+                    joint_args.fasta = str(joint_fasta)
+                    joint_args.marker_qc = str(joint_qc)
                     joint_args.marker_source_type = 'SANGER_AB1'
-                    joint_args.marker_review = getattr(args, 'marker_review', None)
+                    joint_args.marker_review = str(decisions_path) if decisions_path else None
                     joint_args.partner_id = None
                     joint_args.cohort_qc_failures = str(failure_path)
                     joint_args.db = str(working_db)
                     joint_args.out = str(joint_root)
                     cmd_assistant(joint_args)
                 else:
-                    # All isolates failed before producing a marker: retain them
-                    # as markerless records and record QC state without fabricating
-                    # an empty-sequence Assistant run.
-                    metadata_by_id = {
-                        row['source_id']: row for row in load_partner_sequencing_metadata(args.partner_metadata)
-                    }
+                    metadata_by_id = {r['source_id']: r for r in load_partner_sequencing_metadata(args.partner_metadata)}
                     for sequence_id, reason in failure_reasons.items():
                         row = metadata_by_id.get(sequence_id, {})
                         project_db.upsert_sequencing_metadata([{
-                            'id': sequence_id,
-                            'partner_id': row.get('partner_id') or sequence_id.split('_', 1)[0],
+                            'id': sequence_id, 'partner_id': row.get('partner_id') or sequence_id.split('_', 1)[0],
                             'dataset': batch_ids.get(sequence_id, args.dataset),
                             'selected_for_sequencing': row.get('selected_for_sequencing', False),
                             'selected_for_wgs': row.get('selected_for_wgs', False),
-                            'source_id': sequence_id,
-                            'source_file': args.partner_metadata,
+                            'source_id': sequence_id, 'source_file': args.partner_metadata,
                             'raw_selected_value': row.get('raw_selected_value', ''),
                             'raw_commitment_value': row.get('raw_commitment_value', ''),
-                            'project_metadata': row.get('project_metadata', {}),
+                            'project_metadata': {
+                                **(row.get('project_metadata') or {}),
+                                **({'expected_taxon': row.get('expected_taxon')} if row.get('expected_taxon') else {}),
+                                'expected_domain': row.get('expected_domain') or 'Bacteria',
+                            },
                         }])
                         project_db.upsert_sequence_provenance([{
                             'sequence_id': sequence_id, 'marker_qc_class': 'FAIL_QC',
                             'marker_qc_recommendation': 'RESEQUENCE', 'marker_qc_reasons': reason,
                             'manual_review_status': 'NOT_REVIEWED', 'chimera_call': 'NOT_RUN',
                         }])
-                        project_db.update_isolate_status(
-                            sequence_id, 'MARKER_QC_FAILED', detail=reason,
-                            source_file=str(failure_path),
-                        )
-                    run_manifest.add_output(failure_path, role='cohort_qc_failures')
-
-                if original_db.exists():
-                    publish = original_db.with_name(original_db.name + '.publishing')
-                    publish.unlink(missing_ok=True)
-                    with sqlite3.connect(str(working_db)) as source, sqlite3.connect(str(publish)) as target:
-                        source.backup(target)
-                        if target.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
-                            raise RuntimeError('cohort project database failed SQLite integrity_check')
-                    os.replace(publish, original_db)
+                        project_db.update_isolate_status(sequence_id, 'MARKER_QC_FAILED', detail=reason, source_file=str(failure_path))
+                # Persist decisions for records that never entered the registry (rejected/unrescued failures).
+                unrescued = [d for d in decisions if d['sequence_id'] not in included]
+                if unrescued:
+                    project_db.upsert_sequence_provenance([{
+                        'sequence_id': d['sequence_id'], 'marker_qc_class': d['qc_class'] or 'FAIL_QC',
+                        'marker_qc_recommendation': 'RESEQUENCE', 'marker_qc_reasons': failure_reasons.get(d['sequence_id'], ''),
+                        'manual_review_status': 'REJECTED' if d['decision'] in {'REJECT', 'RESEQUENCE'} else 'NOT_REVIEWED',
+                        'review_decision': d['decision'], 'reviewer': d['reviewer'], 'review_notes': d['notes'],
+                        'reviewed_at': d['reviewed_at'], 'chimera_call': 'NOT_RUN',
+                    } for d in unrescued])
+                    record_review_decisions(project_db, unrescued, source_file=str(decisions_path or ''))
+                with sqlite3.connect(str(working_db)) as conn:
+                    check = conn.execute('PRAGMA integrity_check').fetchone()[0]
+                if check != 'ok':
+                    raise RuntimeError(f'cohort project database failed SQLite integrity_check: {check}')
+                publish = original_db.with_name(original_db.name + '.publishing')
+                publish.unlink(missing_ok=True)
+                with sqlite3.connect(str(working_db)) as source, sqlite3.connect(str(publish)) as target:
+                    source.backup(target)
+                os.replace(publish, original_db)
                 working_db.unlink(missing_ok=True)
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-
-        run_manifest.add_output(combined_fasta, role='cohort_marker_fasta')
-        run_manifest.add_output(combined_qc, role='cohort_marker_qc')
-        run_manifest.add_output(combined_review_template, role='cohort_marker_review_template')
-        run_manifest.add_output(failure_path, role='cohort_qc_failures')
-        if combined_records:
-            run_manifest.add_output(joint_root / 'run_manifest.json', role='joint_assistant_manifest')
-            run_manifest.add_output(joint_root / '03_performance_review_hiring_panel' / 'assessment' / 'selection_summary.tsv', role='joint_selection_summary')
-            run_manifest.add_output(joint_root / '03_performance_review_hiring_panel' / 'assessment' / 'sequence_assessment.tsv', role='joint_sequence_assessment')
+        manifest.add_output(joint_fasta, role='cohort_joint_marker_fasta')
+        manifest.add_output(joint_qc, role='cohort_joint_marker_qc')
+        manifest.add_output(review_audit_path, role='cohort_review_application_audit')
+        if records:
+            manifest.add_output(joint_root / 'run_manifest.json', role='joint_assistant_manifest')
+            manifest.add_output(joint_root / '03_performance_review_hiring_panel' / 'assessment' / 'selection_summary.tsv', role='joint_selection_summary')
         status = 'COMPLETE_WITH_WARNINGS' if failure_reasons else 'COMPLETE'
-        run_manifest.add_stage(
-            'assistant_cohort', status,
-            detail=f'{len(batches)} partner batch(es), {len(batch_ids)} isolate(s), '
-                   f'{len(combined_records)} passing marker(s), {len(failure_reasons)} QC failure(s)',
-        )
-        run_manifest.finish(status)
-        print(
-            f'[assistant-cohort] {status}: {len(batches)} batch(es), {len(batch_ids)} isolate(s), '
-            f'{len(combined_records)} passing marker(s), {len(failure_reasons)} QC failure(s).\n'
-            f'  Joint selection: {joint_root / "03_performance_review_hiring_panel" / "assessment" / "selection_summary.tsv" if combined_records else "not generated (no passing markers)"}\n'
-            f'  Cohort report  : {run_manifest.json_path}'
-        )
+        manifest.add_stage('assistant_cohort', status,
+                           detail=f'{len(batch_ids)} isolate(s), {len(records)} marker(s) assessed, '
+                                  f'{len(approved_failed & included)} approved failed marker(s), {len(failure_reasons)} excluded')
+        manifest.finish(status)
+        print(f'[assistant-cohort] ASSESS {status}: {len(records)} marker(s) assessed jointly; {len(failure_reasons)} excluded.\n'
+              f'  Review application audit: {review_audit_path}\n'
+              f'  Cohort report: {manifest.json_path}')
     except BaseException as exc:
-        run_manifest.finish('FAILED', error=exc)
+        manifest.finish('FAILED', error=exc)
         raise
+
+
+def cmd_assistant_cohort(args):
+    """Mixed-partner cohort Assistant: PREPARE, then REVIEW AND ASSESS (resume)."""
+    # Emit Python's native traceback if a C extension or native dependency
+    # terminates the process with SIGSEGV/SIGABRT. This is diagnostic only.
+    import faulthandler
+    import sys
+    if not faulthandler.is_enabled():
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+    logging.getLogger(__name__).info('[ASSISTANT][DIAG] faulthandler enabled for native-crash diagnostics')
+    if getattr(args, 'cohort_resume', None):
+        root = Path(args.cohort_resume).expanduser().resolve()
+        return _cohort_assess(args, root)
+    root = Path(args.out).expanduser().resolve()
+    original_db = Path(args.db).expanduser().resolve()
+    if not original_db.is_file():
+        raise SystemExit(f'[assistant-cohort] Project database does not exist: {original_db}')
+    batches = _read_assistant_cohort_manifest(args.cohort_manifest)
+    _cohort_prepare(args, root, batches)
+    if getattr(args, 'cohort_prepare_only', False):
+        return None
+    return _cohort_assess(args, root)
 
 
 def cmd_assistant(args):
     """Run the Assistant workflow with explicit scientific stage boundaries."""
-    if getattr(args, 'cohort_manifest', None):
+    if getattr(args, 'cohort_manifest', None) or getattr(args, 'cohort_resume', None):
         return cmd_assistant_cohort(args)
     from branchmanager.it_desk import run_it_desk_checks, write_it_desk_report
 
@@ -7033,6 +7299,8 @@ def cmd_assistant(args):
                 else ('SANGER_AB1' if args.sample_map else 'PACBIO_HIFI' if args.pacbio_map else 'PARTNER_FASTA')
             ),
             accept_unverified_marker_qc=bool(args.accept_unverified_marker_qc),
+            unverified_override_authorizer=getattr(args, 'unverified_override_authorizer', ''),
+            unverified_override_reason=getattr(args, 'unverified_override_reason', ''),
             chimera_ref=args.chimera_ref or args.ref,
             skip_chimera_check=args.skip_chimera_check, collapse=False,
         )
@@ -7044,6 +7312,7 @@ def cmd_assistant(args):
             ('performance_review_dashboard', performance_review_dir / 'performance_review_dashboard.html'),
             ('selection_summary', performance_review_dir / 'assessment' / 'selection_summary.tsv'),
             ('sequencing_sets', performance_review_dir / 'assessment' / 'sequencing_sets.tsv'),
+            ('pangenome_hierarchy', performance_review_dir / 'assessment' / 'pangenome_hierarchy.tsv'),
         ):
             manifest.add_output(path, role=role)
         missing = manifest.verify_required_outputs()
@@ -7056,7 +7325,8 @@ def cmd_assistant(args):
     print(
         '[assistant] Onboarding through Hiring Panel complete.\n'
         f'  Decision dashboard: {performance_review_dir / "performance_review_dashboard.html"}\n'
-        f'  Sequencing sets  : {performance_review_dir / "assessment" / "sequencing_sets.tsv"}'
+        f'  Sequencing sets  : {performance_review_dir / "assessment" / "sequencing_sets.tsv"}\n'
+        f'  Pangenome ranks  : {performance_review_dir / "assessment" / "pangenome_hierarchy.tsv"}'
     )
 
 
@@ -7291,7 +7561,157 @@ def cmd_quarterly_review(args):
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 
+def cmd_dashboard(args):
+    """Rebuild the interactive HTML dashboard from an existing run directory.
+
+    This is deliberately a reporting-only operation: it reads existing TSV/JSON
+    outputs and does not open or mutate the project database.
+    """
+    supplied_dir = Path(args.output_dir).expanduser().resolve()
+    if not supplied_dir.is_dir():
+        raise SystemExit(f"[DASHBOARD] Output directory does not exist: {supplied_dir}")
+
+    # Accept either the run root or its assessment/ directory.
+    if (supplied_dir / "selection_summary.tsv").is_file():
+        assessment_dir = supplied_dir
+        run_dir = supplied_dir.parent if supplied_dir.name.lower() == "assessment" else supplied_dir
+    elif (supplied_dir / "assessment" / "selection_summary.tsv").is_file():
+        run_dir = supplied_dir
+        assessment_dir = supplied_dir / "assessment"
+    else:
+        raise SystemExit(
+            "[DASHBOARD] Could not find selection_summary.tsv. Expected either "
+            f"{supplied_dir / 'selection_summary.tsv'} or "
+            f"{supplied_dir / 'assessment' / 'selection_summary.tsv'}."
+        )
+
+    selection_summary = assessment_dir / "selection_summary.tsv"
+    sequence_assessment = assessment_dir / "sequence_assessment.tsv"
+    pangenome_hierarchy = assessment_dir / "pangenome_hierarchy.tsv"
+    novelty_metrics = assessment_dir / "novelty_metrics.tsv"
+    run_manifest = run_dir / "run_manifest.json"
+    genome_assessment = assessment_dir / "genome_collection_assessment.tsv"
+
+    # The dashboard generator treats optional report inputs as empty when they
+    # are absent. Log the omissions so a partial dashboard is not mistaken for
+    # a complete report.
+    for label, path in (
+        ("sequence assessment", sequence_assessment),
+        ("pangenome hierarchy", pangenome_hierarchy),
+        ("novelty metrics", novelty_metrics),
+        ("run manifest", run_manifest),
+        ("genome collection assessment", genome_assessment),
+    ):
+        if not path.is_file():
+            logging.getLogger(__name__).warning(
+                "[DASHBOARD] Optional input is missing (%s): %s", label, path
+            )
+
+    from branchmanager.reporting import write_performance_review_dashboard
+
+    dashboard = write_performance_review_dashboard(
+        selection_summary,
+        run_dir,
+        sequence_assessment=sequence_assessment if sequence_assessment.is_file() else None,
+        pangenome_hierarchy=pangenome_hierarchy if pangenome_hierarchy.is_file() else None,
+        novelty_metrics=novelty_metrics if novelty_metrics.is_file() else None,
+        run_manifest=run_manifest if run_manifest.is_file() else None,
+        genome_assessment=genome_assessment if genome_assessment.is_file() else None,
+    )
+    logging.getLogger(__name__).info("[DASHBOARD] Rebuilt dashboard: %s", dashboard)
+    print(f"Dashboard regenerated: {dashboard}")
+    return dashboard
+
+
+def cmd_regenerate_assessment(args):
+    """Rebuild selection/pangenome reports from an existing assessment without rerunning biology."""
+    assessment_dir = Path(args.assessment_dir).expanduser().resolve()
+    source = assessment_dir / 'sequence_assessment.tsv'
+    if not source.is_file():
+        raise FileNotFoundError(f'Existing assessment TSV not found: {source}')
+    db_path = Path(args.db).expanduser().resolve()
+    if not db_path.is_file():
+        raise FileNotFoundError(f'Existing project database not found: {db_path}')
+    tree_path = Path(args.tree).expanduser().resolve() if args.tree else None
+    if tree_path is None:
+        for candidate in (assessment_dir / 'current_tree.nwk', assessment_dir.parent / 'current_tree.nwk',
+                          assessment_dir.parent / 'tree' / 'current_tree.nwk'):
+            if candidate.is_file():
+                tree_path = candidate
+                break
+    if tree_path is not None and not tree_path.is_file():
+        raise FileNotFoundError(f'Tree file not found: {tree_path}')
+
+    def _snake_header(value):
+        value = str(value or '').strip()
+        # The assessment writer uses presentation headers (ID, PartnerID,
+        # LocalNeighbourhoodFigure); selection functions consume snake_case.
+        value = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', value)
+        value = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', value)
+        return value.replace('-', '_').replace(' ', '_').lower()
+
+    with source.open('r', encoding='utf-8-sig', newline='') as handle:
+        reader = csv.DictReader(handle, delimiter='\t')
+        rows = [
+            {_snake_header(key): value for key, value in row.items() if key is not None}
+            for row in reader
+        ]
+    if not rows:
+        raise ValueError(f'Assessment TSV contains no data rows: {source}')
+
+    # The original workflow creates candidate sets before appending isolates
+    # that never produced a marker consensus. Preserve those placeholders in
+    # final reports, but do not feed them into marker-candidate selection.
+    marker_rows = [row for row in rows if str(row.get('no_marker_sequence', '')).strip().lower() not in {'1', 'true', 'yes'}]
+    if not marker_rows:
+        raise ValueError('No marker-bearing assessment rows are available for selection regeneration.')
+
+    db = Database(str(db_path))
+    # These reporting functions query the database; this command deliberately
+    # does not update isolate statuses or write an assessment snapshot.
+    sequencing_path = assessment_dir / 'sequencing_sets.tsv'
+    hierarchy_path = assessment_dir / 'pangenome_hierarchy.tsv'
+    _selection_sets.build_sequencing_sets(
+        marker_rows, sequencing_path, tree_path=tree_path, db=db,
+        pangenome_target=args.pangenome_target, candidate_set_size=args.candidate_set_size,
+        baseline_redundancy_identity=args.baseline_redundancy_identity,
+        baseline_redundancy_min_query_coverage=args.baseline_redundancy_min_query_coverage,
+        baseline_extension_min_identity=args.baseline_extension_min_identity,
+        baseline_extension_min_query_coverage=args.baseline_extension_min_query_coverage,
+    )
+    _selection_sets.write_pangenome_hierarchy_tsv(
+        marker_rows, hierarchy_path, tree_path=tree_path, db=db,
+        pangenome_target=args.pangenome_target,
+    )
+
+    # Carry the newly calculated selection fields back to the complete report
+    # rows while retaining no-marker placeholders unchanged.
+    updated = {str(r.get('id') or r.get('sequence_id') or ''): r for r in marker_rows}
+    final_rows = [updated.get(str(r.get('id') or r.get('sequence_id') or ''), r) for r in rows]
+    write_sequence_assessment_tsv(source, final_rows)
+    write_selection_summary_tsv(assessment_dir / 'selection_summary.tsv', final_rows)
+    write_baseline_hits_tsv(assessment_dir / 'baseline_hits.tsv', final_rows)
+
+    logging.getLogger(__name__).info('[REGENERATE] Read %d assessment rows (%d marker-bearing).', len(rows), len(marker_rows))
+    logging.getLogger(__name__).info('[REGENERATE] Wrote %s and %s', sequencing_path, hierarchy_path)
+    logging.getLogger(__name__).info('[REGENERATE] Database statuses and assessment snapshots were not modified.')
+
+    if not args.no_dashboard:
+        from branchmanager.reporting import write_genome_collection_assessment, write_performance_review_dashboard
+        run_dir = assessment_dir.parent
+        genome_assessment = write_genome_collection_assessment(db, assessment_dir / 'genome_collection_assessment.tsv')
+        dashboard = write_performance_review_dashboard(
+            assessment_dir / 'selection_summary.tsv', run_dir,
+            sequence_assessment=source,
+            pangenome_hierarchy=hierarchy_path,
+            novelty_metrics=assessment_dir / 'novelty_metrics.tsv',
+            run_manifest=run_dir / 'run_manifest.json',
+            genome_assessment=genome_assessment,
+        )
+        logging.getLogger(__name__).info('[REGENERATE] Rebuilt dashboard: %s', dashboard)
+
 def main(argv=None):
+    from branchmanager.cli.parser import build_parser
     parser = build_parser()
     selected_config = config_path_from_argv(argv)
     if selected_config:
@@ -7301,11 +7721,15 @@ def main(argv=None):
     if args.command == 'assistant':
         # A cohort manifest is itself the complete input declaration. Ignore any
         # per-batch input path inherited from a reusable config profile.
-        if getattr(args, 'cohort_manifest', None):
+        if getattr(args, 'cohort_manifest', None) or getattr(args, 'cohort_resume', None):
             args.sample_map = args.fasta = args.pacbio_map = None
-        input_count = sum(bool(getattr(args, key, None)) for key in ('sample_map', 'fasta', 'pacbio_map', 'cohort_manifest'))
+        input_count = sum(bool(getattr(args, key, None)) for key in ('sample_map', 'fasta', 'pacbio_map', 'cohort_manifest', 'cohort_resume'))
         if input_count != 1:
-            parser.error('assistant requires exactly one of --sample-map, --fasta, --pacbio-map, or --cohort-manifest, supplied on the command line or in --config')
+            parser.error('assistant requires exactly one of --sample-map, --fasta, --pacbio-map, --cohort-manifest, or --cohort-resume, supplied on the command line or in --config')
+        if getattr(args, 'cohort_prepare_only', False) and not args.cohort_manifest:
+            parser.error('--cohort-prepare-only requires --cohort-manifest')
+        if getattr(args, 'cohort_resume', None) and not args.out:
+            args.out = args.cohort_resume
         if not args.dataset:
             parser.error('assistant requires --dataset or a dataset in --config')
         if not args.out:
@@ -7335,8 +7759,7 @@ def main(argv=None):
         cmd_paper_trail(args)
     elif args.command == 'sanger-studio':
         from branchmanager.sanger_studio import serve
-        serve(args.root, args.out, args.sample_map, port=args.port,
-              open_browser=not args.no_browser)
+        serve(port=args.port, open_browser=not args.no_browser)
     elif args.command == 'mailroom':
         cmd_mailroom(args)
     elif args.command == 'interview':
@@ -7357,6 +7780,14 @@ def main(argv=None):
         cmd_marker_evidence_migrate(args)
     elif args.command == 'register-marker-evidence':
         cmd_register_marker_evidence(args)
+    elif args.command == 'import-genome-16s':
+        cmd_import_genome_16s(args)
+    elif args.command == 'import-genome-evidence':
+        cmd_import_genome_evidence(args)
+    elif args.command == 'import-genome-results':
+        cmd_import_genome_results(args)
+    elif args.command == 'marker-review-apply':
+        cmd_marker_review_apply(args)
     elif args.command == 'import-partner-workbook':
         cmd_import_partner_workbook(args)
     elif args.command == 'exit-interview':
@@ -7365,6 +7796,10 @@ def main(argv=None):
         cmd_annual_report(args)
     elif args.command == 'it-desk':
         cmd_it_desk(args)
+    elif args.command == 'dashboard':
+        cmd_dashboard(args)
+    elif args.command == 'regenerate-assessment':
+        cmd_regenerate_assessment(args)
     elif args.command == 'assistant':
         cmd_assistant(args)
     elif getattr(args, '_tool', None) is not None:

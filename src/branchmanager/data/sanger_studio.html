@@ -6,42 +6,148 @@
 <title>BranchManager · Sanger Studio</title>
 <style>
 :root{--ink:#152438;--muted:#63738a;--line:#dce4ee;--paper:#f4f7fb;--card:#fff;--navy:#163554;--blue:#2474c6;--teal:#148777;--amber:#b86b08;--red:#b83a44;--softblue:#e9f3ff;--softteal:#e8f7f3;--softamber:#fff4df;--softred:#ffeded;--shadow:0 8px 28px rgba(24,48,78,.07)}
-*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}button,input,select{font:inherit}button{border:0;border-radius:8px;padding:9px 13px;background:var(--navy);color:white;font-weight:650;cursor:pointer}button:hover{filter:brightness(1.08)}button:disabled{opacity:.5;cursor:wait}.secondary{background:#e7edf5;color:var(--ink)}.blue{background:var(--blue)}.green{background:var(--teal)}.red{background:var(--red)}.quiet{background:transparent;color:var(--blue);padding:5px 7px}.wrap{max-width:1500px;margin:auto;padding:22px}.top{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:16px}.brand{display:flex;gap:14px;align-items:center}.mark{display:grid;place-items:center;width:44px;height:44px;border-radius:13px;background:#dcecff;color:#15558c;font-size:23px}.brand h1{font-size:23px;line-height:1.15;margin:0}.brand p{margin:5px 0 0;color:var(--muted)}.rootbadge{padding:8px 11px;border:1px solid var(--line);border-radius:9px;background:white;color:var(--muted);max-width:48%;overflow-wrap:anywhere}.principle{border:1px solid #c8deef;background:linear-gradient(100deg,#edf7ff,#f3fbfa);border-radius:12px;padding:13px 16px;margin:14px 0 18px;display:flex;gap:12px;align-items:flex-start}.principle strong{color:#18486d}.principle p{margin:0;color:#41536a}.grid{display:grid;grid-template-columns:minmax(270px,340px) minmax(0,1fr);gap:17px;align-items:start}main{min-width:0}.card{background:var(--card);border:1px solid var(--line);border-radius:13px;box-shadow:var(--shadow);min-width:0}.cardhead{padding:14px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0}.cardhead h2,.cardhead h3{font-size:15px;margin:0}.cardhead>.small{min-width:0;max-width:48%;text-align:right;overflow-wrap:anywhere;word-break:break-word}.resulttitle{min-width:0;flex-wrap:wrap}.cardbody{padding:15px 16px;min-width:0}.mapline{display:flex;gap:8px}.mapline input{min-width:0;flex:1}.textinput,input[type=text],input[type=number],select,textarea{border:1px solid #cbd6e3;border-radius:8px;padding:9px 10px;color:var(--ink);background:white}input[type=number]{width:100%}.small{font-size:12px;color:var(--muted)}.samples{max-height:57vh;overflow:auto;margin-top:12px;border-top:1px solid var(--line)}.sample{padding:10px 9px;display:flex;justify-content:space-between;gap:8px;border-bottom:1px solid #edf1f6;cursor:pointer}.sample:hover,.sample.active{background:#edf5ff}.sampleid{font-weight:700}.samplemeta{font-size:11px;color:var(--muted)}.count{border-radius:12px;background:#edf1f6;color:#4d6075;padding:2px 8px;font-size:11px;height:max-content}.section{margin-bottom:16px}.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.row.between{justify-content:space-between}.muted{color:var(--muted)}.help{font-size:12px;color:var(--muted);margin:5px 0 0}.settings{display:grid;grid-template-columns:repeat(4,minmax(110px,1fr));gap:11px}.setting label{display:block;font-size:12px;font-weight:650;color:#495b71;margin-bottom:5px}.setting .explain{font-size:10px;color:var(--muted);margin-top:3px}.readscroll{max-width:100%;overflow:auto}.reads{width:100%;min-width:800px;border-collapse:collapse;font-size:12px}.reads th,.reads td{text-align:left;padding:8px 7px;border-bottom:1px solid #e9eef4;vertical-align:middle}.reads th{font-size:11px;color:var(--muted);font-weight:650}.reads input{width:100%;min-width:100px;padding:7px}.reads select{padding:7px}.runbar{display:flex;align-items:center;gap:12px;margin-top:14px;flex-wrap:wrap}.statusline{min-height:22px;color:var(--muted)}.batchbox{margin-top:12px;padding:10px;border:1px solid #dce7f2;border-radius:9px;background:#f8fbff}.batchbox .statusline{overflow-wrap:anywhere}.results{margin-top:18px}.resulttitle{display:flex;align-items:center;justify-content:space-between;gap:10px}.pill{padding:5px 9px;border-radius:20px;font-size:11px;font-weight:750}.pill.pass{background:var(--softteal);color:#087663}.pill.warn{background:var(--softamber);color:#9b5b00}.pill.fail{background:var(--softred);color:#a42c36}.pill.neutral{background:#edf1f5;color:#56667b}.metrics{display:grid;grid-template-columns:repeat(5,minmax(100px,1fr));gap:9px;margin:13px 0}.metric{background:#f7f9fc;border:1px solid #e6ebf2;border-radius:9px;padding:10px}.metric label{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.04em}.metric b{font-size:17px}.why{padding:11px 13px;border-radius:9px;background:#f3f6fa;margin:10px 0;overflow-wrap:anywhere}.images{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:11px}.images figure{margin:0;padding:8px;border:1px solid var(--line);border-radius:9px;background:#fff}.images img{width:100%;height:auto;display:block}.images figcaption{font-size:11px;color:var(--muted);padding:5px}.links{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}.links a{color:#145e9d;text-decoration:none;border:1px solid #d5e3f0;border-radius:7px;background:#f6faff;padding:6px 9px;font-size:12px}.reviewbox{margin-top:14px;padding:13px;border:1px solid #efd397;background:#fff9eb;border-radius:10px}.reviewbox textarea{width:100%;min-height:65px;margin-top:8px}.reviewbox input{max-width:230px}.reviewbox .row{margin-top:9px}.hidden{display:none!important}.modal{position:fixed;inset:0;background:rgba(18,34,55,.45);display:grid;place-items:center;padding:18px;z-index:5}.modalbox{background:white;border-radius:14px;width:min(780px,100%);max-height:85vh;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 20px 70px #10253d44}.modalbody{padding:14px;overflow:auto}.browseritem{display:flex;align-items:center;gap:8px;padding:8px;border-bottom:1px solid #edf1f5}.browseritem span{flex:1;overflow-wrap:anywhere}.browseritem button{padding:6px 9px;font-size:12px}.footer{margin:18px 0 0;text-align:center;color:var(--muted);font-size:11px}.error{color:var(--red);white-space:pre-wrap}.spinner{width:15px;height:15px;border:2px solid #d3e5f6;border-top-color:#2474c6;border-radius:50%;animation:spin .7s linear infinite;display:inline-block;vertical-align:middle}@keyframes spin{to{transform:rotate(360deg)}}
-@media(max-width:900px){.grid{grid-template-columns:1fr}.samples{max-height:32vh}.settings{grid-template-columns:repeat(2,minmax(110px,1fr))}.metrics{grid-template-columns:repeat(3,minmax(90px,1fr))}.rootbadge{max-width:55%}}
-@media(max-width:560px){.wrap{padding:12px}.top{align-items:flex-start;flex-direction:column}.rootbadge{max-width:100%}.settings{grid-template-columns:repeat(2,minmax(90px,1fr))}.metrics{grid-template-columns:repeat(2,minmax(90px,1fr))}.images{grid-template-columns:1fr}.reads{min-width:680px}.readscroll{overflow:auto}}
-.reads td:first-child{max-width:340px;overflow-wrap:anywhere}.reads td .small{overflow-wrap:anywhere;word-break:break-word}.qualityreads{min-width:1180px}.qualityreads thead tr:first-child th{text-align:center;background:#f7f9fc}.qualityreads thead tr:nth-child(2) th{border-top:0}
-</style>
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}button,input,select{font:inherit}button{border:0;border-radius:8px;padding:9px 13px;background:var(--navy);color:white;font-weight:650;cursor:pointer}button:hover{filter:brightness(1.08)}button:disabled{opacity:.5;cursor:wait}.secondary{background:#e7edf5;color:var(--ink)}.blue{background:var(--blue)}.green{background:var(--teal)}.red{background:var(--red)}.quiet{background:transparent;color:var(--blue);padding:5px 7px}.wrap{width:100%;max-width:none;margin:0;padding:22px clamp(14px,1.4vw,30px)}.top{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:16px}.brand{display:flex;gap:14px;align-items:center}.mark{display:grid;place-items:center;width:44px;height:44px;border-radius:13px;background:#dcecff;color:#15558c;font-size:23px}.brand h1{font-size:23px;line-height:1.15;margin:0}.brand p{margin:5px 0 0;color:var(--muted)}.top-actions{display:flex;align-items:center;justify-content:flex-end;gap:9px;min-width:0}.rootbadge{padding:8px 11px;border:1px solid var(--line);border-radius:9px;background:white;color:var(--muted);max-width:48%;overflow-wrap:anywhere}.shutdown{background:#fff0f0;color:#9d2630;border:1px solid #f1c8cb;white-space:nowrap}.shutdown:hover{background:#ffe4e5}.shutdown:disabled{opacity:.6}.shutdown-notice{display:none;margin:12px 0;padding:13px 16px;border:1px solid #e8c1c4;border-radius:10px;background:#fff1f1;color:#8f2630;font-weight:650}.shutdown-notice.show{display:block}.principle{border:1px solid #c8deef;background:linear-gradient(100deg,#edf7ff,#f3fbfa);border-radius:12px;padding:13px 16px;margin:14px 0 18px;display:flex;gap:12px;align-items:flex-start}.principle strong{color:#18486d}.principle p{margin:0;color:#41536a}.grid{display:grid;grid-template-columns:minmax(270px,340px) minmax(0,1fr);gap:17px;align-items:start}main{min-width:0}.sidebar{position:sticky;top:12px;height:calc(100vh - 24px);max-height:calc(100vh - 24px);display:flex;flex-direction:column;overflow:hidden}.sidebar>.cardbody{flex:1;min-height:0;display:flex;flex-direction:column}.sidebar-runbar{margin-top:10px;padding:10px 0 2px;border-top:1px solid var(--line);background:var(--card)}.sidebar-runbar button{width:100%}.sidebar-runbar .statusline{display:block;margin-top:5px;min-height:17px}.card{background:var(--card);border:1px solid var(--line);border-radius:13px;box-shadow:var(--shadow);min-width:0}.cardhead{padding:14px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0}.cardhead h2,.cardhead h3{font-size:15px;margin:0}.cardhead>.small{min-width:0;max-width:48%;text-align:right;overflow-wrap:anywhere;word-break:break-word}.resulttitle{min-width:0;flex-wrap:wrap}.cardbody{padding:15px 16px;min-width:0}.mapline{display:flex;gap:8px}.mapline input{min-width:0;flex:1}.textinput,input[type=text],input[type=number],select,textarea{border:1px solid #cbd6e3;border-radius:8px;padding:9px 10px;color:var(--ink);background:white}input[type=number]{width:100%}.small{font-size:12px;color:var(--muted)}.samples{flex:1;min-height:100px;max-height:none;overflow:auto;margin-top:12px;border-top:1px solid var(--line)}.sample{padding:10px 9px;display:flex;justify-content:space-between;gap:8px;border-bottom:1px solid #edf1f6;cursor:pointer}.sample:hover,.sample.active{background:#edf5ff}.sampleid{font-weight:700}.samplemeta{font-size:11px;color:var(--muted)}.count{border-radius:12px;background:#edf1f6;color:#4d6075;padding:2px 8px;font-size:11px;height:max-content}.section{margin-bottom:16px}.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.row.between{justify-content:space-between}.muted{color:var(--muted)}.help{font-size:12px;color:var(--muted);margin:5px 0 0}.settings{display:grid;grid-template-columns:repeat(4,minmax(110px,1fr));gap:11px}.setting label{display:block;font-size:12px;font-weight:650;color:#495b71;margin-bottom:5px}.setting .explain{font-size:10px;color:var(--muted);margin-top:3px}.readscroll{max-width:100%;overflow:auto}.reads{width:100%;min-width:800px;border-collapse:collapse;font-size:12px}.reads th,.reads td{text-align:left;padding:8px 7px;border-bottom:1px solid #e9eef4;vertical-align:middle}.reads th{font-size:11px;color:var(--muted);font-weight:650}.reads input{width:100%;min-width:100px;padding:7px}.reads select{padding:7px}.runbar{display:flex;align-items:center;gap:12px;margin-top:14px;flex-wrap:wrap}.statusline{min-height:22px;color:var(--muted)}.batchbox{margin-top:12px;padding:10px;border:1px solid #dce7f2;border-radius:9px;background:#f8fbff}.batchbox .statusline{overflow-wrap:anywhere}.results{margin-top:18px}.resulttitle{display:flex;align-items:center;justify-content:space-between;gap:10px}.pill{padding:5px 9px;border-radius:20px;font-size:11px;font-weight:750}.pill.pass{background:var(--softteal);color:#087663}.pill.warn{background:var(--softamber);color:#9b5b00}.pill.fail{background:var(--softred);color:#a42c36}.pill.neutral{background:#edf1f5;color:#56667b}.metrics{display:grid;grid-template-columns:repeat(5,minmax(100px,1fr));gap:9px;margin:13px 0}.metric{background:#f7f9fc;border:1px solid #e6ebf2;border-radius:9px;padding:10px}.metric label{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.04em}.metric b{font-size:17px}.why{padding:11px 13px;border-radius:9px;background:#f3f6fa;margin:10px 0;overflow-wrap:anywhere}.images{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:11px}.images figure{margin:0;padding:8px;border:1px solid var(--line);border-radius:9px;background:#fff}.images img{width:100%;height:auto;display:block}.images figcaption{font-size:11px;color:var(--muted);padding:5px}.links{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}.links a{color:#145e9d;text-decoration:none;border:1px solid #d5e3f0;border-radius:7px;background:#f6faff;padding:6px 9px;font-size:12px}.reviewbox{margin-top:14px;padding:13px;border:1px solid #efd397;background:#fff9eb;border-radius:10px}.reviewbox textarea{width:100%;min-height:65px;margin-top:8px}.reviewbox input{max-width:230px}.reviewbox .row{margin-top:9px}.hidden{display:none!important}.modal{position:fixed;inset:0;background:rgba(18,34,55,.45);display:grid;place-items:center;padding:18px;z-index:5}.modalbox{background:white;border-radius:14px;width:min(780px,100%);max-height:85vh;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 20px 70px #10253d44}.modalbody{padding:14px;overflow:auto}.browseritem{display:flex;align-items:center;gap:8px;padding:8px;border-bottom:1px solid #edf1f5}.browseritem span{flex:1;overflow-wrap:anywhere}.browseritem button{padding:6px 9px;font-size:12px}.footer{margin:18px 0 0;text-align:center;color:var(--muted);font-size:11px}.error{color:var(--red);white-space:pre-wrap}.spinner{width:15px;height:15px;border:2px solid #d3e5f6;border-top-color:#2474c6;border-radius:50%;animation:spin .7s linear infinite;display:inline-block;vertical-align:middle}@keyframes spin{to{transform:rotate(360deg)}}
+@media(max-width:900px){.top-actions{max-width:100%;width:100%;justify-content:space-between}.grid{grid-template-columns:1fr}.sidebar{position:static;height:auto;max-height:none;overflow:visible}.sidebar>.cardbody{display:block;flex:none}.samples{max-height:32vh;min-height:0;flex:none}.settings{grid-template-columns:repeat(2,minmax(110px,1fr))}.metrics{grid-template-columns:repeat(3,minmax(90px,1fr))}.rootbadge{max-width:55%}}
+@media(max-width:560px){.wrap{padding:12px}.top{align-items:flex-start;flex-direction:column}.top-actions{align-items:stretch;flex-direction:column}.rootbadge{max-width:100%}.rootbadge{max-width:100%}.settings{grid-template-columns:repeat(2,minmax(90px,1fr))}.metrics{grid-template-columns:repeat(2,minmax(90px,1fr))}.images{grid-template-columns:1fr}.reads{min-width:680px}.readscroll{overflow:auto}}
+.reads td:first-child{max-width:340px;overflow-wrap:anywhere}.reads td .small{overflow-wrap:anywhere;word-break:break-word}.reviewtablewrap{max-height:68vh;overflow:auto;position:relative;overscroll-behavior:contain;border:1px solid var(--line);border-radius:9px}.reviewtable{min-width:1660px;border-collapse:separate;border-spacing:0}.reviewtable thead th{position:sticky;top:0;z-index:4;background:#f7f9fc;box-shadow:0 1px 0 var(--line)}.reviewtable td{vertical-align:top}.reviewtable td:nth-child(1){min-width:115px;font-weight:700}.reviewtable td:nth-child(4){min-width:210px;white-space:normal;overflow-wrap:anywhere}.reviewtable td:nth-child(5){min-width:300px;white-space:normal;overflow-wrap:anywhere}.reviewtable td:nth-child(6){min-width:220px;white-space:normal;overflow-wrap:anywhere}.reviewReadEvidence{margin-top:5px;color:var(--muted);font-size:11px;line-height:1.35;overflow-wrap:anywhere}.reviewtable select{min-width:170px}.reviewtable input{min-width:180px}.review-override-hint{margin-top:4px;color:#8b5708;font-weight:650}.reviewtable tr.qcfail{background:#fffafa}.reviewtable tr.warning{background:#fffdf8}.qualityreads{min-width:1180px}.qualityreads thead tr:first-child th{text-align:center;background:#f7f9fc}.qualityreads thead tr:nth-child(2) th{border-top:0}
+.taxonomy-settings{margin-top:15px;padding:12px;border:1px solid #d9e4ef;border-radius:9px;background:#f8fbff}.taxonomy-settings h3{font-size:13px;margin:0 0 7px}.taxonomy-path{display:flex;gap:8px;align-items:center;margin-top:7px}.taxonomy-path input{min-width:0;flex:1;width:100%;font-size:12px}.taxonomy-status{margin-top:6px;overflow-wrap:anywhere}.taxonomy-results{margin-top:15px;padding:13px;border:1px solid var(--line);border-radius:10px;background:#fbfcfe}.taxonomy-results h3{margin:0 0 8px;font-size:14px}.taxonomy-results h4{font-size:12px;margin:13px 0 6px}.taxonomy-summary{min-width:1050px}.taxonomy-hits{min-width:1250px}.taxonomy-results .readscroll{margin-top:6px}.taxon-nearbest{display:inline-block;padding:2px 6px;border-radius:12px;background:#e6f5ef;color:#087663;font-size:10px;font-weight:750}.taxon-qualified{display:inline-block;padding:2px 6px;border-radius:12px;background:#eaf2ff;color:#245f9a;font-size:10px;font-weight:750}.taxon-muted{color:var(--muted);font-size:11px}
+
+/* Assembly-centred review redesign */
+.review-hero{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;padding:18px 20px;background:linear-gradient(110deg,#f0f6ff,#f5fbfa);border:1px solid #d9e6f2;border-radius:13px;margin:8px 0 12px}
+.review-hero h2{font-size:21px;margin:3px 0}.review-hero p{margin:4px 0 0}.eyebrow{font-size:10px;letter-spacing:.12em;font-weight:800;color:#58718d}
+.hero-status,.candidate-qc{padding:6px 10px;border-radius:20px;font-size:11px;font-weight:800;white-space:nowrap}.hero-status.pass,.candidate-qc.pass{background:#e4f5ef;color:#087663}.hero-status.warn,.candidate-qc.warn{background:#fff1d7;color:#925600}.hero-status.fail{background:#ffeaeb;color:#a42c36}
+.review-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 14px}.review-metrics>div{background:white;border:1px solid var(--line);border-radius:10px;padding:12px 14px}.review-metrics b{display:block;font-size:23px;line-height:1.2}.review-metrics span{font-size:11px;color:var(--muted)}
+.review-panel{background:white;border:1px solid var(--line);border-radius:13px;padding:16px;margin:0 0 14px;box-shadow:0 4px 16px rgba(24,48,78,.04)}
+.panel-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.panel-heading h3{margin:0;font-size:16px}.panel-heading p{margin:4px 0 12px;color:var(--muted);font-size:12px}
+.sequence-toolbar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:9px 0;border-top:1px solid #edf1f5;font-size:11px;color:#52647a}.sequence-toolbar span:last-child{margin-left:auto}.legend-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}.blue-dot{background:#2474c6}.red-dot{background:#c64d53}.amber-dot{background:#d99a28}
+.sequence-scroll{max-height:260px;overflow:auto;border:1px solid #e4eaf1;border-radius:9px;padding:12px;background:#fbfcfe}.consensus-seq{font:600 13px/2.05 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere;word-break:break-all;letter-spacing:.025em}.base{display:inline-block;min-width:9px;text-align:center;border-radius:2px;cursor:pointer}.base:hover{background:#dcecff;outline:1px solid #8bb8e7}.base.discordant{background:#ffe1e2;color:#a52d37;text-decoration:underline;text-decoration-color:#c64d53;text-decoration-thickness:2px}.base.ambiguous{background:#fff0cc;color:#895600;font-weight:900}.sequence-inspector{min-height:36px;margin-top:9px;padding:9px 11px;border-radius:8px;background:#f3f6fa;font-size:12px;color:#43556b}.review-note{font-size:11px;color:#66778c;margin-top:9px}
+.candidate-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px}.candidate-card{border:1px solid #e0e7ef;border-radius:10px;padding:12px;background:#fcfdff;min-width:0}.candidate-top{display:flex;justify-content:space-between;gap:8px;align-items:center}.candidate-top>b{overflow-wrap:anywhere}.candidate-length{font-size:25px;font-weight:800;margin:10px 0 2px}.candidate-length small{font-size:12px;color:var(--muted);font-weight:500}.candidate-card p{font-size:11px;color:#50637a;overflow-wrap:anywhere;margin:4px 0 8px}.candidate-meta{font-size:11px;color:#52647a;margin-bottom:7px}.candidate-card>small{font-size:10px;color:var(--muted)}
+.diagnostics{margin:9px 0;background:white;border:1px solid var(--line);border-radius:10px;overflow:hidden}.diagnostics summary{cursor:pointer;padding:13px 15px;font-weight:700;color:#344b64;background:#f8fafc;list-style-position:inside}.diagnostics[open] summary{border-bottom:1px solid var(--line)}.diagnostics .readscroll{padding:8px 12px}.position-table{max-height:420px}.position-table .reads{min-width:650px}
+@media(max-width:800px){.review-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.panel-heading{flex-direction:column}.panel-heading button{width:100%}.review-hero{flex-direction:column}.sequence-toolbar span:last-child{margin-left:0}}
+
+
+.candidate-grid{grid-template-columns:repeat(auto-fit,minmax(min(100%,285px),1fr));align-items:stretch}.candidate-card{display:flex;flex-direction:column;gap:7px;overflow-wrap:anywhere}.candidate-card .candidate-top{align-items:flex-start}.candidate-card .candidate-top>b{min-width:0;overflow-wrap:anywhere;word-break:break-word}.candidate-card .candidate-qc{flex-shrink:0}.candidate-card .candidate-select{margin-top:auto;width:100%;background:#e8f1fb;color:#174f83;border:1px solid #c9dced}.candidate-card.chosen{border:2px solid #2474c6;background:#f4f9ff;box-shadow:0 0 0 3px #2474c61a}.candidate-card.viewer-active:not(.chosen){border-color:#8bb8e5;background:#f8fbff}.candidate-override{border-color:#edcf91;background:#fffdf8}.candidate-qc.fail{background:#ffeaeb;color:#a42c36}.override-warning{padding:7px 8px;border-radius:7px;background:#fff0d3;color:#805000;font-size:11px;font-weight:700}.selection-footer{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-top:13px;padding-top:12px;border-top:1px solid #e8edf3}.selection-footer span{flex:1;min-width:200px;font-size:12px;color:#50637a}.candidate-card p{margin:2px 0}.candidate-card>small{margin-bottom:4px}
+
+
+.alignment-controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:10px 0}.alignment-controls label{font-size:11px;font-weight:700;color:var(--muted)}.alignment-controls input[type=number]{width:90px;padding:6px;border:1px solid var(--line);border-radius:6px}.alignment-controls input[type=range]{flex:1;min-width:150px}.alignment-legend{display:flex;gap:9px;align-items:center;flex-wrap:wrap;font-size:10px;color:var(--muted);margin:8px 0}.alignment-legend span{padding:2px 5px;border-radius:3px;font-weight:800}.aln-match{background:#e7f4ed;color:#176b48}.aln-gap{background:#eef1f5;color:#778}.aln-diff{background:#ffe1e2;color:#a52d37}.aln-ambig{background:#fff0cc;color:#895600}.alignment-scroll{overflow:auto;border:1px solid var(--line);border-radius:8px;background:#fff;max-height:340px}.alignment-grid{display:grid;grid-template-columns: minmax(190px,190px) repeat(var(--cols),19px);min-width:max-content;font:11px/1.8 ui-monospace,SFMono-Regular,Consolas,monospace}.alignment-grid .aln-label{position:sticky;left:0;box-sizing:border-box;width:190px;min-width:0;max-width:190px;overflow:hidden;text-overflow:ellipsis;background:#f5f8fc;z-index:2;padding:3px 8px;border-right:1px solid #dfe6ef;white-space:nowrap;font:600 10px/1.8 system-ui,sans-serif}.alignment-grid .aln-cell{text-align:center;border-bottom:1px solid #f0f2f5;cursor:pointer}.alignment-grid .aln-cell.diff{background:#ffe1e2;color:#a52d37;font-weight:900}.alignment-grid .aln-cell.ambig{background:#fff0cc;color:#895600;font-weight:900}.alignment-grid .aln-cell.gap{color:#c2c9d2}.alignment-grid .aln-cell.selected{outline:2px solid #2474c6;outline-offset:-2px}.alignment-grid .aln-ruler{color:#718096;background:#f8fafc}.alignment-grid .aln-consensus{font-weight:900;background:#edf4fc}.alignment-grid .aln-cell:hover{outline:1px solid #2474c6}
+
+.trace-read-selector{margin:7px 0;padding:8px 11px;border:1px solid var(--line);border-radius:8px;background:#fff;font-size:11px}
+.trace-read-selector summary{cursor:pointer;font-weight:700;color:var(--ink)}
+.trace-read-options{display:flex;flex-wrap:wrap;gap:7px 16px;padding-top:9px}
+.trace-read-options label{display:grid;grid-template-columns:14px auto;column-gap:6px;align-items:center;font-size:11px}
+.trace-read-options label small{grid-column:2;color:var(--muted);font-size:9px}
+.trace-read-options input{accent-color:#2474c6}
+.trace-read-unavailable{opacity:.55}
+.trace-count-summary{font-size:10px;color:var(--muted);margin:4px 1px 9px}
+.trace-controls{grid-column:1/-1;display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:10px 12px;margin:8px 0 2px;background:#f5f8fc;border:1px solid var(--line);border-radius:8px;font-size:11px}.trace-controls label{display:flex;align-items:center;gap:7px;font-weight:700}.trace-controls select{border:1px solid #cbd5e1;border-radius:6px;padding:6px 9px;background:#fff;color:var(--ink)}.trace-control-note{color:var(--muted);font-size:10px}.trace-overlay-card{grid-column:1/-1}.trace-overlay-svg{height:340px}.trace-overlay-toggle input{accent-color:#2474c6}.trace-review-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:12px;margin-top:10px;align-items:stretch}.trace-read-card{border:1px solid var(--line);border-radius:9px;padding:12px;min-width:0;background:#fff}.trace-read-card h4{margin:0 0 6px;font-size:12px}.trace-read-card .trace-meta{font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.45}.trace-svg{width:100%;height:250px;display:block;background:#fbfcfe;border:1px solid #e6ebf2;border-radius:6px}.trace-note{font-size:11px;color:var(--muted);margin:7px 0}.trace-legend{display:flex;gap:12px;flex-wrap:wrap;font-size:10px;margin:7px 0}.trace-legend span{font-weight:700}.trace-no-data{padding:18px;background:#fff8e8;color:#875600;border-radius:6px;font-size:11px}.trace-review-grid>.trace-no-data{grid-column:1/-1}.trace-review-grid:has(>.trace-read-card:only-of-type){grid-template-columns:minmax(0,1fr)}</style>
 </head>
 <body>
 <div class="wrap">
   <header class="top">
     <div class="brand"><div class="mark">⌁</div><div><h1>Sanger Studio</h1><p>Inspect chromatograms, primer mapping, trimming, overlap assembly and QC decisions.</p></div></div>
-    <div class="rootbadge" id="rootBadge">Connecting…</div>
+    <div class="top-actions">
+      <div class="rootbadge" id="outputBadge">Connecting…</div>
+      <button class="shutdown" id="shutdownBtn" type="button" title="Stop the local Sanger Studio server">Shut down Studio</button>
+    </div>
   </header>
+  <div class="shutdown-notice" id="shutdownNotice" role="status" aria-live="polite">Sanger Studio has stopped. Your saved outputs and review decisions remain on disk. You can close this browser tab.</div>
   <div class="principle"><div>ⓘ</div><p><strong>Read length and consensus length are different checks.</strong> The default minimum usable primer read is <b>300 bp</b>; the default minimum final sequence is <b>800 bp</b>. A 700 bp read can contribute to a longer assembled consensus when it passes read QC and overlaps its partner read. A read that fails read-level quality filters is excluded from the assembly.</p></div>
   <div class="grid">
-    <aside class="card">
-      <div class="cardhead"><h2>Batch and isolates</h2><button class="secondary" id="browseBtn">Browse</button></div>
+    <aside class="card sidebar">
+      <div class="cardhead"><h2>Input batch and isolates</h2></div>
       <div class="cardbody">
-        <div class="mapline"><input id="mapPath" type="text" placeholder="Mailroom ab1_map.tsv path"><button id="loadMap">Load</button></div>
-        <p class="help">Load a Mailroom map for correct sample IDs, primers and read directions. Or browse to AB1 files and make a quick editable map.</p>
-        <div id="mapStatus" class="small" style="margin-top:10px"></div>
+        <div class="row">
+          <button class="blue" id="chooseInputFolderBtn" type="button">Choose input folder</button>
+          <button class="secondary" id="chooseReadsBtn" type="button">Select AB1/ABI files</button>
+          <button class="secondary" id="uploadZipBtn" type="button">Upload AB1 ZIP</button>
+          <input id="ab1ZipInput" type="file" accept=".zip,application/zip" hidden>
+        </div>
+        <p class="help">Choose a directory containing AB1/ABI chromatograms (including nested folders), an Assistant cohort, sample maps, individual chromatograms, or a ZIP containing AB1/ABI files. ZIP uploads are extracted locally by Studio; raw chromatograms are grouped by inferred sample ID. Check every inferred primer and direction before assembly. Assistant taxonomy is optional. Studio automatically detects Assistant cohort outputs, standalone sample maps, or raw AB1/ABI chromatograms.</p>
+        <div id="mapStatus" class="small" style="margin-top:10px">No input loaded yet. Choose a folder, sample map or chromatogram files.</div>
+        <div class="batchbox" style="margin-top:8px">
+          <div class="row between"><strong>Taxonomy evidence</strong><span id="onboardingTaxonomyStatus" class="small">Not screened</span></div>
+          <div id="onboardingTaxonomyDetails" class="small" style="margin-top:5px">Pre-screened assignments load automatically when a matching Assistant cohort is detected. Otherwise taxonomy starts as NOT_SCREENED; fresh VSEARCH is optional.</div>
+        </div>
+        <details style="margin-top:9px">
+          <summary class="small" style="cursor:pointer">Alternative: load a standalone sample map</summary>
+          <div class="row" style="margin-top:8px"><button class="secondary" id="chooseMapBtn" type="button">Choose sample map</button></div>
+          <div class="mapline" style="margin-top:8px"><input id="mapPath" type="text" placeholder="Paste a standalone sample map path"><button id="loadMap">Load path</button></div>
+          <p class="help">For unusual directory structures, select a TSV/CSV/TXT map directly. Read paths can live anywhere; relative paths resolve from the map file.</p>
+        </details>
+        <div class="batchbox">
+          <div class="row between"><strong>Output directory</strong><button class="secondary" id="chooseOutputBtn">Choose folder</button></div>
+          <div id="outputPath" class="small" style="margin-top:5px;overflow-wrap:anywhere"></div>
+        </div>
         <div class="batchbox"><button id="processAllBtn" class="blue" style="width:100%">Process and download all</button><div id="batchStatus" class="statusline small" style="margin-top:7px">Runs the loaded map through Paper Trail and bundles all results for download.</div></div>
         <input id="sampleSearch" type="text" placeholder="Filter isolate IDs…" style="width:100%;margin-top:10px">
         <div id="samples" class="samples"></div>
+        <div class="sidebar-runbar"><button class="blue" id="runBtnSidebar" disabled>Inspect and assemble this isolate</button><span id="sidebarRunStatus" class="statusline small" role="status" aria-live="polite">Select an isolate to inspect it.</span></div>
       </div>
     </aside>
     <main>
       <section class="card">
         <div class="cardhead"><h2 id="sampleHeading">Select an isolate</h2><span class="small" id="sampleSub"></span></div>
         <div class="cardbody">
-          <div id="emptyHint" class="muted">Load a Mailroom map or select AB1 files from Browse. The table below lets you verify and correct each read’s primer and orientation before assembly.</div>
+          <div id="emptyHint" class="muted">Choose an input folder, standalone sample map or AB1/ABI files. The table below lets you verify and correct each read’s primer and orientation before assembly.</div>
           <div id="samplePanel" class="hidden">
             <div class="readscroll"><table class="reads"><thead><tr><th>Read file</th><th>Primer</th><th>Direction</th><th>Mode</th></tr></thead><tbody id="readRows"></tbody></table></div>
-            <p class="help">Check that reverse primers are marked <b>reverse</b>. A wrong direction can prevent real overlaps from being found.</p>
-            <div class="row" style="margin:14px 0 10px"><strong>QC and assembly settings</strong><button class="quiet" id="resetSettings">Reset defaults</button><span class="small">Used for this isolate or the full batch.</span><label class="small">Read mode <select id="mode"><option value="map">Use map setting</option><option value="assemble">Assemble primer reads</option><option value="best_read">Select best read</option></select></label></div>
+            <p class="help">Add one map row per chromatogram: any number of forward and reverse primers can belong to the same isolate (for example, 2F + 2R). Check inferred sample IDs, primer names and directions. Reads are assembled only where they meet the configured overlap criteria; incompatible or non-overlapping reads are reported rather than forced into a consensus.</p>
+            <div class="row" style="margin:14px 0 10px;align-items:center">
+              <strong>Sequence target</strong>
+              <label class="small">Profile <select id="sequenceType"><option value="16S">16S rRNA</option><option value="ITS">ITS</option><option value="18S">18S rRNA</option><option value="28S_LSU">28S / LSU rRNA</option><option value="CUSTOM">Other / custom target</option></select></label>
+              <span class="small" id="sequenceTypeHelp">Starting QC thresholds for 16S; edit them below to match the assay.</span>
+            </div>
+            <div class="row" style="margin:14px 0 10px"><strong>QC and assembly settings</strong><button class="quiet" id="resetSettings">Reset defaults</button><span class="small">Used for this isolate or the full batch.</span><label class="small">Read mode <select id="mode"><option value="map">Use map setting</option><option value="assemble">Assemble primer reads</option><option value="best_read">Single best read (skip assembly)</option></select></label></div>
+            <p class="help">Use Assemble primer reads for routine paired-primer Sanger data. Single best read deliberately skips overlap assembly. When assembly cannot form a consensus, Studio offers the eligible reads for manual fallback selection in the cohort review table.</p>
             <div class="settings" id="settings"></div>
-            <div class="runbar"><button class="blue" id="runBtn">Inspect and assemble this isolate</button><span id="runStatus" class="statusline"></span></div>
+            <details style="margin-top:12px">
+              <summary class="small" style="cursor:pointer">Optional custom primer sequences</summary>
+              <p class="help">Add custom primer sequences when using a target or primer not in the built-in registry. One primer per line: <code>primer_name[TAB]IUPAC_sequence</code>. These sequences are used for conservative leading-primer trimming; set each read's primer name and direction in the table above.</p>
+              <textarea id="customPrimerSequences" rows="4" style="width:100%;font-family:ui-monospace,monospace" placeholder="ITS1F2&#9;GAAGGTGAAGTCGTAACAAGG"></textarea>
+            </details>
+            <div class="taxonomy-settings">
+              <div class="row between"><h3>Pre-screened taxonomy evidence</h3><span class="small" id="sampleTaxonomyStatus">Automatic when available</span></div>
+              <p class="help">When an Assistant cohort structure is detected, the normalised read maps and matching Paper Trail taxonomy/hit files are loaded together. Standalone users do not need Assistant cohort mode: their taxonomy starts as <code>NOT_SCREENED</code> and can optionally be generated with VSEARCH below.</p>
+            </div>
+            <div class="taxonomy-settings">
+              <div class="row between"><h3>Optional: re-run taxonomy screening</h3><span class="small" id="taxScreenStatus">Off by default</span></div>
+              <label class="small" style="display:flex;align-items:center;gap:8px;margin:7px 0">
+                <input id="rerunTaxonomyCheck" type="checkbox" style="width:auto">
+                Re-run VSEARCH using the reads trimmed with the QC settings above
+              </label>
+              <p class="help">Leave unchecked to display pre-screened onboarding assignments. When checked, clicking Inspect and assemble this isolate runs a new VSEARCH search against the selected reference using the current trimmed reads. Studio displays a live running message and confirms completion (including zero-hit runs).</p>
+              <details style="margin-top:8px">
+                <summary class="small" style="cursor:pointer">Optional VSEARCH reference settings</summary>
+                <label class="small" for="screenRefPath" style="display:block;margin-top:8px">Reference FASTA</label>
+                <div class="taxonomy-path"><input id="screenRefPath" type="text" placeholder="GTDB / SILVA / other reference FASTA"><button class="secondary" id="chooseTaxonomyRefBtn" type="button">Choose FASTA</button></div>
+                <label class="small" for="screenTaxaPath" style="display:block;margin-top:8px">Taxonomy mapping table (optional; leave blank to use FASTA headers)</label>
+                <div class="taxonomy-path"><input id="screenTaxaPath" type="text" placeholder="Optional reference ID → taxonomy TSV/CSV"><button class="secondary" id="chooseTaxonomyTableBtn" type="button">Choose table</button></div>
+                <div class="row between" style="margin-top:8px"><span class="small" id="taxScreenConfigSource"></span><button class="blue" id="applyTaxonomySettingsBtn" type="button">Apply optional re-screen settings</button></div>
+              </details>
+            </div>
+            <div class="runbar"><button class="blue" id="runBtn">Inspect and assemble this isolate</button><span id="runStatus" class="statusline" role="status" aria-live="polite"></span></div>
+          </div>
+        </div>
+      </section>
+      <section id="cohortReview" class="card results">
+        <div class="cardhead">
+          <div class="resulttitle"><h2>Cohort marker review</h2><span id="cohortReviewPill" class="pill neutral">Not attached</span></div>
+          <button class="secondary" id="attachReviewBtn">Attach review TSV</button>
+        </div>
+        <div class="cardbody">
+          <p class="help">Attach the cohort_marker_review_template.tsv generated by Assistant. Review warning, failed-QC and unverified markers here; the original template is never overwritten. When no consensus can be formed, choose which read-passing-QC sequence to carry forward. The longest usable read is recommended by default; a manual choice is saved with reviewer identity and is reapplied by Assistant PREPARE when you supply this decisions TSV with --marker-review. This is an individual-read fallback, not an assembled consensus. <b>APPROVE_FAIL_QC</b> is a separate human override for an available failed marker candidate: the automated QC/read-level status remains FAIL_QC, while the approved candidate is carried into the joint marker set and the override is recorded downstream.</p>
+          <div id="cohortReviewStatus" class="small">No cohort review file attached.</div>
+          <div id="cohortReviewControls" class="hidden">
+            <div class="row between" style="margin:12px 0">
+              <label>Reviewer (required for decisions) <input type="text" id="cohortReviewer" placeholder="Name or initials" autocomplete="name"></label>
+              <input type="text" id="cohortReviewSearch" placeholder="Filter sequence / partner / reason…" style="min-width:220px;flex:1">
+              <select id="cohortReviewFilter"><option value="all">All QC classes</option><option value="PASS_WITH_WARNINGS">Warnings</option><option value="FAIL_QC">Failed QC</option><option value="QUALITY_UNVERIFIED">Unverified</option></select>
+              <button class="green" id="saveCohortReviewBtn">Save review decisions</button>
+            </div>
+            <div class="help">Every recorded decision needs a reviewer name or initials. APPROVE, APPROVE_FAIL_QC and APPROVE_UNVERIFIED also require a short rationale in Reviewer notes. Blank decisions are saved as drafts.</div>
+            <div id="cohortReviewCounts" class="batchbox small"></div>
+            <div class="readscroll reviewtablewrap"><table class="reads reviewtable"><thead><tr><th>Sequence</th><th>Partner / dataset</th><th>QC / review type</th><th>QC reasons</th><th>Output sequence / review candidate</th><th>Fallback read selection</th><th>Taxonomy evidence</th><th>Decision</th><th>Reviewer notes</th></tr></thead><tbody id="cohortReviewRows"></tbody></table></div>
+            <div id="cohortReviewSaveStatus" class="statusline small" style="margin-top:10px"></div>
           </div>
         </div>
       </section>
@@ -51,11 +157,12 @@
           <div class="metrics" id="metrics"></div>
           <div class="why" id="why"></div>
           <div id="readResults"></div>
+          <div id="taxonomyResults"></div>
           <div id="images" class="images"></div>
           <div id="reportLinks" class="links"></div>
           <div id="reviewBox" class="reviewbox hidden">
-            <strong>Manual review for a passing marker with warnings</strong>
-            <p class="help">Approve or reject the marker with your name and notes. This records a separate review decision; it does not change the chromatogram or QC measurements. Failed-QC markers must be resequenced.</p>
+            <strong>Single-isolate review for a passing marker with warnings</strong>
+            <p class="help">Approve or reject the marker with your name and notes. This records a separate review decision; it does not change the chromatogram or QC measurements. For cohort-wide decisions, attach the Assistant review TSV in the Cohort marker review panel below.</p>
             <div class="row"><label>Reviewer <input type="text" id="reviewer" placeholder="Name or initials"></label></div>
             <textarea id="reviewNotes" placeholder="What did you inspect? Record supporting evidence or reason for rejection."></textarea>
             <div class="row"><button class="green" id="approveBtn">Approve marker</button><button class="red" id="rejectBtn">Reject marker</button><a id="reviewFile" class="small" href="/artifact?path=marker_review_decisions.tsv" target="_blank">Open saved review decisions</a><span id="reviewStatus" class="small"></span></div>
@@ -66,9 +173,8 @@
   </div>
   <div class="footer">Local-only interface · uses BranchManager Paper Trail/Merge Meeting · no project database is read or changed</div>
 </div>
-<div id="modal" class="modal hidden"><div class="modalbox"><div class="cardhead"><h2>Choose a Mailroom map or AB1 files</h2><button class="secondary" id="closeBrowser">Close</button></div><div class="modalbody"><div class="row between"><div id="browsePathLabel" class="small"></div><button class="quiet" id="browseUp">Up one folder</button></div><div id="browserList" style="margin-top:10px"></div><div class="row" style="margin-top:12px"><button class="blue" id="quickMapBtn">Create quick map from selected AB1 files</button><span class="small">Filename-based guesses are editable before running.</span></div></div></div></div>
 <script>
-const $=s=>document.querySelector(s);let studioState=null, sampleRows=[], activeId='', lastInspection=null, browsePath='.',browseFiles=[];
+const $=s=>document.querySelector(s);const selectedAssemblySequences={};let studioState=null, sampleRows=[], activeId='', lastInspection=null, cohortReview=null, inspectionRunning=false, batchRunning=false;
 const SETTING_INFO=[
  ['min_quality','End-trimming Phred cutoff','Mott-style end-trimming threshold.'],
  ['min_read_length','Minimum usable read (bp)','Per-read minimum before it may contribute.'],
@@ -81,29 +187,680 @@ const SETTING_INFO=[
  ['min_overlap_identity','Minimum overlap identity','Minimum identity fraction across the aligned overlap.']
 ];
 function esc(x){return String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function pillClass(q){return q==='FAIL_QC'?'fail':q==='PASS_WITH_WARNINGS'?'warn':q==='PASS_HIGH_CONFIDENCE'?'pass':'neutral'}
 async function api(path,body){let r=await fetch(path,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{});let j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j}
 function setStatus(node,msg,error=false){node.textContent=msg;node.className=error?'error':'small'}
 function renderSettings(){let p=studioState.policy,unit={min_quality:' Phred',min_read_length:' bp',min_final_length:' bp',min_mean_quality:' Phred',max_output_expected_errors:' errors',warn_n_percent:'%',max_n_percent:'%',min_overlap:' bp',min_overlap_identity:' fraction'};$('#settings').innerHTML=SETTING_INFO.map(([k,label,help])=>`<div class="setting"><label for="s_${k}">${label}</label><input id="s_${k}" type="number" step="${k.includes('identity')?'0.01':(k==='min_mean_quality'||k.includes('errors')||k.includes('percent')?'0.1':'1')}" value="${esc(p[k])}"><div class="explain">${help} Default: ${esc(p[k])}${unit[k]}.</div></div>`).join('')}
 function renderSamples(){let q=$('#sampleSearch')?.value?.toLowerCase()||'';let samples=(studioState?.samples||[]).filter(s=>s.sequence_id.toLowerCase().includes(q));$('#samples').innerHTML=samples.map(s=>`<div class="sample ${s.sequence_id===activeId?'active':''}" data-id="${esc(s.sequence_id)}"><div><div class="sampleid">${esc(s.sequence_id)}</div><div class="samplemeta">${esc(s.processing_mode)} · ${s.read_count} read(s)</div></div><span class="count">${s.missing_files?'MISSING':'READY'}</span></div>`).join('')||'<div class="small" style="padding:10px">No isolates loaded.</div>';document.querySelectorAll('.sample').forEach(el=>el.onclick=()=>selectSample(el.dataset.id))}
-function selectSample(id){activeId=id;let s=(studioState.samples||[]).find(x=>x.sequence_id===id);if(!s)return;$('#emptyHint').classList.add('hidden');$('#samplePanel').classList.remove('hidden');$('#sampleHeading').textContent=id;$('#sampleSub').textContent=`${s.read_count} read(s) · map default: ${s.processing_mode}`;$('#readRows').innerHTML=s.reads.map((r,i)=>`<tr data-file="${esc(r.file)}"><td title="${esc(r.file)}">${esc(r.file.split('/').pop())}<div class="small">${esc(r.file)}</div></td><td><input class="primer" value="${esc(r.primer)}" placeholder="e.g. 27F"></td><td><select class="direction"><option value="">Choose…</option><option ${r.direction==='forward'?'selected':''} value="forward">forward</option><option ${r.direction==='reverse'?'selected':''} value="reverse">reverse</option></select></td><td>${esc(r.processing_mode||'map default')}</td></tr>`).join('');renderSamples()}
+function selectSample(id){
+ if(inspectionRunning){setRunFeedback(`Inspection is still running for ${activeId}. Wait for it to finish before changing isolates.`);return}
+ const s=(studioState.samples||[]).find(x=>x.sequence_id===id);if(!s)return;
+ activeId=id;
+ $('#sampleTaxonomyStatus').textContent=studioState.onboarding_taxonomy?.loaded?'Assistant pre-screened assignments loaded':'NOT_SCREENED — no cached assignments';
+ // Processing mode is an isolate-specific override. Always return the control
+ // to "Use map setting" on isolate changes; otherwise a prior best_read or
+ // assemble click can silently override the next isolate's own map setting.
+ $('#mode').value='map';
+ $('#runBtnSidebar').disabled=false;$('#emptyHint').classList.add('hidden');$('#samplePanel').classList.remove('hidden');$('#sampleHeading').textContent=id;$('#sampleSub').textContent=`${s.read_count} read(s) · map default: ${s.processing_mode}`;
+ $('#readRows').innerHTML=s.reads.map((r,i)=>`<tr data-file="${esc(r.file)}"><td title="${esc(r.file)}">${esc(r.file.split('/').pop())}<div class="small">${esc(r.file)}</div></td><td><input class="primer" value="${esc(r.primer)}" placeholder="e.g. 27F"></td><td><select class="direction"><option value="">Choose…</option><option ${r.direction==='forward'?'selected':''} value="forward">forward</option><option ${r.direction==='reverse'?'selected':''} value="reverse">reverse</option></select></td><td>${esc(r.processing_mode||'map default')}</td></tr>`).join('');renderSamples()
+}
 function readSettings(){let o={};SETTING_INFO.forEach(([k])=>o[k]=Number($(`#s_${k}`).value));return o}
-async function loadMap(path){setStatus($('#mapStatus'),'Loading map and checking read paths…');try{let data=await api('/api/load-map',{path});studioState.samples=data.samples;studioState.map_path=data.path;sampleRows=data.samples;$('#mapPath').value=data.path;$('#mapStatus').textContent=`Loaded ${data.samples.length} isolate(s), ${data.read_count} read(s).`;activeId='';$('#samplePanel').classList.add('hidden');$('#emptyHint').classList.remove('hidden');$('#results').classList.add('hidden');renderSamples()}catch(e){setStatus($('#mapStatus'),e.message,true)}}
-function showBrowse(){browsePath='.';browseFiles=[];$('#modal').classList.remove('hidden');browse()}
-async function browse(path=browsePath){try{let d=await api('/api/browse?path='+encodeURIComponent(path));browsePath=d.current;$('#browsePathLabel').textContent=studioState.root+'/'+(browsePath==='.'?'':browsePath);let dirs=d.entries.filter(e=>e.kind==='directory'),maps=d.entries.filter(e=>e.kind==='map'),reads=d.entries.filter(e=>e.kind==='read');let h='';for(let e of dirs)h+=`<div class="browseritem"><span>📁 ${esc(e.name)}</span><button class="secondary" data-dir="${esc(e.path)}">Open</button></div>`;for(let e of maps)h+=`<div class="browseritem"><span>▤ ${esc(e.name)}</span><button data-map="${esc(e.path)}">Load map</button></div>`;if(reads.length)h+=`<div class="small" style="margin:12px 0 6px">AB1/ABI reads (${reads.length})</div>`;for(let e of reads)h+=`<label class="browseritem"><input type="checkbox" class="rawcheck" value="${esc(e.path)}"><span>⌁ ${esc(e.name)}</span></label>`;$('#browserList').innerHTML=h||'<div class="small">No subfolders, maps, or AB1/ABI reads found.</div>';document.querySelectorAll('[data-dir]').forEach(b=>b.onclick=()=>browse(b.dataset.dir));document.querySelectorAll('[data-map]').forEach(b=>b.onclick=()=>{let p=studioState.root+'/'+b.dataset.map;$('#modal').classList.add('hidden');loadMap(p)});browseFiles=reads.map(x=>x.path)}catch(e){$('#browserList').innerHTML=`<div class="error">${esc(e.message)}</div>`}}
-async function quickMap(){let paths=[...document.querySelectorAll('.rawcheck:checked')].map(x=>studioState.root+'/'+x.value);if(!paths.length){alert('Select one or more AB1/ABI files first.');return}try{let d=await api('/api/quick-map',{paths});studioState.samples=d.samples;studioState.map_path='';$('#mapPath').value='(quick map from selected files)';$('#mapStatus').textContent=`Quick map created for ${d.samples.length} isolate(s), ${d.read_count} read(s). Check IDs, primers and directions before running.`;$('#modal').classList.add('hidden');activeId='';renderSamples();if(d.samples.length)selectSample(d.samples[0].sequence_id)}catch(e){alert(e.message)}}
-async function inspect(){if(!activeId)return;let rows=[...document.querySelectorAll('#readRows tr')].map(r=>({file:r.dataset.file,primer:r.querySelector('.primer').value,direction:r.querySelector('.direction').value}));if(rows.some(r=>!r.primer||!r.direction)){setStatus($('#runStatus'),'Set a primer and direction for every read before processing.',true);return}let body={sequence_id:activeId,reads:rows,processing_mode:$('#mode').value,settings:readSettings()};$('#runBtn').disabled=true;$('#runStatus').innerHTML='<span class="spinner"></span> Calling bases, trimming and assembling…';$('#results').classList.add('hidden');try{let r=await api('/api/inspect',body);lastInspection=r;renderResult(r);setStatus($('#runStatus'),'Inspection complete.')}catch(e){setStatus($('#runStatus'),e.message,true)}finally{$('#runBtn').disabled=false}}
-async function processAll(){let rows=[...document.querySelectorAll('#readRows tr')].map(r=>({file:r.dataset.file,primer:r.querySelector('.primer').value,direction:r.querySelector('.direction').value}));let body={sequence_id:activeId,reads:rows,processing_mode:$('#mode')?.value||'map',settings:readSettings()};let button=$('#processAllBtn');button.disabled=true;button.innerHTML='<span class="spinner"></span> Processing all mapped isolates…';setStatus($('#batchStatus'),'Running the shared Paper Trail/Merge Meeting pipeline for the full map. This may take a while.');try{let r=await api('/api/process-all',body);let counts=Object.entries(r.qc_counts||{}).map(([k,v])=>`${k}: ${v}`).join(' · ');$('#batchStatus').innerHTML=`Processed ${r.sample_count} isolate(s). ${esc(counts)}. <a href="${esc(r.bundle_url)}" download>Download complete results bundle</a>`;let link=$('#batchStatus a');link.click()}catch(e){setStatus($('#batchStatus'),e.message,true)}finally{button.disabled=false;button.textContent='Process and download all'}}
-function pillClass(q){return q==='FAIL_QC'?'fail':q==='PASS_WITH_WARNINGS'?'warn':q==='PASS_HIGH_CONFIDENCE'?'pass':'neutral'}
+const SEQUENCE_PROFILES={
+ '16S':{read:300,final:800,label:'16S rRNA'},
+ 'ITS':{read:100,final:150,label:'ITS'},
+ '18S':{read:200,final:300,label:'18S rRNA'},
+ '28S_LSU':{read:200,final:300,label:'28S / LSU rRNA'},
+ 'CUSTOM':{read:null,final:null,label:'Other / custom target'}
+};
+function applySequenceProfile(){
+ const key=$('#sequenceType').value||'16S',p=SEQUENCE_PROFILES[key];
+ if(p.read!==null){$('#s_min_read_length').value=p.read;$('#s_min_final_length').value=p.final;}
+ $('#sequenceTypeHelp').textContent=key==='CUSTOM'
+  ?'No thresholds are changed. Set minimum read and final lengths for the assay below.'
+  :`${p.label} starting thresholds: minimum read ${p.read} bp; minimum final sequence ${p.final} bp. These are editable starting points, not biological limits.`;
+}
+async function applyLoadedMap(data){
+ if(data.cancelled)return;
+ studioState.samples=data.samples||[];studioState.map_path=data.path||'';studioState.input_source=data.input_kind||studioState.input_source;sampleRows=data.samples||[];
+ if(data.path)$('#mapPath').value=data.path;else if(data.quick_map)$('#mapPath').value='';
+ if(data.taxonomy_loaded===false||['standalone_sample_map','normalised_read_map','raw_chromatograms'].includes(data.input_kind)){
+  studioState.onboarding_taxonomy={loaded:false,message:'No pre-screened taxonomy is loaded (NOT_SCREENED).'};
+  cohortReview=cohortReview||null;
+ }
+ $('#mapStatus').textContent=data.status_message||`Loaded ${studioState.samples.length} isolate(s), ${data.read_count||0} read(s).`;
+ renderOnboardingTaxonomyState(studioState.onboarding_taxonomy);
+ activeId='';lastInspection=null;$('#samplePanel').classList.add('hidden');$('#emptyHint').classList.remove('hidden');$('#results').classList.add('hidden');renderSamples();
+ if(studioState.samples.length)selectSample(studioState.samples[0].sequence_id);
+}
+async function loadMap(path){setStatus($('#mapStatus'),'Loading map and checking referenced files…');try{let data=await api('/api/load-map',{path});await applyLoadedMap(data)}catch(e){setStatus($('#mapStatus'),e.message,true)}}
+async function chooseMap(){setStatus($('#mapStatus'),'Choose a sample map in the file dialog…');try{let data=await api('/api/pick-map',{});await applyLoadedMap(data);if(!data.cancelled)$('#mapStatus').textContent+= ' All read paths were resolved.'}catch(e){setStatus($('#mapStatus'),e.message,true)}}
+async function chooseReads(){setStatus($('#mapStatus'),'Choose AB1/ABI files in the file dialog…');try{let data=await api('/api/pick-reads',{});data.quick_map=true;data.status_message=`Loaded ${data.samples.length} isolate(s), ${data.read_count} read(s) from selected chromatograms.`;await applyLoadedMap(data);if(!data.cancelled)$('#mapStatus').textContent+=' Check inferred IDs, primers and directions before processing.'}catch(e){setStatus($('#mapStatus'),e.message,true)}}
+async function uploadAb1Zip(file){
+ if(!file)return;
+ const button=$('#uploadZipBtn');button.disabled=true;
+ setStatus($('#mapStatus'),`Uploading ${file.name}…`);
+ try{
+  const response=await fetch('/api/upload-ab1-zip',{
+   method:'POST',headers:{'Content-Type':'application/zip','X-Filename':encodeURIComponent(file.name)},
+   body:file
+  });
+  const data=await response.json();if(!response.ok)throw new Error(data.error||response.statusText);
+  data.quick_map=true;await applyLoadedMap(data);
+  $('#mapStatus').textContent=(data.status_message||'ZIP chromatograms loaded.')+' Check inferred IDs, primers and directions before processing.';
+ }catch(e){setStatus($('#mapStatus'),e.message,true)}
+ finally{button.disabled=false;$('#ab1ZipInput').value=''}
+}
+async function chooseInputFolder(){
+ const button=$('#chooseInputFolderBtn');button.disabled=true;
+ setStatus($('#mapStatus'),'Choose a folder. Studio is checking for Assistant cohort files, sample maps and AB1/ABI chromatograms…');
+ try{
+  const d=await api('/api/pick-input-folder',{});if(d.cancelled)return;
+  studioState.onboarding_taxonomy=d.onboarding_taxonomy||{loaded:Boolean(d.taxonomy_loaded),root:'',read_count:0,taxonomy_read_count:0,hit_count:0,isolate_count:0,message:d.status_message||'No pre-screened taxonomy loaded.'};
+  if(d.screen_ref){studioState.screen_ref=d.screen_ref;$('#screenRefPath').value=d.screen_ref;}
+  if(d.screen_taxa!==undefined){studioState.screen_taxa=d.screen_taxa||'';$('#screenTaxaPath').value=studioState.screen_taxa;}
+  await applyLoadedMap(d);
+  renderOnboardingTaxonomyState(studioState.onboarding_taxonomy);
+  if(d.taxonomy_loaded){
+   updateTaxonomyScreenStatus('Pre-screened Assistant taxonomy loaded. VSEARCH remains optional.');
+  }else{
+   const refAvailable=Boolean(studioState.screen_ref);
+   updateTaxonomyScreenStatus(refAvailable?'No cached taxonomy (NOT_SCREENED). Fresh VSEARCH is available but opt-in.':'No cached taxonomy (NOT_SCREENED). Choose a reference FASTA to enable optional VSEARCH.');
+   $('#sampleTaxonomyStatus').textContent='NOT_SCREENED';
+  }
+ }catch(e){setStatus($('#mapStatus'),e.message,true)}
+ finally{button.disabled=false}
+}
+async function chooseOutput(){try{let d=await api('/api/pick-output',{});if(d.cancelled)return;studioState.out=d.out;$('#outputPath').textContent=d.out;$('#outputBadge').textContent='Output: '+d.out}catch(e){setStatus($('#batchStatus'),e.message,true)}}
+function updateTaxonomyScreenStatus(message){$('#taxScreenStatus').textContent=message;$('#taxScreenConfigSource').textContent=studioState.taxonomy_config_path?`Auto-detected from ${studioState.taxonomy_config_path}`:''}
+function renderOnboardingTaxonomyState(data){
+ const loaded=Boolean(data&&data.loaded);
+ $('#onboardingTaxonomyStatus').textContent=loaded?'Pre-screened loaded':'NOT_SCREENED';
+ $('#onboardingTaxonomyDetails').textContent=loaded
+  ? `${data.isolate_count} isolates · ${data.read_count} mapped reads · ${data.taxonomy_read_count} taxonomy assignments · ${data.hit_count} candidate hits · ${data.partner_count||data.map_paths?.length||0} paired dataset(s)${data.partner_names?.length?` · ${data.partner_names.join(', ')}`:''}`
+  : 'No pre-screened taxonomy is loaded. This is valid for standalone Sanger work. Select a reference FASTA and opt into VSEARCH when fresh taxonomy is needed.';
+}
+async function applyTaxonomySettings(){
+ try{let d=await api('/api/set-taxonomy-screen',{screen_ref:$('#screenRefPath').value,screen_taxa:$('#screenTaxaPath').value});studioState.screen_ref=d.screen_ref;studioState.screen_taxa=d.screen_taxa;studioState.taxonomy_screen_enabled=d.enabled;updateTaxonomyScreenStatus(d.enabled?'Reference saved. Fresh VSEARCH runs only when the re-screen checkbox is enabled; otherwise cached onboarding taxonomy is used when available.':'No reference configured; VSEARCH re-screening unavailable.');}
+ catch(e){setStatus($('#taxScreenStatus'),e.message,true)}
+}
+async function chooseTaxonomyRef(){try{let d=await api('/api/pick-taxonomy-reference',{});if(d.cancelled)return;$('#screenRefPath').value=d.screen_ref;$('#screenTaxaPath').value=d.screen_taxa;studioState.screen_ref=d.screen_ref;studioState.screen_taxa=d.screen_taxa;studioState.taxonomy_screen_enabled=d.enabled;updateTaxonomyScreenStatus('Reference selected for optional re-screening.')}catch(e){setStatus($('#taxScreenStatus'),e.message,true)}}
+async function chooseTaxonomyTable(){try{let d=await api('/api/pick-taxonomy-table',{});if(d.cancelled)return;$('#screenRefPath').value=d.screen_ref;$('#screenTaxaPath').value=d.screen_taxa;studioState.screen_ref=d.screen_ref;studioState.screen_taxa=d.screen_taxa;studioState.taxonomy_screen_enabled=d.enabled;updateTaxonomyScreenStatus('Taxonomy mapping selected for optional re-screening.')}catch(e){setStatus($('#taxScreenStatus'),e.message,true)}}
+async function shutdownStudio(){
+ const button=$('#shutdownBtn');
+ if(inspectionRunning||batchRunning){setStatus($('#mapStatus'),'Wait for the current inspection or batch processing run to finish before shutting down Studio.',true);return}
+ if(!window.confirm('Shut down the local Sanger Studio server? Saved inspections, outputs and review decisions will remain on disk.'))return;
+ button.disabled=true;button.textContent='Shutting down…';
+ try{
+  const result=await api('/api/shutdown',{});
+  $('#shutdownNotice').textContent=result.message||'Sanger Studio has stopped. Your saved outputs and review decisions remain on disk. You can close this browser tab.';
+  $('#shutdownNotice').classList.add('show');
+  $('#mapStatus').textContent='Sanger Studio server stopped. You can close this browser tab.';
+  $('#outputBadge').textContent='Studio stopped';
+  document.querySelectorAll('button').forEach(b=>{if(b!==button)b.disabled=true});
+  button.textContent='Studio stopped';
+ }catch(e){button.disabled=false;button.textContent='Shut down Studio';setStatus($('#mapStatus'),e.message,true)}
+}
+async function attachReview(){setStatus($('#cohortReviewStatus'),'Choose a cohort marker review template…');try{let d=await api('/api/pick-marker-review',{});if(d.cancelled)return;renderCohortReview(d);$('#cohortReviewStatus').textContent=`Attached ${d.source} · ${d.total} marker(s).`; }catch(e){setStatus($('#cohortReviewStatus'),e.message,true)}}
+function renderCohortReview(data){cohortReview=data;$('#cohortReviewControls').classList.remove('hidden');$('#cohortReviewPill').className='pill neutral';$('#cohortReviewPill').textContent=`${data.decided}/${data.total} decided`;$('#cohortReviewStatus').textContent=`Source: ${data.source}`;$('#cohortReviewer').value=$('#cohortReviewer').value||((data.rows.find(r=>r.reviewer)?.reviewer)||'');renderCohortReviewRows();}
+function renderReviewSequenceEvidence(r){
+ const rawLength=String(r.output_length??'').trim();
+ const outputLength=Number(rawLength);
+ const hasFinal=rawLength!==''&&Number.isFinite(outputLength)&&outputLength>0;
+ const nValue=String(r.n_percent??'').trim();
+ const outputType=String(r.output_type||'').toUpperCase();
+ const outputLabel=outputType==='INDIVIDUAL_READ'?'Selected individual read':'Final consensus';
+ const finalLine=hasFinal
+  ? `<div><b>${esc(outputLabel)}:</b> ${esc(outputLength)} bp · N: ${nValue?`${esc(nValue)}%`:'not recorded'}</div>`
+  : `<div><b>Final consensus:</b> none (${rawLength||'0'} bp) · N: not applicable</div>`;
+ const candidateLength=Number(r.candidate_length??0);
+ const candidateSource=String(r.candidate_source??'').trim();
+ const candidateN=String(r.candidate_n_percent??'').trim();
+ const candidateRead=String(r.candidate_read_id??'').trim();
+ let candidateLine='';
+ if(candidateLength>0&&candidateSource==='BEST_RECOVERABLE_READ'){
+  candidateLine=`<div><b>Fallback read candidate:</b> ${esc(candidateLength)} bp · N: ${candidateN?`${esc(candidateN)}%`:'not recorded'}${candidateRead?`<div class="small">Read: ${esc(candidateRead)} · not an assembled consensus</div>`:'<div class="small">Not an assembled consensus</div>'}</div>`;
+ }else if(candidateLength>0&&candidateSource==='FAILED_FINAL_CONSENSUS'){
+  candidateLine=`<div><b>Review candidate:</b> failed final consensus (${esc(candidateLength)} bp · N: ${candidateN?`${esc(candidateN)}%`:'not recorded'})</div>`;
+ }
+ const readEvidence=String(r.read_level_evidence??'').trim();
+ const readLine=readEvidence?`<div class="reviewReadEvidence"><b>Read-level QC:</b> ${esc(readEvidence)}</div>`:'';
+ return finalLine+candidateLine+readLine;
+}
+function renderFallbackReadChoice(r){
+ const candidates=Array.isArray(r.fallback_read_options_list)?r.fallback_read_options_list:[];
+ if(candidates.length<2)return '<span class="taxon-muted">Not required</span>';
+ const recommended=String(r.recommended_read_id||candidates[0].read_id||'');
+ const selected=String(r.selected_read_id||recommended);
+ const source=String(r.read_selection_source||'').toUpperCase();
+ const options=candidates.map((candidate,i)=>{
+  const id=String(candidate.read_id||'');
+  const label=`${i===0?'Recommended · ':''}${id} · ${candidate.length||0} bp · Q${candidate.mean_quality??'NA'} · N ${candidate.n_percent??'NA'}%`;
+  return `<option value="${esc(id)}" ${id===selected?'selected':''}>${esc(label)}</option>`;
+ }).join('');
+ return `<select class="fallbackReadChoice" aria-label="Fallback read for ${esc(r.sequence_id)}">${options}</select><div class="small">${source==='MANUAL'?'Manual reviewer selection':'Automatic recommendation: longest usable read'}</div>`;
+}
+function renderCohortReviewRows(){
+ if(!cohortReview)return;
+ let q=$('#cohortReviewSearch').value.toLowerCase(),filter=$('#cohortReviewFilter').value;
+ let rows=cohortReview.rows.filter(r=>(filter==='all'||String(r.qc_class).toUpperCase()===filter)&&[r.sequence_id,r.partner_id,r.dataset,r.qc_reasons,r.taxonomy_concordance,r.read_level_evidence,r.candidate_source,r.candidate_read_id,(r.fallback_read_options_list||[]).map(x=>x.read_id).join(' ')].join(' ').toLowerCase().includes(q));
+ $('#cohortReviewRows').innerHTML=rows.map(r=>{
+  let options=['<option value="">— Not reviewed —</option>',...(r.allowed_decisions_list||[]).map(d=>`<option value="${esc(d)}" ${String(r.decision||'').toUpperCase()===d?'selected':''}>${esc(d)}</option>`)].join('');
+  let cls=String(r.qc_class).toUpperCase()==='FAIL_QC'?'qcfail':String(r.qc_class).toUpperCase()==='PASS_WITH_WARNINGS'?'warning':'';
+  const decision=String(r.decision||'').toUpperCase();
+  const overrideHint=decision==='APPROVE_FAIL_QC'?'<div class="small review-override-hint">Manual override recorded · automated QC remains FAIL_QC</div>':'';
+  return `<tr class="${cls}" data-seq="${esc(r.sequence_id)}"><td><button class="quiet reviewInspect" data-review-inspect="${esc(r.sequence_id)}">${esc(r.sequence_id)}</button><div class="small">${esc(r.marker_source_type||'')}</div></td><td>${esc(r.partner_id||'')}<div class="small">${esc(r.dataset||'')}</div></td><td><span class="pill ${pillClass(r.qc_class)}">${esc(r.qc_class)}</span><div class="small">${esc(r.review_type||'')}</div><div class="small">${esc(r.processing_mode||'')} · ${esc(r.assembly_status||'')}</div></td><td>${esc(r.qc_reasons||'—')}</td><td>${renderReviewSequenceEvidence(r)}</td><td>${renderFallbackReadChoice(r)}</td><td>${esc(r.taxonomy_concordance||'—')}<div class="small">${esc(r.read_taxonomy_assignments||'')}</div></td><td><select class="cohortDecision">${options}</select><div class="small">${(r.allowed_decisions_list||[]).join(' · ')}</div>${overrideHint}</td><td><input class="cohortNotes" type="text" value="${esc(r.notes||'')}" placeholder="Reason / evidence"></td></tr>`;
+ }).join('')||'<tr><td colspan="9">No records match this filter.</td></tr>';
+ let counts={};cohortReview.rows.forEach(r=>{let key=String(r.qc_class||'UNKNOWN');counts[key]=(counts[key]||0)+1});
+ let decided=cohortReview.rows.filter(r=>String(r.decision||'').trim()).length;
+ let manualSelections=cohortReview.rows.filter(r=>String(r.read_selection_source||'').toUpperCase()==='MANUAL'&&String(r.selected_read_id||'').trim()).length;
+ $('#cohortReviewCounts').textContent=`Showing ${rows.length} of ${cohortReview.total} · ${decided} decisions · ${manualSelections} manual read selection(s) · `+Object.entries(counts).map(([k,v])=>`${k}: ${v}`).join(' · ');
+ $('#cohortReviewPill').textContent=`${decided}/${cohortReview.total} decided`;
+}
+
+async function saveCohortReview(){
+ if(!cohortReview)return;
+ let rows=[...document.querySelectorAll('#cohortReviewRows tr[data-seq]')].map(tr=>({
+  sequence_id:tr.dataset.seq,
+  decision:tr.querySelector('.cohortDecision').value,
+  notes:tr.querySelector('.cohortNotes').value,
+  selected_read_id:tr.querySelector('.fallbackReadChoice')?.value||''
+ }));
+ /* Include filtered-out rows unchanged so selections and decisions are preserved. */
+ let visible=new Map(rows.map(r=>[r.sequence_id,r]));
+ let all=cohortReview.rows.map(r=>visible.get(r.sequence_id)||({
+  sequence_id:r.sequence_id,decision:r.decision||'',notes:r.notes||'',
+  selected_read_id:r.selected_read_id||''
+ }));
+ const reviewer=$('#cohortReviewer').value.trim();
+ const metadata=new Map(cohortReview.rows.map(r=>[r.sequence_id,r]));
+ const problems=[];
+ for(const row of all){
+  const meta=metadata.get(row.sequence_id)||{};
+  const decision=String(row.decision||'').trim().toUpperCase();
+  const rowReviewer=reviewer||String(meta.reviewer||'').trim();
+  if(decision&&!rowReviewer){
+   problems.push(`${row.sequence_id}: enter a reviewer name or initials.`);
+  }
+  if(decision.startsWith('APPROVE')&&!String(row.notes||'').trim()){
+   problems.push(`${row.sequence_id}: an approval needs explanatory notes.`);
+  }
+  if(decision&&!(meta.allowed_decisions_list||[]).includes(decision)){
+   problems.push(`${row.sequence_id}: ${decision} is not an allowed decision for this QC class.`);
+  }
+  const selected=String(row.selected_read_id||'').trim();
+  const options=meta.fallback_read_options_list||[];
+  const optionIds=options.map(x=>String(x.read_id||'').trim());
+  if(selected&& !optionIds.includes(selected)){
+   problems.push(`${row.sequence_id}: selected fallback read is not in the QC-passing options.`);
+  }
+  if(selected&&selected!==String(meta.recommended_read_id||'').trim()&&!rowReviewer){
+   problems.push(`${row.sequence_id}: a manual fallback-read choice needs reviewer identity.`);
+  }
+ }
+ if(problems.length){
+  const visibleProblems=problems.slice(0,8);
+  const remainder=problems.length-visibleProblems.length;
+  const lineBreak=String.fromCharCode(10);
+  const message=`Cannot save yet (${problems.length} issue(s)):${lineBreak}${visibleProblems.join(lineBreak)}${remainder?`${lineBreak}…and ${remainder} more. Filter the table and correct the remaining records.`:''}`;
+  setStatus($('#cohortReviewSaveStatus'),message,true);
+  $('#cohortReviewSaveStatus').scrollIntoView({behavior:'smooth',block:'nearest'});
+  return;
+ }
+ let button=$('#saveCohortReviewBtn');button.disabled=true;
+ setStatus($('#cohortReviewSaveStatus'),`Saving ${all.length} marker review row(s)…`);
+ try{
+  let d=await api('/api/save-marker-review',{reviewer,rows:all});
+  cohortReview=d;renderCohortReview(d);
+  $('#cohortReviewSaveStatus').innerHTML=`Saved ${d.decided} decision(s) and manual read selections to <b>${esc(d.saved)}</b>. <a href="${esc(d.download_url)}" download>Download completed review TSV</a>. Supply this file to Assistant PREPARE with --marker-review to carry the choices forward.`;
+ }catch(e){
+  setStatus($('#cohortReviewSaveStatus'),`Save failed: ${e.message}`,true);
+  $('#cohortReviewSaveStatus').scrollIntoView({behavior:'smooth',block:'nearest'});
+ }finally{button.disabled=false}
+}
+
+function setRunFeedback(message,{error=false,loading=false}={}){
+ ['#runStatus','#sidebarRunStatus'].forEach(sel=>{
+  const node=$(sel);if(!node)return;
+  node.className=error?'error':'statusline small';
+  node.innerHTML=loading?`<span class="spinner"></span> ${esc(message)}`:esc(message);
+ });
+}
+async function inspect(){
+ if(!activeId||inspectionRunning)return;
+ const inspectedId=activeId;
+ const requestedMode=$('#mode').value||'map';
+ const sample=(studioState.samples||[]).find(x=>x.sequence_id===inspectedId);
+ const mapMode=sample?.processing_mode||'assemble';
+ const effectiveMode=requestedMode==='map'?mapMode:requestedMode;
+ let rows=[...document.querySelectorAll('#readRows tr')].map(r=>({file:r.dataset.file,primer:r.querySelector('.primer').value,direction:r.querySelector('.direction').value}));
+ if(rows.some(r=>!r.primer||!r.direction)){setRunFeedback('Set a primer and direction for every read before processing.',{error:true});return}
+ const rerun=$('#rerunTaxonomyCheck').checked;
+ const reference=$('#screenRefPath').value||studioState.screen_ref||'configured reference';
+ const referenceName=String(reference).split(/[\\/]/).pop();
+ const modeLabel=effectiveMode==='best_read'?'single best read (assembly skipped)':'assemble primer reads';
+ const body={sequence_id:inspectedId,reads:rows,processing_mode:requestedMode,settings:readSettings(),sequence_type:$('#sequenceType').value,custom_primer_sequences:$('#customPrimerSequences').value,rerun_taxonomy:rerun};
+ inspectionRunning=true;$('#shutdownBtn').disabled=true;
+ const runButtons=[$('#runBtn'),$('#runBtnSidebar')].filter(Boolean);
+ const originalButtonLabels=runButtons.map(b=>b.textContent);
+ runButtons.forEach(b=>{b.disabled=true;b.innerHTML=rerun?'<span class="spinner"></span> Inspect + VSEARCH running…':'<span class="spinner"></span> Inspecting isolate…'});
+ const runningMessage=rerun
+  ? `Inspecting ${inspectedId} using ${modeLabel} and running a FRESH VSEARCH taxonomy screen against ${referenceName} on the current trimmed reads. VSEARCH is running as part of this inspection and may take several minutes…`
+  : `Inspecting ${inspectedId} using ${modeLabel}; taxonomy will use pre-screened onboarding results where available…`;
+ setRunFeedback(runningMessage,{loading:true});
+ if(rerun)updateTaxonomyScreenStatus(`RUNNING: fresh VSEARCH for ${inspectedId} against ${referenceName} using the current trimmed reads…`);
+ $('#results').classList.add('hidden');
+ try{
+  let r=await api('/api/inspect',body);lastInspection=r;
+  // The backend stores an explicit per-isolate override in this Studio session.
+  // Keep the client-side map summary in sync so returning to this isolate and
+  // choosing "Use map setting" reproduces the last resolved mode for this row.
+  const resolvedSample=(studioState.samples||[]).find(x=>x.sequence_id===inspectedId);
+  if(resolvedSample&&r.processing_mode){
+   resolvedSample.processing_mode=r.processing_mode;
+   (resolvedSample.reads||[]).forEach(read=>{read.processing_mode=r.processing_mode});
+  }
+  renderResult(r);
+  setRunFeedback(rerun?(r.taxonomy_screen_message||'Fresh VSEARCH taxonomy screening completed as part of this inspection.'):'Inspection complete.');
+  if(rerun)updateTaxonomyScreenStatus(r.taxonomy_screen_message||'Fresh VSEARCH completed.');
+ }catch(e){
+  setRunFeedback(rerun?`Inspection/VSEARCH failed: ${e.message}`:e.message,{error:true});
+  if(rerun)updateTaxonomyScreenStatus(`FAILED: ${e.message}`);
+ }finally{
+  inspectionRunning=false;$('#shutdownBtn').disabled=false;
+  runButtons.forEach((b,i)=>{b.disabled=!activeId;b.textContent=originalButtonLabels[i]||'Inspect and assemble this isolate'});
+ }
+}
+async function processAll(){
+ let rows=[...document.querySelectorAll('#readRows tr')].map(r=>({file:r.dataset.file,primer:r.querySelector('.primer').value,direction:r.querySelector('.direction').value}));
+ let rerun=$('#rerunTaxonomyCheck').checked,reference=$('#screenRefPath').value||studioState.screen_ref||'configured reference';
+ let body={sequence_id:activeId,reads:rows,processing_mode:$('#mode')?.value||'map',settings:readSettings(),sequence_type:$('#sequenceType').value,custom_primer_sequences:$('#customPrimerSequences').value,rerun_taxonomy:rerun};
+ let button=$('#processAllBtn');button.disabled=true;button.innerHTML='<span class="spinner"></span> Processing all mapped isolates…';
+ batchRunning=true;$('#shutdownBtn').disabled=true;
+ setStatus($('#batchStatus'),rerun?`Processing the batch and running fresh VSEARCH taxonomy screening against ${String(reference).split(/[\\/]/).pop()} using current trimmed reads. This may take several minutes…`:'Running the shared Paper Trail/Merge Meeting pipeline for the full map. This may take a while.');
+ if(rerun)updateTaxonomyScreenStatus(`RUNNING: fresh VSEARCH batch screening against ${String(reference).split(/[\\/]/).pop()}…`);
+ try{
+  let r=await api('/api/process-all',body);let counts=Object.entries(r.qc_counts||{}).map(([k,v])=>`${k}: ${v}`).join(' · ');
+  let tax=r.taxonomy_mode==='fresh_vsearch'?` · ${r.taxonomy_screen_message||'Fresh VSEARCH re-screen completed'}`:(r.taxonomy_mode==='assistant_onboarding_cache'?' · reused onboarding taxonomy':'');
+  let freshness=r.taxonomy_freshness==='STALE_TRIMMED_SEQUENCE_CHANGED'?' · WARNING: cached taxonomy is stale for changed trimmed reads':(r.taxonomy_freshness==='MATCHES_CURRENT_TRIMMED_READS'?' · cached taxonomy matches current trimmed reads':'');
+  $('#batchStatus').innerHTML=`Processed ${r.sample_count} isolate(s). ${esc(counts)}${esc(tax)}${esc(freshness)}. <a href="${esc(r.bundle_url)}" download>Download complete results bundle</a>`;
+  if(rerun)updateTaxonomyScreenStatus(r.taxonomy_screen_message||'Fresh VSEARCH batch screening completed.');
+  let link=$('#batchStatus a');link.click();
+ }catch(e){
+  setStatus($('#batchStatus'),rerun?`Batch/VSEARCH failed: ${e.message}`:e.message,true);
+  if(rerun)updateTaxonomyScreenStatus(`FAILED: ${e.message}`);
+ }
+ finally{batchRunning=false;$('#shutdownBtn').disabled=false;button.disabled=false;button.textContent='Process and download all'}
+}
+
+function renderTaxonomyResults(r){
+ const host=$('#taxonomyResults');
+ if(!r.taxonomy_screen_requested&&r.taxonomy_freshness!=='FRESH_VSEARCH_RERUN'){
+  host.innerHTML='<div class="taxonomy-results"><h3>Primer-read taxonomy evidence</h3><p class="taxon-muted">No pre-screened taxonomy assignments were found for these read IDs. This is normal for standalone input: the status is NOT_SCREENED. Configure a reference FASTA and enable optional VSEARCH to generate fresh assignments.</p></div>';
+  return;
+ }
+ const reads=r.taxonomy_reads||[],hits=r.taxonomy_hits||[];
+ const concordance=r.taxonomy_concordance||'NOT_REPORTED';
+ let html=`<div class="taxonomy-results"><h3>Primer-read taxonomy evidence</h3><p><b>Source:</b> ${esc(r.taxonomy_source||'Taxonomy screen')} · <b>Inter-read comparison:</b> ${esc(concordance)} <span class="taxon-muted">${esc(r.read_taxonomy_assignments||'')}</span></p>`;
+ if(r.taxonomy_screen_message)html+=`<p class="taxon-muted"><b>${esc(r.taxonomy_freshness==='FRESH_VSEARCH_RERUN'?'Fresh VSEARCH run: ':'Taxonomy screen: ')}</b>${esc(r.taxonomy_screen_message)}</p>`;
+ if(r.taxonomy_staleness_note)html+=`<p class="taxon-muted">${esc(r.taxonomy_staleness_note)}</p>`;
+ if(r.taxonomy_comparison_reason)html+=`<p class="taxon-muted">${esc(r.taxonomy_comparison_reason)}</p>`;
+ if(!reads.length){
+  html+='<p class="taxon-muted">The taxonomy screen ran, but no per-read assignments were produced. Check the taxonomy-screen output files and the run manifest.</p>';
+ } else {
+  html+='<h4>Per-read taxonomy assignments</h4><div class="readscroll"><table class="reads qualityreads taxonomy-summary"><thead><tr><th>Read</th><th>Best reference hit</th><th>Identity</th><th>Query coverage</th><th>Target coverage</th><th>Taxonomy</th><th>Assigned rank</th><th>Qualified hits</th><th>Near-best hits</th><th>Classification status</th><th>Support</th></tr></thead><tbody>';
+  html+=reads.map(x=>`<tr><td>${esc(x.ID)}</td><td>${esc(x.BestHit||'—')}</td><td>${esc(x.Identity||'—')}${x.Identity?'%':''}</td><td>${esc(x.QueryCoverage||'—')}${x.QueryCoverage?'%':''}</td><td>${esc(x.TargetCoverage||'—')}${x.TargetCoverage?'%':''}</td><td>${esc(x.Taxon||'No taxonomy assigned')}</td><td>${esc(x.AssignedRank||'NA')}</td><td>${esc(x.QualifiedHitCount??'0')}</td><td>${esc(x.NearBestHitCount??'0')}</td><td>${esc(x.ReadClassificationStatus||'UNKNOWN')}</td><td>${esc(x.TaxonomySupport||'—')}</td></tr>`).join('');
+  html+='</tbody></table></div>';
+  html+='<h4>Candidate reference hits</h4><p class="taxon-muted">Near-best hits are within the configured identity window of the best qualifying hit. Qualified indicates that identity and query/target coverage filters were met.</p>';
+  html+='<div class="readscroll"><table class="reads qualityreads taxonomy-hits"><thead><tr><th>Read</th><th>Reference ID</th><th>Taxonomy</th><th>Identity</th><th>Query coverage</th><th>Target coverage</th><th>Alignment (bp)</th><th>Qualified</th><th>Near-best</th><th>Delta from best</th></tr></thead><tbody>';
+  html+=hits.map(x=>`<tr><td>${esc(x.ReadID)}</td><td>${esc(x.TargetID)}</td><td>${esc(x.Taxonomy||'Unmapped reference')}</td><td>${esc(x.Identity||'—')}%</td><td>${esc(x.QueryCoverage||'—')}%</td><td>${esc(x.TargetCoverage||'—')}%</td><td>${esc(x.AlignmentLength||'—')}</td><td>${String(x.Qualified||'').toLowerCase()==='yes'?'<span class="taxon-qualified">Yes</span>':'No'}</td><td>${String(x.NearBest||'').toLowerCase()==='yes'?'<span class="taxon-nearbest">Near-best</span>':'No'}</td><td>${esc(x.IdentityDelta||'—')}</td></tr>`).join('')||'<tr><td colspan="10">No qualifying reference hits were recovered for these reads.</td></tr>';
+  html+='</tbody></table></div>';
+ }
+ html+='</div>';host.innerHTML=html;
+}
 function renderResult(r){
  $('#results').classList.remove('hidden');$('#resultHeading').textContent=r.sequence_id;$('#resultPill').className='pill '+pillClass(r.qc_class);$('#resultPill').textContent=`${r.qc_class} · ${r.recommendation}`;$('#jobDir').textContent=r.job_dir;
- let ms=[['Result',r.status],['Consensus',r.output_length?`${r.output_length} bp`:'none'],['Reads used',`${r.used_reads}/${r.read_count}`],['Overlap',r.overlap_length?`${r.overlap_length} bp`:'none'],['Overlap identity',r.overlap_identity||'NA']];$('#metrics').innerHTML=ms.map(x=>`<div class="metric"><label>${esc(x[0])}</label><b>${esc(x[1])}</b></div>`).join('');
- $('#why').innerHTML=`<b>QC reason:</b> ${esc(r.reasons||'No QC warning or failure reason.')}<br><b>Suggested action:</b> ${esc(r.suggested_action||'Review the evidence and retain the report with the submission.')}${r.taxonomy_concordance?`<br><b>Primer-read taxonomy agreement:</b> ${esc(r.taxonomy_concordance)} · ${esc(r.read_taxonomy_assignments)}`:''}`;
- $('#readResults').innerHTML=`<h3>Per-read evidence</h3><div class="readscroll"><table class="reads qualityreads"><thead><tr><th rowspan="2">Read</th><th rowspan="2">Primer / direction</th><th rowspan="2">QC</th><th colspan="3">Raw read</th><th colspan="4">Post-trimming QC</th><th rowspan="2">Reason</th></tr><tr><th>Length</th><th>Mean Q</th><th>Expected errors</th><th>Length</th><th>Mean Q</th><th>Expected errors</th><th>Masked N%</th></tr></thead><tbody>${r.reads.map(x=>`<tr><td>${esc(x.ReadID)}</td><td>${esc(x.Primer)} / ${esc(x.Direction)}</td><td>${esc(x.QCClass)} · ${esc(x.Status)}</td><td>${esc(x.RawLength)} bp</td><td>${esc(x.MeanRawQuality)}</td><td>${esc(x.RawExpectedErrors)}</td><td>${esc(x.TrimmedLength)} bp</td><td>${esc(x.MeanTrimmedQuality)}</td><td>${esc(x.TrimmedExpectedErrors)}</td><td>${esc(x.MaskedNPercent)}%</td><td>${esc(x.Reasons||'—')}</td></tr>`).join('')}</tbody></table></div>`;
+ let ms=[['Result',r.status],['Processing mode',r.processing_mode||'map default'],['Consensus / selected read',r.output_length?`${r.output_length} bp`:'none'],['Reads used',`${r.used_reads}/${r.read_count}`],['Overlap',r.overlap_length?`${r.overlap_length} bp`:'none'],['Overlap identity',r.overlap_identity||'NA']];$('#metrics').innerHTML=ms.map(x=>`<div class="metric"><label>${esc(x[0])}</label><b>${esc(x[1])}</b></div>`).join('');
+ let selectionLine=r.selected_read_id?`<br><b>Selected individual read:</b> ${esc(r.selected_read_id)} (${esc(r.read_selection_source||'selection')})${r.fallback_reason?` · ${esc(r.fallback_reason)}`:''}`:'';
+ let fallbackLine=r.fallback_read_options?.length>1?`<br><b>Fallback candidates:</b> ${r.fallback_read_options.map(x=>`${esc(x.read_id)} (${esc(x.length)} bp, Q${esc(x.mean_quality)}, N ${esc(x.n_percent)}%)`).join(' · ')}<br><span class="taxon-muted">Choose the read to carry forward in the Fallback read selection column of the Cohort marker review table, then save the review TSV.</span>`:'';
+ $('#why').innerHTML=`<b>Processing mode:</b> ${esc(r.processing_mode||'map default')} · <b>Assembly outcome:</b> ${esc(r.assembly_status||r.status)}<br><b>QC reason:</b> ${esc(r.reasons||'No QC warning or failure reason.')}<br><b>Suggested action:</b> ${esc(r.suggested_action||'Review the evidence and retain the report with the submission.')}${selectionLine}${fallbackLine}${r.taxonomy_concordance?`<br><b>Primer-read taxonomy agreement:</b> ${esc(r.taxonomy_concordance)} · ${esc(r.read_taxonomy_assignments)}`:''}`;
+ if(cohortReview){
+  const reviewRow=cohortReview.rows.find(x=>x.sequence_id===r.sequence_id);
+  if(reviewRow&&Array.isArray(r.fallback_read_options)&&r.fallback_read_options.length>1){
+   reviewRow.fallback_read_options_list=r.fallback_read_options;
+   reviewRow.fallback_read_options=JSON.stringify(r.fallback_read_options);
+   reviewRow.recommended_read_id=r.recommended_read_id||r.fallback_read_options[0].read_id;
+   reviewRow.selected_read_id=r.selected_read_id||reviewRow.recommended_read_id;
+   reviewRow.read_selection_source=r.read_selection_source||'AUTO_LONGEST_USABLE_READ';
+   reviewRow.fallback_reason=r.fallback_reason||'';
+   renderCohortReviewRows();
+  }
+ }
+
+ const ev=r.consensus_evidence||[];
+ const consensus=ev.map(x=>String(x.ConsensusBase||'N')).join('');
+ const disagreements=ev.filter(x=>String(x.Disagreement).toLowerCase()==='yes');
+ let activeEvidence=ev;
+ let activeDisagreements=disagreements;
+ let activeReviewPositions=[]; // candidate-specific disagreements plus ambiguous-call review sites
+ const single=ev.filter(x=>String(x.EvidenceClass||'').includes('SINGLE_READ')).length;
+ const candidates=(r.assembly_candidates||[]).map(x=>({...x, len:Number(x.OutputLength)||0}));
+ const usable=candidates.filter(x=>x.len>0&&!String(x.Reasons||'').includes('partial_no_overlap'));
+ const ranked=usable.sort((a,b)=>(a.QCClass==='PASS_HIGH_CONFIDENCE'?-1:0)-(b.QCClass==='PASS_HIGH_CONFIDENCE'?-1:0)||b.len-a.len);
+ const fasta=`>${r.sequence_id}|SangerStudio_consensus|${r.qc_class}\n${(consensus.match(/.{1,70}/g)||[]).join('\n')}\n`;
+ const dl=(name,content,type='text/plain')=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([content],{type}));a.download=name;a.click();URL.revokeObjectURL(a.href)};
+ const pct=ev.length?Math.round(100*disagreements.length/ev.length):0;
+ const seqHtml=consensus?`<div class="consensus-seq" id="consensusSeq">${[...consensus].map((b,i)=>`<span class="base ${b==='N'?'ambiguous':''} ${String(ev[i]?.Disagreement).toLowerCase()==='yes'?'discordant':''}" title="Position ${i+1}; ${esc(ev[i]?.ObservedBases||'')}; ${esc(ev[i]?.EvidenceClass||'')}">${b}</span>`).join('')}</div>`:'<p class="muted">No consensus-position evidence was supplied for this result.</p>';
+ $('#readResults').innerHTML=`
+ <section class="review-hero">
+   <div><div class="eyebrow">SEQUENCE REVIEW · ${esc(r.sequence_id)}</div><h2>Assembly overview</h2><p class="muted">Review the sequence first. Supporting evidence and technical reports are available below.</p></div>
+   <div class="hero-status ${r.qc_class==='FAIL_QC'?'fail':r.qc_class==='PASS_WITH_WARNINGS'?'warn':'pass'}">${esc(r.qc_class||r.status||'UNCLASSIFIED')}</div>
+ </section>
+ <div class="review-metrics">
+  <div><b>${Number(r.output_length)||consensus.length||'—'}</b><span>Consensus bp</span></div>
+  <div><b>${esc(r.used_reads||'—')}</b><span>Reads used</span></div>
+  <div><b>${disagreements.length}</b><span>Disagreement positions</span></div>
+  <div><b>${single}</b><span>Single-read positions</span></div>
+ </div>
+ <section class="review-panel">
+  <div class="panel-heading"><div><h3>Consensus sequence</h3><p>Ambiguous bases and read disagreements are highlighted. Select a base to inspect its evidence.</p></div><button class="blue" id="downloadConsensus">Download consensus FASTA</button></div>
+  <div class="sequence-toolbar"><span><i class="legend-dot blue-dot"></i> Consensus</span><span><i class="legend-dot red-dot"></i> Read disagreement</span><span><i class="legend-dot amber-dot"></i> Ambiguous base</span><span class="muted">${consensus.length.toLocaleString()} positions</span></div>
+  <div class="sequence-scroll">${seqHtml}</div>
+  <div class="sequence-inspector" id="baseInspector">Select a nucleotide above to see its position-level evidence.</div>
+  <div class="review-note">${disagreements.length} disagreement positions (${pct}% of positions with evidence); ${single} positions have single-read support. These are review indicators, not automatic rejection criteria.</div>
+ </section>
+ <section class="review-panel" id="readAlignmentPanel">
+  <div class="panel-heading"><div><h3>Multiple-read alignment</h3><p>Reads are shown in the selected candidate's coordinates. 'Next disagreement' cycles through read-review positions: different unambiguous bases and ambiguous-vs-concrete calls. The candidate-card 'ambiguous overlap conflicts' count is a separate assembly/QC metric.</p></div><span class="small">${(r.read_alignment||[]).length} placed reads</span></div>
+  <div class="alignment-controls"><label>Consensus position <input id="alignmentStart" type="number" min="1" max="${Math.max(1,consensus.length)}" value="1"></label><input id="alignmentRange" type="range" min="1" max="${Math.max(1,consensus.length)}" value="1"><span id="alignmentWindowLabel">1–${Math.min(80,consensus.length)} / ${consensus.length}</span><button class="secondary" id="nextDisagreement">Next disagreement</button></div>
+  <div class="alignment-legend"><span class="aln-match">A/C/G/T</span> mapped base <span class="aln-gap">–</span> no mapped base <span class="aln-diff">Mismatch</span> differs from consensus <span class="aln-ambig">N</span> ambiguous call</div>
+  <div class="alignment-scroll" id="readAlignment"></div>
+  <p class="help" id="alignmentStatus">${(r.read_alignment||[]).length ? 'Select a position in the alignment to inspect read-level evidence.' : 'No read placements with corresponding trimmed sequences were available. Re-run inspection with the updated version to generate the alignment.'}</p>
+ </section>
+ <section class="review-panel" id="chromatogramReviewPanel">
+  <div class="panel-heading"><div><h3>Chromatogram evidence</h3><p>Trace channels are synchronised to the selected consensus position using the read's stored trimmed-to-raw coordinate mapping. This is trace inspection, not independent re-basecalling.</p></div><span class="small" id="tracePositionLabel">Select a consensus position</span></div>
+  <div class="trace-legend"><span style="color:#16a34a">A</span><span style="color:#2563eb">C</span><span style="color:#374151">G</span><span style="color:#dc2626">T</span><span>Vertical marker = called peak</span></div>
+  <div id="traceReviewContent" class="trace-review-grid"><p class="trace-note">Select a nucleotide in the consensus or alignment to inspect its supporting chromatograms.</p></div>
+ </section>
+ <section class="review-panel">
+  <div class="panel-heading"><div><h3>Select the assembly to retain</h3><p>Choose one sequence for this isolate. QC-failed reads are included only in clearly flagged review candidates; selecting one is an explicit override, not a change to automated QC.</p></div><span class="small">${ranked.length} sequence-bearing candidates</span></div>
+  <div class="candidate-grid">${ranked.map((x,i)=>`<article class="candidate-card ${x.IncludesFailedRead==='yes'?'candidate-override':''}"><div class="candidate-top"><b>${esc(x.CandidateID)}</b><span class="candidate-qc ${String(x.QCClass).includes('PASS_HIGH')?'pass':String(x.QCClass).includes('PASS')?'warn':'fail'}">${esc(x.QCClass)}</span></div><div class="candidate-length">${x.len.toLocaleString()} <small>bp</small></div><p>${esc(x.ReadIDs||'Read set not recorded')}</p><div class="candidate-meta">Overlap: ${esc(x.OverlapLength||'—')} bp · Identity: ${Number.isFinite(Number(x.OverlapIdentity))?(Number(x.OverlapIdentity)*100).toFixed(2)+'%':'—'} · Ambiguous overlap conflicts: ${esc(x.AmbiguousConflicts||x.Conflicts||'0')}</div>${x.IncludesFailedRead==='yes'?`<div class="override-warning">Includes read(s) failing read-level QC: ${esc(x.ReadQC||'see read QC table')}</div>`:''}<small>${esc(x.Reasons||'No additional QC warnings reported')}</small><button class="candidate-select" data-candidate="${esc(x.CandidateID)}" ${x.Sequence?'':'disabled'}>Select this sequence</button></article>`).join('')||'<p class="muted">No sequence-bearing candidates were generated.</p>'}</div>
+  <div class="selection-footer"><span id="candidateSelectionStatus">No candidate selected for final extraction.</span><button class="blue" id="downloadSelectedCandidate" disabled>Download selected FASTA</button><button class="secondary" id="downloadSelectedBatch" ${Object.keys(selectedAssemblySequences).length?'':'disabled'}>Download selected isolates FASTA (${Object.keys(selectedAssemblySequences).length})</button></div>
+  <p class="help">The selected candidate is exported using its exact stored sequence from assembly_candidates.fasta. Selecting it does not alter the original automated result or QC classification.</p>
+ </section>
+ <details class="diagnostics"><summary>Read quality and trimming evidence (${r.reads.length} reads)</summary><div class="readscroll"><table class="reads qualityreads"><thead><tr><th>Read</th><th>Primer / direction</th><th>QC</th><th>Raw bp</th><th>Trimmed bp</th><th>Trim coordinates</th><th>Mean Q</th><th>Expected errors</th><th>Masked N%</th><th>Trace / peak evidence</th><th>Reason</th></tr></thead><tbody>${r.reads.map(x=>`<tr><td>${esc(x.ReadID)}</td><td>${esc(x.Primer)} / ${esc(x.Direction)}</td><td>${esc(x.QCClass)}</td><td>${esc(x.RawLength)}</td><td>${esc(x.TrimmedLength)}</td><td>${esc(x.TrimStart)}–${esc(x.TrimEnd)}</td><td>${esc(x.MeanTrimmedQuality)}</td><td>${esc(x.TrimmedExpectedErrors)}</td><td>${esc(x.MaskedNPercent)}%</td><td>Trace ${esc(x.TraceAvailable)} · PCON ${esc(x.QualityAvailable)} · mixed peaks ${esc(x.MixedPeakCount)}</td><td>${esc(x.Reasons||'—')}</td></tr>`).join('')}</tbody></table></div></details>
+ <details class="diagnostics"><summary>Read overlaps and assembly diagnostics (${r.overlap_candidates?.length||0} pairs)</summary><div class="readscroll"><table class="reads qualityreads"><thead><tr><th>Read A</th><th>Read B</th><th>Overlap</th><th>Identity</th><th>Outcome</th><th>Reason</th></tr></thead><tbody>${(r.overlap_candidates||[]).map(x=>`<tr><td>${esc(x.ReadA)}</td><td>${esc(x.ReadB)}</td><td>${esc(x.OverlapLength)} bp</td><td>${(Number(x.Identity)*100).toFixed(2)}%</td><td>${String(x.Accepted).toLowerCase()==='yes'?'Accepted':'Rejected'}</td><td>${esc(x.Reason)}</td></tr>`).join('')}</tbody></table></div></details>
+ <details class="diagnostics"><summary>Full per-position evidence (${ev.length.toLocaleString()} positions)</summary><div class="readscroll position-table"><table class="reads qualityreads"><thead><tr><th>Position</th><th>Consensus</th><th>Supporting reads</th><th>Observed bases</th><th>Disagreement</th><th>Evidence class</th></tr></thead><tbody>${ev.map(x=>`<tr><td>${esc(x.ConsensusPosition)}</td><td><b>${esc(x.ConsensusBase)}</b></td><td>${esc(x.SupportingReads)}</td><td>${esc(x.ObservedBases)}</td><td>${esc(x.Disagreement)}</td><td>${esc(x.EvidenceClass)}</td></tr>`).join('')}</tbody></table></div></details>`;
+ $('#downloadConsensus').onclick=()=>{const seq=activeConsensus||consensus;const label=selectedCandidate?selectedCandidate.CandidateID:'consensus';dl(`${r.sequence_id}_${label}.fasta`,`>${r.sequence_id}|${label}|${selectedCandidate?.QCClass||r.qc_class}\n${(seq.match(/.{1,70}/g)||[]).join('\n')}\n`,'text/x-fasta');};
+ let selectedCandidate=null;
+ const candidateById=new Map(ranked.map(x=>[x.CandidateID,x]));
+ const selectedStatus=$('#candidateSelectionStatus');
+ const selectedDownload=$('#downloadSelectedCandidate');
+ function activateCandidateAlignment(candidate){
+   activeConsensus=String(candidate.Sequence||'').toUpperCase();
+   alignmentReads=(r.candidate_read_alignments||{})[candidate.CandidateID]||[];
+   // Recalculate evidence against the selected candidate, never reuse the
+   // default assembly's position table for a different sequence. N/other
+   // ambiguous calls are displayed but do not count as nucleotide agreement.
+   activeEvidence=Array.from({length:activeConsensus.length},(_,i)=>{
+     const calls=alignmentReads.map(x=>({read_id:x.read_id,base:String(x.aligned_sequence||'')[i]||'-'})).filter(x=>x.base!=='-');
+     const concrete=calls.filter(x=>'ACGT'.includes(x.base));
+     const bases=[...new Set(concrete.map(x=>x.base))];
+     const disagreement=bases.length>1;
+     return {ConsensusPosition:i+1,ConsensusBase:activeConsensus[i],SupportingReads:calls.map(x=>x.read_id).join(';'),ObservedBases:calls.map(x=>x.base).join(';'),Disagreement:disagreement?'yes':'no',EvidenceClass:disagreement?'MULTI_READ_DISAGREEMENT':concrete.length>1?'MULTI_READ_AGREEMENT':calls.length?'SINGLE_READ_SUPPORT':'NO_READ_SUPPORT'};
+   });
+   activeDisagreements=activeEvidence.filter(x=>String(x.Disagreement).toLowerCase()==='yes');
+   // Navigation must include both concrete A/C/G/T disagreements and positions
+   // where an ambiguous call (N or IUPAC) is paired with a concrete call.
+   // The latter are review sites, not unambiguous nucleotide disagreements.
+   activeReviewPositions=activeEvidence.filter(x=>{
+     const observed=String(x.ObservedBases||'').split(';').filter(b=>b && b!=='-');
+     return new Set(observed).size>1 && observed.length>1;
+   });
+   const seqNode=$('#consensusSeq');
+   if(seqNode)seqNode.innerHTML=[...activeConsensus].map((b,i)=>`<span class="base ${b==='N'?'ambiguous':''} ${String(activeEvidence[i]?.Disagreement).toLowerCase()==='yes'?'discordant':''}" data-active-pos="${i}" title="Position ${i+1}; ${esc(activeEvidence[i]?.ObservedBases||'')}; ${esc(activeEvidence[i]?.EvidenceClass||'')}">${b}</span>`).join('');
+   $('#readAlignmentPanel .panel-heading h3').textContent=`Multiple-read alignment · ${candidate.CandidateID}`;
+   $('#readAlignmentPanel .panel-heading p').textContent=`Reads included in ${candidate.CandidateID} are projected onto its exact stored sequence. Disagreements are recalculated for this candidate.`;
+   $('#readAlignmentPanel .panel-heading .small').textContent=`${alignmentReads.length} mapped reads`;
+   $('#alignmentStart').max=Math.max(1,activeConsensus.length);
+   $('#alignmentRange').max=Math.max(1,activeConsensus.length);
+   $('#alignmentStatus').textContent=alignmentReads.length?`${alignmentReads.length} candidate read(s) projected. ${activeDisagreements.length} unambiguous disagreements; ${activeReviewPositions.length} total read-conflict/ambiguous review positions.`:'No candidate reads could be aligned to this sequence.';
+   showAlignmentPosition(0);
+   renderActiveSequence();
+ }
+ // Delegate candidate selection from the stable grid container. This is more
+ // robust than binding individual buttons while the review DOM is being built.
+ const candidateGrid=$('.candidate-grid');
+ if(candidateGrid){
+   candidateGrid.addEventListener('click',event=>{
+     const btn=event.target.closest('.candidate-select');
+     if(!btn||!candidateGrid.contains(btn))return;
+     event.preventDefault();
+     const candidate=candidateById.get(btn.dataset.candidate);
+     if(!candidate||!candidate.Sequence){
+       selectedStatus.textContent=`Could not load the stored sequence for ${btn.dataset.candidate||'this candidate'}.`;
+       return;
+     }
+     try{
+       selectedCandidate=candidate;
+       activateCandidateAlignment(candidate);
+       candidateGrid.querySelectorAll('.candidate-card').forEach(card=>card.classList.remove('chosen'));
+       btn.closest('.candidate-card')?.classList.add('chosen');
+       selectedStatus.textContent=`Selected ${candidate.CandidateID} · ${candidate.len.toLocaleString()} bp · ${candidate.QCClass}`;
+       selectedDownload.disabled=false;
+     }catch(error){
+       selectedStatus.textContent=`Candidate selection failed: ${error?.message||String(error)}`;
+       console.error('Sanger Studio candidate selection failed',error);
+     }
+   });
+ }
+ selectedDownload.onclick=()=>{if(!selectedCandidate)return;const name=`${r.sequence_id}|${selectedCandidate.CandidateID}|${selectedCandidate.QCClass}`;dl(`${r.sequence_id}_${selectedCandidate.CandidateID}.fasta`,`>${name}\n${(selectedCandidate.Sequence.match(/.{1,70}/g)||[]).join('\n')}\n`,'text/x-fasta');selectedAssemblySequences[r.sequence_id]={candidate:selectedCandidate,sequence:selectedCandidate.Sequence};$('#downloadSelectedBatch').disabled=false;$('#downloadSelectedBatch').textContent=`Download selected isolates FASTA (${Object.keys(selectedAssemblySequences).length})`;};
+ $('#downloadSelectedBatch').onclick=()=>{const records=Object.entries(selectedAssemblySequences).map(([id,v])=>`>${id}|${v.candidate.CandidateID}|${v.candidate.QCClass}\n${(v.sequence.match(/.{1,70}/g)||[]).join('\n')}`).join('\n');if(records)dl('SangerStudio_selected_assemblies.fasta',records+'\n','text/x-fasta');};
+ renderActiveSequence();
+
+ let alignmentReads=r.read_alignment||[];
+ let activeConsensus=consensus;
+ const alignmentWidth=80;
+ let alignmentPosition=0;
+ function renderActiveSequence(){
+   const node=$('#consensusSeq'); if(!node)return;
+   node.querySelectorAll('.base').forEach((el,i)=>el.addEventListener('click',()=>{
+     const x=activeEvidence[i]||{};
+     $('#baseInspector').innerHTML=`<b>Position ${i+1} · ${esc(x.ConsensusBase||'')}</b> &nbsp; Supporting reads: ${esc(x.SupportingReads||'—')} &nbsp; Observed: ${esc(x.ObservedBases||'—')} &nbsp; <span>${esc(x.EvidenceClass||'')}</span>`;
+     showAlignmentPosition(i);
+   }));
+ }
+ function updateBaseInspector(position){
+   const x=activeEvidence[position]||{};
+   const readCoords=alignmentReads.map(read=>{
+     const rp=trimmedPositionAt(read,position);
+     const base=String(read.aligned_sequence||'')[position]||'-';
+     return rp>0?`${read.read_id}: ${base} (trimmed read position ${rp})`:null;
+   }).filter(Boolean);
+   const coordText=readCoords.length?`<br><span class="small">Read coordinates: ${readCoords.map(esc).join(' · ')}</span>`:'';
+   $('#baseInspector').innerHTML=`<b>Position ${position+1} · ${esc(x.ConsensusBase||activeConsensus[position]||'')}</b> &nbsp; Supporting reads: ${esc(x.SupportingReads||'—')} &nbsp; Observed: ${esc(x.ObservedBases||'—')} &nbsp; <span>${esc(x.EvidenceClass||'')}</span>${coordText}`;
+ }
+ const traceColours={A:'#16a34a',C:'#2563eb',G:'#374151',T:'#dc2626'};
+ function trimmedPositionAt(read,position){
+   const stored=Number((read.read_positions||[])[position]);
+   if(Number.isFinite(stored)&&stored>0)return stored;
+   // Fallback for older inspection payloads: candidate read projections are
+   // already in consensus coordinates. Count mapped bases through this column.
+   // A gap at the selected column is never treated as supporting evidence.
+   const aligned=String(read.aligned_sequence||'');
+   if(position<0||position>=aligned.length||aligned[position]==='-')return 0;
+   let count=0;
+   for(let i=0;i<=position;i++)if(aligned[i]&&aligned[i]!=='-')count++;
+   return count;
+ }
+ let traceZoomSamples=30;
+ let traceOverlayMode=true;
+ let traceAmplitudeMode='normalised';
+ let traceSelectedReadIds=null;
+ function renderTraceReview(position){
+   const host=$('#traceReviewContent'); if(!host)return;
+   $('#tracePositionLabel').textContent=`Consensus position ${position+1}`;
+   const rows=alignmentReads.map(read=>{
+     const rp=trimmedPositionAt(read,position);
+     const trace=(read.trace_review||{})[read.read_id];
+     return rp>0?{read,rp,trace}:null;
+   }).filter(Boolean);
+   const usable=rows.filter(x=>x.trace&&x.trace.available&&(x.trace.channels||{}).A);
+   const availableIds=usable.map(x=>x.read.read_id);
+   if(traceSelectedReadIds===null)traceSelectedReadIds=new Set(availableIds);
+   else {
+     // Keep the selection stable as the consensus position changes, while
+     // dropping reads that no longer provide trace evidence at this position.
+     traceSelectedReadIds=new Set([...traceSelectedReadIds].filter(id=>availableIds.includes(id)));
+   }
+   const selected=usable.filter(x=>traceSelectedReadIds.has(x.read.read_id));
+   const zoomOptions=[10,20,30,60,100,200];
+   const controls=`<div class="trace-controls">
+     <label>Zoom window <select id="traceZoomSelect">
+       ${zoomOptions.map(v=>`<option value="${v}" ${traceZoomSamples===v?'selected':''}>±${v} samples</option>`).join('')}
+       <option value="all" ${traceZoomSamples==='all'?'selected':''}>Full trace</option>
+     </select></label>
+     <label>View <select id="traceViewMode">
+       <option value="overlay" ${traceOverlayMode?'selected':''}>Peak-aligned overlay</option>
+       <option value="individual" ${!traceOverlayMode?'selected':''}>Individual traces</option>
+     </select></label>
+     <label>Amplitude <select id="traceAmplitudeMode">
+       <option value="normalised" ${traceAmplitudeMode==='normalised'?'selected':''}>Normalised</option>
+       <option value="raw" ${traceAmplitudeMode==='raw'?'selected':''}>Raw signal</option>
+     </select></label>
+     <span class="trace-control-note">Zoom is centred on each read's called peak.</span>
+   </div>
+   <details class="trace-read-selector" ${usable.length?'':'open'}>
+     <summary>Supporting reads · ${selected.length} of ${usable.length} chromatograms selected</summary>
+     <div class="trace-read-options">
+       ${rows.map(({read,trace})=>{
+         const available=!!(trace&&trace.available&&(trace.channels||{}).A);
+         const checked=available&&traceSelectedReadIds.has(read.read_id);
+         return `<label class="${available?'':'trace-read-unavailable'}"><input type="checkbox" class="trace-read-choice" value="${esc(read.read_id)}" ${checked?'checked':''} ${available?'':'disabled'}><span>${esc(read.read_id)}</span><small>${available?'Trace available':esc(trace?.reason||'No trace data')}</small></label>`;
+       }).join('')}
+     </div>
+   </details>
+   <div class="trace-count-summary">${rows.length} mapped reads · ${usable.length} chromatograms available · ${selected.length} displayed</div>`;
+   if(!rows.length){host.innerHTML=controls+'<div class="trace-no-data">No supporting read has a mapped coordinate at this consensus position.</div>';return;}
+   if(!usable.length){
+     host.innerHTML=controls+rows.map(({read,trace})=>`<article class="trace-read-card"><h4>${esc(read.read_id)}</h4><div class="trace-no-data">${esc(trace?.reason||'Chromatogram trace data are unavailable for this read.')}</div></article>`).join('');
+   }else if(!selected.length){
+     host.innerHTML=controls+'<div class="trace-no-data">Select at least one supporting read to display chromatogram evidence.</div>';
+   }else{
+     const span=traceZoomSamples==='all'?null:Number(traceZoomSamples);
+     const prepared=selected.map(({read,rp,trace})=>{
+       const isReverse=String(read.direction||trace.direction||'').toLowerCase().startsWith('rev');
+       const rawBaseIndex=isReverse?Number(trace.trim_end||0)-rp:Number(trace.trim_start||0)+rp-1;
+       const peak=Number(trace.peak_locations?.[rawBaseIndex]??-1);
+       const binSize=Math.max(1,Number(trace.bin_size||1));
+       const peakBin=peak>=0?Math.floor(peak/binSize):-1;
+       const channels=trace.channels||{};
+       const n=Math.max(...Array.from('ACGT').map(b=>(channels[b]||[]).length),1);
+       const lo=span===null?0:Math.max(0,peakBin-span);
+       const hi=span===null?n-1:Math.min(n-1,peakBin+span);
+       return {read,rp,trace,rawBaseIndex,peakBin,channels,n,lo,hi};
+     }).filter(x=>x.peakBin>=0);
+     if(!prepared.length){
+       host.innerHTML=controls+'<div class="trace-no-data">The selected reads do not have valid called-peak coordinates at this position.</div>';
+     }else if(traceOverlayMode&&prepared.length>1){
+       const width=1400,height=360,left=48,right=28,top=22,bottom=34,gw=width-left-right,gh=height-top-bottom;
+       let minOffset=0,maxOffset=0;
+       prepared.forEach(x=>{minOffset=Math.min(minOffset,x.lo-x.peakBin);maxOffset=Math.max(maxOffset,x.hi-x.peakBin);});
+       if(maxOffset<=minOffset){minOffset=-30;maxOffset=30;}
+       const xFor=offset=>left+((offset-minOffset)/(maxOffset-minOffset))*gw;
+       const allValues=prepared.flatMap(x=>Array.from('ACGT').flatMap(b=>x.channels[b]||[]));
+       const sharedMax=Math.max(1,...allValues.map(Number).filter(Number.isFinite));
+       const paths=[];
+       prepared.forEach(({channels,peakBin,lo,hi})=>{
+         const localMax=Math.max(1,...Array.from('ACGT').flatMap(b=>channels[b]||[]).map(Number).filter(Number.isFinite));
+         const scale=traceAmplitudeMode==='normalised'?localMax:sharedMax;
+         Array.from('ACGT').forEach(base=>{
+           const vals=channels[base]||[],pts=[];
+           for(let i=lo;i<=hi;i++){
+             const offset=i-peakBin;
+             pts.push(`${xFor(offset).toFixed(2)},${(top+gh-(Number(vals[i]||0)/scale)*gh).toFixed(2)}`);
+           }
+           if(pts.length)paths.push(`<polyline fill="none" stroke="${traceColours[base]}" stroke-opacity=".72" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" points="${pts.join(' ')}"/>`);
+         });
+       });
+       const centre=xFor(0);
+       const tickOffsets=span===null?[-1000,-500,0,500,1000].filter(v=>v>=minOffset&&v<=maxOffset):[-span,-Math.round(span/2),0,Math.round(span/2),span].filter((v,i,a)=>a.indexOf(v)===i);
+       const ticks=tickOffsets.map(v=>`<line x1="${xFor(v)}" y1="${top+gh}" x2="${xFor(v)}" y2="${top+gh+5}" stroke="#64748b"/><text x="${xFor(v)}" y="${height-8}" text-anchor="middle" font-size="11" fill="#64748b">${v===0?'Peak':v>0?'+'+v:v}</text>`).join('');
+       host.innerHTML=controls+`<article class="trace-read-card trace-overlay-card"><div class="row between"><h4>Supporting chromatograms · peak-aligned overlay</h4><span class="small">${prepared.length} traces</span></div><div class="trace-meta">${traceAmplitudeMode==='normalised'?'Each read is independently amplitude-normalised.':'Raw channel amplitudes are shown on a shared scale; differences between instruments/runs may affect amplitude.'} Traces are centred on their called peaks. The vertical dashed line marks the called base.</div><svg class="trace-svg trace-overlay-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="Peak-aligned overlay of ${prepared.length} supporting chromatograms"><line x1="${left}" y1="${top+gh}" x2="${width-right}" y2="${top+gh}" stroke="#cbd5e1"/>${paths.join('')}<line x1="${centre}" y1="${top}" x2="${centre}" y2="${top+gh}" stroke="#111827" stroke-width="1.6" stroke-dasharray="6 5"/>${ticks}</svg><div class="trace-legend"><span style="color:#16a34a">A</span><span style="color:#2563eb">C</span><span style="color:#374151">G</span><span style="color:#dc2626">T</span></div></article>`;
+     }else{
+       const individualRawMax=Math.max(1,...prepared.flatMap(x=>Array.from('ACGT').flatMap(b=>x.channels[b]||[])).map(Number).filter(Number.isFinite));
+       const cards=prepared.map(({read,rp,trace,rawBaseIndex,peakBin,channels,n,lo,hi})=>{
+         const isReverse=String(read.direction||trace.direction||'').toLowerCase().startsWith('rev');
+         const quality=Number(trace.qualities?.[rawBaseIndex]??NaN),ratio=Number(trace.secondary_peak_ratios?.[rawBaseIndex]??NaN),secondary=String(trace.secondary_peak_bases?.[rawBaseIndex]||'');
+         const max=traceAmplitudeMode==='normalised'?Math.max(1,...Array.from('ACGT').flatMap(b=>channels[b]||[]).map(Number).filter(Number.isFinite)):individualRawMax;
+         const width=1400,height=300,left=48,right=28,top=18,bottom=32,gw=width-left-right,gh=height-top-bottom;
+         const paths=Array.from('ACGT').map(base=>{const vals=channels[base]||[],pts=[];for(let i=lo;i<=hi;i++){const yScale=max;pts.push(`${left+((i-lo)/Math.max(1,hi-lo))*gw},${top+gh-(Number(vals[i]||0)/yScale)*gh}`);}return `<polyline fill="none" stroke="${traceColours[base]}" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" points="${pts.join(' ')}"/>`;}).join('');
+         const markerX=peakBin>=lo&&peakBin<=hi?left+((peakBin-lo)/Math.max(1,hi-lo))*gw:null;
+         const marker=markerX===null?'':`<line x1="${markerX}" y1="${top}" x2="${markerX}" y2="${top+gh}" stroke="#111827" stroke-width="1.6" stroke-dasharray="5 4"/>`;
+         return `<article class="trace-read-card"><h4>${esc(read.read_id)} · ${esc(read.primer||'')} · ${esc(read.direction||'')}</h4><div class="trace-meta">Consensus ${position+1} → trimmed read ${rp} → raw base ${rawBaseIndex+1} · called ${esc(String(read.aligned_sequence||'')[position]||'—')} · ${Number.isFinite(quality)?'Q'+quality:'Q unavailable'} · ${Number.isFinite(ratio)?'Secondary peak '+(secondary||'—')+' · ratio '+ratio.toFixed(2):'Secondary peak evidence unavailable'}</div><svg class="trace-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="Chromatogram for ${esc(read.read_id)}"><line x1="${left}" y1="${top+gh}" x2="${width-right}" y2="${top+gh}" stroke="#cbd5e1"/>${paths}${marker}<text x="${left}" y="${height-7}" font-size="11" fill="#64748b">${span===null?'Trace start':'Peak −'+span+' samples'}</text><text x="${width-right}" y="${height-7}" text-anchor="end" font-size="11" fill="#64748b">${span===null?'Trace end':'Peak +'+span+' samples'}</text></svg></article>`;
+       }).join('');
+       host.innerHTML=controls+cards;
+     }
+   }
+   $('#traceZoomSelect')?.addEventListener('change',e=>{traceZoomSamples=e.target.value==='all'?'all':Number(e.target.value);renderTraceReview(position);});
+   $('#traceViewMode')?.addEventListener('change',e=>{traceOverlayMode=e.target.value==='overlay';renderTraceReview(position);});
+   $('#traceAmplitudeMode')?.addEventListener('change',e=>{traceAmplitudeMode=e.target.value;renderTraceReview(position);});
+   host.querySelectorAll('.trace-read-choice').forEach(el=>el.addEventListener('change',e=>{
+     if(e.target.checked)traceSelectedReadIds.add(e.target.value);else traceSelectedReadIds.delete(e.target.value);
+     renderTraceReview(position);
+   }));
+ }
+ function showAlignmentPosition(position){
+   if(!activeConsensus.length)return;
+   alignmentPosition=Math.max(0,Math.min(activeConsensus.length-1,position));
+   const start=Math.floor(alignmentPosition/alignmentWidth)*alignmentWidth;
+   const end=Math.min(activeConsensus.length,start+alignmentWidth);
+   const grid=$('#readAlignment'); if(!grid)return;
+   const rows=[{read_id:'CONSENSUS',status:r.qc_class,aligned_sequence:activeConsensus,consensus:true},...alignmentReads];
+   grid.innerHTML=`<div class="alignment-grid" style="--cols:${end-start}">${rows.map(row=>{
+     const label=row.consensus?'Consensus':`${row.read_id} · ${row.primer||'primer unknown'} · ${row.direction||'direction unknown'}`;
+     const cells=[...String(row.aligned_sequence||'').slice(start,end)].map((base,j)=>{
+       const pos=start+j, ref=activeConsensus[pos]||'N';
+       const cls=base==='-'?'gap':base==='N'||!('ACGT'.includes(base))?'ambig':(!row.consensus&&'ACGT'.includes(ref)&&base!==ref?'diff':'');
+       return `<span class="aln-cell ${cls} ${row.consensus?'aln-consensus':''} ${pos===alignmentPosition?'selected':''}" data-pos="${pos}" title="Position ${pos+1}: ${esc(row.read_id)} = ${esc(base)}">${esc(base)}</span>`;
+     }).join('');
+     return `<div class="aln-label" title="${esc(label)}">${esc(label)}</div>${cells}`;
+   }).join('')}</div>`;
+   $('#alignmentStart').value=alignmentPosition+1;
+   $('#alignmentRange').value=alignmentPosition+1;
+   $('#alignmentWindowLabel').textContent=`${start+1}–${end} / ${activeConsensus.length}`;
+   grid.querySelectorAll('.aln-cell').forEach(cell=>cell.addEventListener('click',()=>{
+     const pos=Number(cell.dataset.pos); alignmentPosition=pos;
+     updateBaseInspector(pos);
+     showAlignmentPosition(pos);
+   }));
+   renderTraceReview(alignmentPosition);
+ }
+ if($('#alignmentRange')){
+   $('#alignmentRange').oninput=e=>showAlignmentPosition(Number(e.target.value)-1);
+   $('#alignmentStart').onchange=e=>showAlignmentPosition(Number(e.target.value)-1);
+   $('#nextDisagreement').onclick=()=>{
+     if(!activeReviewPositions.length){$('#alignmentStatus').textContent='No positions with differing read calls or ambiguous-vs-concrete evidence were found in this candidate alignment. Candidate overlap-conflict counts are a separate assembly/QC metric.';return;}
+     const next=activeReviewPositions.find(x=>Number(x.ConsensusPosition)>alignmentPosition+1);
+     const target=next?Number(next.ConsensusPosition)-1:Number(activeReviewPositions[0].ConsensusPosition)-1;
+     showAlignmentPosition(target);
+     updateBaseInspector(target);
+   };
+   // Initialise the viewer from the first ranked candidate's explicit
+   // candidate/read projection. The legacy default read_alignment payload does
+   // not contain read_positions and therefore cannot drive chromatogram lookup.
+   if(ranked.length){
+     activateCandidateAlignment(ranked[0]);
+     document.querySelectorAll('.candidate-card')[0]?.classList.add('viewer-active');
+     $('#alignmentStatus').textContent=`Viewing ${ranked[0].CandidateID}: ${alignmentReads.length} candidate read(s) projected. Select a candidate below to change the sequence to retain.`;
+   }else{
+     showAlignmentPosition(0);
+   }
+ }
+ renderTaxonomyResults(r);
  $('#images').innerHTML=r.artifacts.map(a=>`<figure><a href="${a.url}" target="_blank"><img loading="lazy" src="${a.url}" alt="${esc(a.label)}"></a><figcaption>${esc(a.label)}</figcaption></figure>`).join('');$('#reportLinks').innerHTML=r.files.map(f=>`<a href="${f.url}" target="_blank">${esc(f.label)}</a>`).join('');
- let review=r.qc_class==='PASS_WITH_WARNINGS'&&r.recommendation==='MANUAL_REVIEW';$('#reviewBox').classList.toggle('hidden',!review);$('#reviewStatus').textContent='';if(!review&&r.qc_class==='FAIL_QC')$('#why').innerHTML+=`<br><br><b>This marker cannot be approved through manual review.</b> It failed a read/consensus quality check; inspect the read evidence and resequence if needed.`;$('#results').scrollIntoView({behavior:'smooth',block:'start'})
+ let review=r.qc_class==='PASS_WITH_WARNINGS'&&r.recommendation==='MANUAL_REVIEW';$('#reviewBox').classList.toggle('hidden',!review);$('#reviewStatus').textContent='';if(!review&&r.qc_class==='FAIL_QC')$('#why').innerHTML+=`<br><br><b>This marker failed automated QC.</b> Its eligibility for any exception decision is controlled by the attached cohort review template; inspect the sequence evidence and use the cohort review panel where appropriate.`;$('#results').scrollIntoView({behavior:'smooth',block:'start'})
 }
 async function saveReview(decision){if(!lastInspection)return;try{let r=await api('/api/review',{sequence_id:lastInspection.sequence_id,decision,reviewer:$('#reviewer').value,notes:$('#reviewNotes').value});$('#reviewStatus').textContent=`Saved ${decision} decision to ${r.path}`;$('#reviewFile').href='/artifact?path=marker_review_decisions.tsv'}catch(e){$('#reviewStatus').textContent=e.message;$('#reviewStatus').className='error'}}
-async function init(){try{studioState=await api('/api/state');$('#rootBadge').textContent='Root: '+studioState.root;$('#mapPath').value=studioState.map_path||'';renderSettings();renderSamples();let map=studioState.map_path;if(map){$('#mapStatus').textContent=`Loaded ${studioState.samples.length} isolate(s) from the command line.`;if(studioState.samples.length)selectSample(studioState.samples[0].sequence_id)}$('#loadMap').onclick=()=>loadMap($('#mapPath').value);$('#sampleSearch').oninput=renderSamples;$('#browseBtn').onclick=showBrowse;$('#closeBrowser').onclick=()=>$('#modal').classList.add('hidden');$('#browseUp').onclick=()=>{let a=browsePath.split('/').filter(Boolean);a.pop();browse(a.join('/')||'.')};$('#quickMapBtn').onclick=quickMap;$('#runBtn').onclick=inspect;$('#processAllBtn').onclick=processAll;$('#resetSettings').onclick=renderSettings;$('#approveBtn').onclick=()=>saveReview('approve');$('#rejectBtn').onclick=()=>saveReview('reject');$('#mode').onchange=()=>{};$('#samples').addEventListener('click',()=>{});}catch(e){$('#rootBadge').textContent='Studio connection failed';$('#mapStatus').textContent=e.message}}
+async function init(){try{studioState=await api('/api/state');$('#outputBadge').textContent='Output: '+studioState.out;$('#outputPath').textContent=studioState.out;$('#mapPath').value=studioState.map_path||'';$('#screenRefPath').value=studioState.screen_ref||'';$('#screenTaxaPath').value=studioState.screen_taxa||'';updateTaxonomyScreenStatus(studioState.taxonomy_screen_enabled?'Reference available for optional VSEARCH re-screening.':'No reference configured for optional re-screening.');renderOnboardingTaxonomyState(studioState.onboarding_taxonomy);renderSettings();renderSamples();$('#sequenceType').onchange=applySequenceProfile;applySequenceProfile();$('#chooseInputFolderBtn').onclick=chooseInputFolder;$('#chooseMapBtn').onclick=chooseMap;$('#chooseReadsBtn').onclick=chooseReads;$('#uploadZipBtn').onclick=()=>$('#ab1ZipInput').click();$('#ab1ZipInput').onchange=e=>uploadAb1Zip(e.target.files&&e.target.files[0]);$('#chooseOutputBtn').onclick=chooseOutput;$('#shutdownBtn').onclick=shutdownStudio;$('#chooseTaxonomyRefBtn').onclick=chooseTaxonomyRef;$('#chooseTaxonomyTableBtn').onclick=chooseTaxonomyTable;$('#applyTaxonomySettingsBtn').onclick=applyTaxonomySettings;$('#rerunTaxonomyCheck').onchange=()=>updateTaxonomyScreenStatus($('#rerunTaxonomyCheck').checked?'Fresh VSEARCH will run on the current trimmed reads during the next inspection.':'Off: use pre-screened onboarding taxonomy where available.');$('#attachReviewBtn').onclick=attachReview;$('#loadMap').onclick=()=>loadMap($('#mapPath').value);$('#sampleSearch').oninput=renderSamples;$('#runBtn').onclick=inspect;$('#runBtnSidebar').onclick=inspect;$('#processAllBtn').onclick=processAll;$('#resetSettings').onclick=renderSettings;$('#approveBtn').onclick=()=>saveReview('approve');$('#rejectBtn').onclick=()=>saveReview('reject');$('#cohortReviewSearch').oninput=renderCohortReviewRows;$('#cohortReviewFilter').onchange=renderCohortReviewRows;$('#cohortReviewRows').addEventListener('change',e=>{let tr=e.target.closest('tr[data-seq]');if(!tr||!cohortReview)return;let record=cohortReview.rows.find(r=>r.sequence_id===tr.dataset.seq);if(!record)return;if(e.target.classList.contains('cohortDecision')){record.decision=e.target.value;let n=cohortReview.rows.filter(r=>String(r.decision||'').trim()).length;$('#cohortReviewPill').textContent=`${n}/${cohortReview.total} decided`}if(e.target.classList.contains('cohortNotes'))record.notes=e.target.value;if(e.target.classList.contains('fallbackReadChoice')){record.selected_read_id=e.target.value;record.read_selection_source=e.target.value&&e.target.value!==record.recommended_read_id?'MANUAL':'AUTO_LONGEST_USABLE_READ';}});$('#cohortReviewRows').addEventListener('input',e=>{if(!e.target.classList.contains('cohortNotes')||!cohortReview)return;let tr=e.target.closest('tr[data-seq]'),record=cohortReview.rows.find(r=>r.sequence_id===tr?.dataset.seq);if(record)record.notes=e.target.value});$('#cohortReviewRows').addEventListener('click',e=>{let b=e.target.closest('[data-review-inspect]');if(!b)return;let id=b.dataset.reviewInspect;if((studioState.samples||[]).some(s=>s.sequence_id===id)){selectSample(id);$('#sampleHeading').scrollIntoView({behavior:'smooth',block:'start'})}else{setStatus($('#cohortReviewSaveStatus'),`${id} is not present in the currently loaded raw-read map. Attach the relevant partner sample map to inspect its chromatograms.`,true)}});$('#saveCohortReviewBtn').onclick=saveCohortReview;if(studioState.marker_review)renderCohortReview(studioState.marker_review);if(studioState.samples?.length){$('#mapStatus').textContent=studioState.onboarding_taxonomy?.loaded?studioState.onboarding_taxonomy.message:`Loaded ${studioState.samples.length} isolate(s) from the startup state.`;selectSample(studioState.samples[0].sequence_id)}}catch(e){$('#outputBadge').textContent='Studio connection failed';$('#mapStatus').textContent=e.message}}
 init();
 </script>
 </body>

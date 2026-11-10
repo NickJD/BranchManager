@@ -19,6 +19,7 @@ from branchmanager.pipeline.paper_trail import (
     _row_processing_mode,
     _row_value,
 )
+from branchmanager.utils.io import write_tsv
 
 
 AB1_SUFFIXES = ('.ab1', '.abi', '.ab1.gz', '.abi.gz')
@@ -466,7 +467,4 @@ def _issue(
 
 
 def _write_tsv(path: Path, rows: list[dict[str, object]], fields: tuple[str, ...]) -> None:
-    with open(path, 'w', newline='') as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', extrasaction='ignore')
-        writer.writeheader()
-        writer.writerows(rows)
+    write_tsv(path, list(fields), rows)

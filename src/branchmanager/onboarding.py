@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Iterable, Optional
@@ -15,11 +16,11 @@ from branchmanager.pipeline.paper_trail import (
     _metadata_key_variants,
     _is_supported_read_file,
     _normalise_row,
-    _open_text,
     _row_processing_mode,
     _row_value,
 )
 from branchmanager.utils.fasta import read_fasta, write_fasta
+from branchmanager.utils.io import open_text
 
 
 PARTNER_COLUMNS = ('partner_id', 'partner', 'partner_acronym', 'partner_code')
@@ -90,14 +91,14 @@ def _read_xlsx_table(path: str | Path) -> list[dict[str, str]]:
 def _read_table(path: str | Path) -> list[dict[str, str]]:
     if str(path).lower().endswith(('.xlsx', '.xlsm')):
         return _read_xlsx_table(path)
-    with _open_text(path) as handle:
+    with open_text(path) as handle:
         sample = handle.read(4096)
         handle.seek(0)
         delimiter = '\t' if str(path).lower().endswith(('.tsv', '.tsv.gz', '.txt', '.txt.gz')) else ','
         try:
             delimiter = csv.Sniffer().sniff(sample, delimiters=',\t').delimiter
         except Exception:
-            pass
+            logging.getLogger(__name__).debug('Could not sniff CSV delimiter for %r; using default', path)
         return [_normalise_row(row) for row in csv.DictReader(handle, delimiter=delimiter)]
 
 

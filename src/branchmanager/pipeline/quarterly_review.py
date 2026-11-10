@@ -7,7 +7,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-from branchmanager.pipeline import diversity_metadata as _diversity_metadata
+from branchmanager.pipeline.evidence_policy import evidence_quality as _shared_evidence_quality
 from branchmanager.pipeline.neighbourhood import _load_alignment_sequences, _msa_pident, pairwise_leaf_distances
 from branchmanager.pipeline.selection_sets import (
     DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY,
@@ -15,7 +15,6 @@ from branchmanager.pipeline.selection_sets import (
     DEFAULT_BASELINE_REDUNDANCY_IDENTITY,
     DEFAULT_BASELINE_REDUNDANCY_QUERY_COVERAGE,
     DEFAULT_PANGENOME_TARGET,
-    SELECTION_BLOCKING_PLACEMENT_FLAGS,
     baseline_extension_evidence,
     baseline_redundancy_evidence,
 )
@@ -84,10 +83,23 @@ def normalise_assessment_row(row: dict, *, source_path: str = '') -> dict:
             row, 'classification_identity', 'GTDBClassificationIdentity', 'ClassificationIdentity',
         ),
         'classification_confidence': _value(
-            row, 'classification_confidence', 'GTDBClassificationConfidence', 'ClassificationConfidence',
+            row, 'classification_confidence', 'GTDBSourceClassifierConfidence', 'SourceClassifierConfidence',
         ),
+        'classification_assignment_status': _value(row, 'classification_assignment_status', 'GTDBAssignmentStatus', 'AssignmentStatus'),
+        'classification_evidence_tier': _value(row, 'classification_evidence_tier', 'GTDBEvidenceTier', 'EvidenceTier'),
+        'classification_alignment_evidence_status': _value(row, 'classification_alignment_evidence_status', 'GTDBAlignmentEvidenceStatus', 'AlignmentEvidenceStatus'),
+        'classification_assignment_evidence_level': _value(row, 'classification_assignment_evidence_level', 'GTDBAssignmentEvidenceLevel', 'AssignmentEvidenceLevel'),
+        'classification_evidence_interpretation': _value(row, 'classification_evidence_interpretation', 'GTDBEvidenceInterpretation', 'EvidenceInterpretation'),
+        'classification_taxonomy_support_pct': _value(row, 'classification_taxonomy_support_pct', 'GTDBTaxonomySupportPct', 'TaxonomySupportPct'),
+        'classification_taxonomy_candidate_count': _value(row, 'classification_taxonomy_candidate_count', 'GTDBTaxonomyCandidateCount', 'TaxonomyCandidateCount'),
         'classification_query_coverage': _value(
             row, 'classification_query_coverage', 'GTDBQueryCoverage', 'QueryCoverage',
+        ),
+        'classification_target_coverage': _value(
+            row, 'classification_target_coverage', 'GTDBTargetCoverage', 'TargetCoverage',
+        ),
+        'classification_alignment_length': _value(
+            row, 'classification_alignment_length', 'GTDBAlignmentLength', 'AlignmentLength',
         ),
         'marker_source_type': _value(row, 'marker_source_type', 'MarkerSourceType', default=''),
         'marker_evidence_tier': _value(row, 'marker_evidence_tier', 'MarkerEvidenceTier', default=''),
@@ -259,52 +271,7 @@ def _tree_leaf(row: dict) -> str:
 
 
 def _evidence_quality(row: dict) -> str:
-    """Return selection evidence tier without conflating marker source and taxonomy.
-
-    Explicit marker provenance takes precedence over the legacy identity-based
-    heuristic. A genome-predicted marker is capped at MODERATE; an unreviewed
-    FAIL_QC/QUALITY_UNVERIFIED marker remains LOW. A documented APPROVE_FAIL_QC
-    review can admit an otherwise recoverable failed consensus as MODERATE while
-    preserving its original QC class in the reports.
-    """
-    source = str(row.get('marker_source_type') or '').strip().upper()
-    tier = str(row.get('marker_evidence_tier') or '').strip().upper()
-    qc_class = str(row.get('marker_qc_class') or '').strip().upper()
-    review = str(row.get('marker_manual_review_status') or '').strip().upper()
-    decision = str(row.get('marker_review_decision') or '').strip().upper()
-
-    if tier in {'HIGH', 'MODERATE', 'LOW'}:
-        if tier == 'LOW' or review == 'REJECTED':
-            return 'LOW'
-        if qc_class in {'FAIL_QC', 'QUALITY_UNVERIFIED'}:
-            if not (review == 'APPROVED' and decision in {'APPROVE_FAIL_QC', 'APPROVE_UNVERIFIED', 'APPROVE'}):
-                return 'LOW'
-            return 'MODERATE'
-        if source == 'GENOME_BARRNAP':
-            return 'MODERATE' if tier == 'HIGH' else tier
-        return tier
-
-    explicit = str(row.get('evidence_quality') or '').strip().upper()
-    if explicit in {'HIGH', 'MODERATE', 'LOW'}:
-        return explicit
-    flag_set = {f.strip() for f in str(row.get('placement_flags') or '').upper().split(';') if f.strip()}
-    identity = _float(row.get('classification_identity'))
-    confidence = _float(row.get('classification_confidence'))
-    coverage = _float(row.get('classification_query_coverage'))
-    taxonomy = str(row.get('taxonomy') or '').strip().lower()
-    if flag_set & SELECTION_BLOCKING_PLACEMENT_FLAGS:
-        return 'LOW'
-    if identity is not None and identity < 90.0:
-        return 'LOW'
-    if coverage is not None and coverage < 80.0:
-        return 'LOW'
-    if identity is None and taxonomy in {'', 'na', 'none'}:
-        return 'LOW'
-    if flag_set & {'LOW_CLASSIFICATION', 'LOW_CONFIDENCE', 'DISAGREEMENT', 'CONFLICT'}:
-        return 'MODERATE'
-    if (identity is not None and identity < 95.0) or (confidence is not None and confidence < 0.8) or (coverage is not None and coverage < 90.0):
-        return 'MODERATE'
-    return 'HIGH'
+    return _shared_evidence_quality(row)
 
 
 def _available_ids_by_species(db) -> Dict[str, List[str]]:
@@ -317,14 +284,50 @@ def _available_ids_by_species(db) -> Dict[str, List[str]]:
             "FROM sequences s LEFT JOIN taxonomy t ON s.id = t.id "
             "LEFT JOIN sequencing_metadata m ON s.id = m.id ORDER BY t.rowid"
         ).fetchall()
+        genome_records = conn.execute(
+            "SELECT g.sequence_id, g.gtdb_taxonomy FROM genome_records g "
+            "WHERE g.genome_qc_pass=1 ORDER BY g.genome_id"
+        ).fetchall()
+        genome_record_ids = {
+            str(row[0]) for row in conn.execute("SELECT DISTINCT sequence_id FROM genome_records")
+        }
     available = defaultdict(set)
     for sequence_id, dataset, taxonomy, already_sequenced in records:
         species = _species(taxonomy)
         dataset_role = roles.get(str(dataset or ''), {})
         is_baseline = dataset_role.get('role') == 'baseline' and dataset_role.get('genomes_available')
-        if species and (is_baseline or bool(already_sequenced)):
+        if species and is_baseline:
+            available[normalise_taxon_name(species)].add(str(sequence_id))
+        # Older records may mark an existing genome only in sequencing_metadata.
+        # Modern genome records contribute below only after passing genome QC.
+        if species and bool(already_sequenced) and str(sequence_id) not in genome_record_ids:
+            available[normalise_taxon_name(species)].add(str(sequence_id))
+    for sequence_id, genome_taxonomy in genome_records:
+        species = _species(genome_taxonomy)
+        if species:
             available[normalise_taxon_name(species)].add(str(sequence_id))
     return {key: sorted(ids) for key, ids in available.items()}
+
+
+def _genome_qc_status_by_id(db) -> dict[str, str]:
+    """Collapse assembly QC to isolate status without multiplying isolate coverage."""
+    if db is None:
+        return {}
+    with db.connect() as conn:
+        records = conn.execute(
+            "SELECT sequence_id, genome_qc_pass FROM genome_records ORDER BY sequence_id, genome_id"
+        ).fetchall()
+    values = defaultdict(list)
+    for sequence_id, qc_pass in records:
+        values[str(sequence_id)].append(qc_pass)
+    return {
+        sequence_id: (
+            'GENOME_QC_PASSED' if any(value == 1 for value in checks)
+            else 'GENOME_QC_FAILED' if checks and all(value == 0 for value in checks)
+            else 'GENOME_QC_UNKNOWN'
+        )
+        for sequence_id, checks in values.items()
+    }
 
 
 def _genome_feedback_by_species(db) -> dict:
@@ -519,7 +522,13 @@ def build_quarterly_review(
     rows = [row for row in rows if row['id']]
 
     metadata = db.get_sequencing_metadata_for_ids([row['id'] for row in rows]) if db else {}
+    genome_qc_status = _genome_qc_status_by_id(db)
     for row in rows:
+        row['genome_qc_status'] = genome_qc_status.get(row['id'], 'NOT_RECORDED')
+        row['genome_available'] = str(row['id'] in genome_qc_status or (
+            row['id'] in metadata and metadata[row['id']]['selected_for_wgs']
+        ))
+        row['genome_resequencing_eligible'] = str(row['genome_qc_status'] == 'GENOME_QC_FAILED')
         if row['id'] in metadata:
             row['selected_for_genome_sequencing'] = str(bool(metadata[row['id']]['selected_for_sequencing']))
             row['already_sequenced'] = str(bool(metadata[row['id']]['selected_for_wgs']))
@@ -543,12 +552,24 @@ def build_quarterly_review(
     for key, members in grouped.items():
         species = _species(members[0].get('taxonomy'))
         available_anchors = list(available_species.get(normalise_taxon_name(species), [])) if species else []
-        available_anchors.extend(row['id'] for row in members if _true(row.get('already_sequenced')))
+        available_anchors.extend(
+            row['id'] for row in members
+            if _true(row.get('already_sequenced'))
+            and row.get('genome_qc_status') not in {'GENOME_QC_FAILED', 'GENOME_QC_UNKNOWN'}
+        )
         available_anchors_by_group[key] = sorted(set(available_anchors))
         committed_anchors = list(available_anchors)
-        committed_anchors.extend(row['id'] for row in members if _true(row.get('selected_for_genome_sequencing')))
+        committed_anchors.extend(
+            row['id'] for row in members
+            if _true(row.get('selected_for_genome_sequencing'))
+            and row.get('genome_qc_status') != 'GENOME_QC_FAILED'
+        )
         anchors_by_group[key] = sorted(set(committed_anchors))
         reported = max((_int(row.get('genome_committed_count_same_species')) for row in members), default=0)
+        failed_genomes = {
+            row['id'] for row in members if row.get('genome_qc_status') == 'GENOME_QC_FAILED'
+        }
+        reported = max(0, reported - len(failed_genomes))
         counts_by_group[key] = max(reported, len(anchors_by_group[key]))
         hungate_count = max((_int(row.get('hungate_genome_count_same_species')) for row in members), default=0)
         secondary_count = max((_int(row.get('secondary_baseline_genome_count_same_species')) for row in members), default=0)
@@ -593,6 +614,9 @@ def build_quarterly_review(
                 'marker_qc_class': row.get('marker_qc_class', 'NA'),
                 'marker_manual_review_status': row.get('marker_manual_review_status', 'NA'),
                 'marker_review_decision': row.get('marker_review_decision', 'NA'),
+                'genome_available': row.get('genome_available', 'False'),
+                'genome_qc_status': row.get('genome_qc_status', 'NOT_RECORDED'),
+                'genome_resequencing_eligible': row.get('genome_resequencing_eligible', 'False'),
                 'available_genomes_before': counts_by_group[key],
                 'hungate_baseline_genomes_before': hungate_counts_by_group[key],
                 'secondary_baseline_genomes_before': secondary_counts_by_group[key],
@@ -639,7 +663,8 @@ def build_quarterly_review(
                 'backup_for': 'NA',
                 'marginal_patristic_distance': 'NA',
             }
-            if _true(row.get('already_sequenced')):
+            failed_existing_genome = row.get('genome_qc_status') == 'GENOME_QC_FAILED'
+            if _true(row.get('already_sequenced')) and not failed_existing_genome:
                 base.update({
                     'role': 'ALREADY_SEQUENCED', 'priority_tier': 'ALREADY_SEQUENCED',
                     'baseline_redundancy_status': 'NOT_APPLICABLE_COMMITTED',
@@ -647,7 +672,7 @@ def build_quarterly_review(
                     'recommendation_reason': 'genome already available; excluded from new recommendations',
                 })
                 recommendations[row['id']] = base
-            elif _true(row.get('selected_for_genome_sequencing')):
+            elif _true(row.get('selected_for_genome_sequencing')) and not failed_existing_genome:
                 base.update({
                     'role': 'ALREADY_SELECTED', 'priority_tier': 'COMMITTED_PENDING',
                     'baseline_redundancy_status': 'NOT_APPLICABLE_COMMITTED',
@@ -822,7 +847,8 @@ QUARTERLY_REVIEW_FIELDS = [
     'round_id', 'sequence_id', 'partner_id', 'role', 'round_rank', 'backup_rank', 'backup_for',
     'priority_tier', 'assessment_species', 'evidence_quality', 'marker_source_type',
     'marker_evidence_tier', 'marker_qc_class', 'marker_manual_review_status',
-    'marker_review_decision', 'available_genomes_before',
+    'marker_review_decision', 'genome_available', 'genome_qc_status',
+    'genome_resequencing_eligible', 'available_genomes_before',
     'hungate_baseline_genomes_before', 'secondary_baseline_genomes_before',
     'cultured_project_baseline_genomes_before', 'selection_group_type',
     'qc_passed_genome_ids', 'available_ani_clusters',

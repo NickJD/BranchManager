@@ -1,0 +1,10 @@
+PangenomeRank	PangenomeTaxon	TaxonomyProvenance	CandidateIDs	CommittedGenomeIDs	CandidateCount	CommittedGenomeCount	PangenomeTarget	PangenomeGap	PangenomeEligible	PangenomeEligibilityReason
+GENUS	Winkia	GTDB	DEMO_001;DEMO_005;DEMO_009;DEMO_013;DEMO_017;DEMO_021	DEMO_001;DEMO_005	6	2	8	6	Yes	GTDB lineage and reference genome context available.
+GENUS	Prevotella	GTDB	DEMO_002;DEMO_006;DEMO_010;DEMO_014;DEMO_018;DEMO_022	DEMO_002;DEMO_006	6	2	8	6	Yes	GTDB lineage and reference genome context available.
+GENUS	Butyrivibrio	GTDB	DEMO_003;DEMO_007;DEMO_011;DEMO_015;DEMO_019;DEMO_023	DEMO_003;DEMO_GENOME_ONLY_007	6	2	8	6	Yes	GTDB lineage and reference genome context available.
+SPECIES	Ruminococcus sp demo 1	GTDB	DEMO_004	DEMO_004	1	1	8	7	Yes	GTDB lineage and reference genome context available.
+SPECIES	Ruminococcus sp demo 2	GTDB	DEMO_008		1	0	8	8	Yes	GTDB lineage and reference genome context available.
+SPECIES	Ruminococcus sp demo 3	GTDB	DEMO_012		1	0	8	8	Yes	GTDB lineage and reference genome context available.
+SPECIES	Ruminococcus sp demo 4	GTDB	DEMO_016		1	0	8	8	Yes	GTDB lineage and reference genome context available.
+SPECIES	Ruminococcus sp demo 5	GTDB	DEMO_020		1	0	8	8	Yes	GTDB lineage and reference genome context available.
+SPECIES	Ruminococcus sp demo 6	GTDB	DEMO_024		1	0	8	8	Yes	GTDB lineage and reference genome context available.

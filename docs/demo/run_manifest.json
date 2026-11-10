@@ -1,0 +1,9 @@
+{
+  "workflow": "performance_review",
+  "status": "DEMONSTRATION DATA",
+  "started_at": "2026-11-10T20:19:33Z",
+  "completed_at": "2026-11-10T20:19:33Z",
+  "branchmanager_version": "1.0.0",
+  "git_revision": "unavailable",
+  "notes": "All records and values are synthetic. The dashboard was regenerated from the committed demonstration fixtures using the current BranchManager reporting function."
+}

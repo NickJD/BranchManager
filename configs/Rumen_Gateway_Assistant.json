@@ -1,0 +1,181 @@
+{
+  "schema_version": 1,
+  "project_directory": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/November_Release",
+  "project": {
+    "name": "Rumen Gateway",
+    "collection_name": "Hungate Collection and partner rumen isolate collection",
+    "organism_scope": [
+      "Bacteria"
+    ],
+    "marker_gene": "16S rRNA",
+    "taxonomy_authority": "GTDB",
+    "partner_field": "partner_id",
+    "selection_unit": "genome",
+    "selection_budget": 100,
+    "profile_notes": "Project-wide profile for the five partner collections. The two cultured baselines (Hungate and Secondary) are already registered in project.sqlite; do not reload them as part of the partner cohort Assistant run."
+  },
+  "data": {
+    "database": "project.sqlite",
+    "partner_metadata": "Partner_Isolate_Catalogue_November.csv",
+    "primary_taxonomy_fasta": "../Taxa_Databases/GTDB/gtdb_r232_bac_arch_ssu_reps.fna.gz",
+    "secondary_taxonomy_fasta": "../Taxa_Databases/GG2/2024.09.backbone.full-length.fna.gz",
+    "secondary_taxonomy_table": "../Taxa_Databases/GG2/2024.09.taxonomy.id.tsv.gz",
+    "baseline_fasta": "../Taxa_Databases/Hungate/410_Hungate_Sequences.fasta",
+    "secondary_baseline_fasta": "../Taxa_Databases/Rumen_Isolates/secondard_16s.fasta",
+    "secondary_baseline_taxonomy": "../Taxa_Databases/Rumen_Isolates/pipeline_taxonomy.tsv",
+    "most_wanted_list": "../MWL.csv",
+    "marker_cohort_manifest_template": "Partner_Marker_Cohort_Manifest.csv",
+    "genome_only_results_template": "AAFC_IAS_CAAS_Genome_Results.tsv",
+    "marker_cohort_metadata": "Partner_Isolate_Catalogue_November.csv"
+  },
+  "defaults": {
+    "assistant": {
+      "db": "project.sqlite",
+      "partner_metadata": "Partner_Isolate_Catalogue_November.csv",
+      "ref": "../Taxa_Databases/GTDB/gtdb_r232_bac_arch_ssu_reps.fna.gz",
+      "ref_name": "GTDB_r232",
+      "alt_databases": [
+        {
+          "name": "GG2_2024_09",
+          "ref": "../Taxa_Databases/GG2/2024.09.backbone.full-length.fna.gz",
+          "taxa": "../Taxa_Databases/GG2/2024.09.taxonomy.id.tsv.gz"
+        },
+        {
+          "name": "NCBI_16S_2026_08",
+          "ref": "../Taxa_Databases/NCBI/ncbi_16s_formatted.fasta",
+          "taxa": null
+        },
+        {
+          "name": "SILVA_144",
+          "ref": "../Taxa_Databases/SILVA/SILVA_144_SSURef_NR99_tax_silva_trunc.fasta.gz",
+          "taxa": null
+        }
+      ],
+      "mwl": "../MWL.csv",
+      "dataset": "RumenGateway_Marker_Cohort",
+      "out": "Assistant_Marker_Cohort",
+      "sequence_domain": "bacteria",
+      "threads": 10,
+      "tree_method": "fasttree",
+      "pangenome_target": 9,
+      "candidate_set_size": 9,
+      "baseline_redundancy_identity": 99.8,
+      "baseline_redundancy_min_query_coverage": 95.0,
+      "baseline_extension_min_identity": 98.65,
+      "baseline_extension_min_query_coverage": 95.0
+    },
+    "filing-cabinet": {
+      "db": "project.sqlite",
+      "ref": "../Taxa_Databases/GTDB/gtdb_r232_bac_arch_ssu_reps.fna.gz",
+      "ref_name": "GTDB_r232",
+      "sequence_domain": "bacteria",
+      "threads": 10,
+      "tree_method": "fasttree"
+    },
+    "performance-review": {
+      "db": "project.sqlite",
+      "partner_metadata": "Partner_Isolate_Catalogue_November.csv",
+      "ref": "../Taxa_Databases/GTDB/gtdb_r232_bac_arch_ssu_reps.fna.gz",
+      "ref_name": "GTDB_r232",
+      "alt_ref": [
+        "../Taxa_Databases/GG2/2024.09.backbone.full-length.fna.gz",
+        "../Taxa_Databases/NCBI/ncbi_16s_formatted.fasta",
+        "../Taxa_Databases/SILVA/SILVA_144_SSURef_NR99_tax_silva_trunc.fasta.gz"
+      ],
+      "alt_taxa": [
+        "../Taxa_Databases/GG2/2024.09.taxonomy.id.tsv.gz",
+        null,
+        null
+      ],
+      "alt_ref_name": [
+        "GG2_2024_09",
+        "NCBI_16S_2026_08",
+        "SILVA_144"
+      ],
+      "mwl": "../MWL.csv",
+      "sequence_domain": "bacteria",
+      "pangenome_target": 9,
+      "candidate_set_size": 9,
+      "baseline_redundancy_identity": 99.8,
+      "baseline_redundancy_min_query_coverage": 95.0,
+      "baseline_extension_min_identity": 98.65,
+      "baseline_extension_min_query_coverage": 95.0,
+      "threads": 10,
+      "tree_method": "fasttree"
+    },
+    "quarterly-review": {
+      "db": "project.sqlite",
+      "genome_budget": 100,
+      "pangenome_target": 9,
+      "baseline_redundancy_identity": 99.8,
+      "baseline_redundancy_min_query_coverage": 95.0,
+      "baseline_extension_min_identity": 98.65,
+      "baseline_extension_min_query_coverage": 95.0
+    }
+  },
+  "partner_datasets": [
+    {
+      "partner_id": "QUB",
+      "dataset": "QUB_01",
+      "intake_class": "marker_evidence",
+      "catalogue_isolates": 686,
+      "marker_bearing_isolates": 574,
+      "marker_sequence_only": 476,
+      "marker_and_maldi": 98,
+      "maldi_only": 112,
+      "workflow": "assistant cohort manifest",
+      "input_type_from_current_QUB_profile": "sanger",
+      "note": "Confirm that the Sanger input supplied to the cohort represents the intended QUB marker set; add a partner_workbook or MALDI sidecar if the 112 MALDI-only records need to be registered in the same intake."
+    },
+    {
+      "partner_id": "UoG",
+      "dataset": "UoG_01",
+      "intake_class": "marker_evidence",
+      "catalogue_isolates": 75,
+      "marker_bearing_isolates": 75,
+      "workflow": "assistant cohort manifest",
+      "input_type": "set_in_manifest_from_actual_input_modality",
+      "note": "Use sanger for AB1/sample-map inputs or partner_fasta for an already assembled marker FASTA; supply marker QC provenance where available."
+    },
+    {
+      "partner_id": "BSI",
+      "dataset": "BSI_01",
+      "intake_class": "marker_evidence",
+      "catalogue_isolates": 115,
+      "marker_bearing_isolates": 115,
+      "workflow": "assistant cohort manifest",
+      "input_type": "set_in_manifest_from_actual_input_modality",
+      "note": "Use sanger for AB1/sample-map inputs or partner_fasta for an already assembled marker FASTA; supply marker QC provenance where available."
+    },
+    {
+      "partner_id": "AAFC",
+      "dataset": "AAFC_01",
+      "intake_class": "genome_only",
+      "catalogue_isolates": 34,
+      "already_sequenced": true,
+      "selected_for_genome_sequencing": true,
+      "addition_method": null,
+      "workflow": "register markerless candidate records, then records-update with GTDB-Tk genome evidence",
+      "input_type": "not_in_current_assistant_cohort_manifest"
+    },
+    {
+      "partner_id": "IAS_CAAS",
+      "dataset": "IAS_CAAS_01",
+      "intake_class": "genome_only",
+      "catalogue_isolates": 878,
+      "already_sequenced": true,
+      "selected_for_genome_sequencing": true,
+      "addition_method": null,
+      "workflow": "register markerless candidate records, then records-update with GTDB-Tk genome evidence",
+      "input_type": "not_in_current_assistant_cohort_manifest",
+      "note": "Keep the full stable ID (e.g. IAS_CAAS_01); current partner workbook reader previously needed a small regex correction to accept underscores in the prefix."
+    }
+  ],
+  "workflow_notes": [
+    "The Assistant defaults use the complete five-partner catalogue remains Partner_Isolate_Catalogue_November.csv and is used for later cumulative reviews.",
+    "Current assistant cohort input types are sanger, partner_fasta, pacbio_hifi, genome_16s, and maldi_only. There is no GTDB-Tk-only genome input type.",
+    "Therefore QUB, UoG, and BSI are assessed together through the marker cohort manifest. AAFC and IAS_CAAS are registered/imported separately afterwards as genome-only partner records.",
+    "Do not set baseline_fasta in the Assistant defaults: Hungate and Secondary are already present in project.sqlite.",
+    "Do not use add-external-genomes for AAFC or IAS_CAAS if they are to remain partner candidate records and may receive marker evidence later."
+  ]
+}

@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import csv
-import gzip
+import copy
+import itertools
 import io
+import json
 import logging
 import math
 import re
 import struct
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
 from branchmanager.utils.fasta import read_fasta, reverse_complement, write_fasta
+from branchmanager.utils.io import open_text, write_tsv
+from branchmanager.utils.text import normalise_header
 
 
 logger = logging.getLogger(__name__)
@@ -42,7 +47,7 @@ class PaperTrailQCPolicy:
     min_overlap_identity: float = 0.98
 
 
-PAPER_TRAIL_QC_POLICY_VERSION = '2.3'
+PAPER_TRAIL_QC_POLICY_VERSION = '2.6_tsv_schema_alignment_and_cohort_inspection'
 DEFAULT_QC_POLICY = PaperTrailQCPolicy()
 
 
@@ -57,6 +62,19 @@ DEFAULT_PRIMERS = (
     # 28S / LSU rRNA
     'LR0R', 'LR3', 'LR5', 'LR6', 'NL1', 'NL4',
 )
+
+# Explicit orientation is essential for primer names that do not end in F/R
+# (notably ITS, 18S and LSU primer conventions).
+DEFAULT_PRIMER_DIRECTIONS = {
+    **{name: ('reverse' if name.upper().endswith('R') else 'forward') for name in DEFAULT_PRIMERS},
+    'ITS1': 'forward', 'ITS1F': 'forward', 'ITS2': 'reverse',
+    'ITS3': 'forward', 'ITS4': 'reverse', 'ITS4B': 'reverse', 'ITS5': 'forward',
+    'NS1': 'forward', 'NS2': 'reverse', 'NS3': 'forward', 'NS4': 'reverse',
+    'NS5': 'forward', 'NS6': 'reverse', 'NS7': 'forward', 'NS8': 'reverse',
+    '528F': 'forward', '1391F': 'forward', 'EukBr': 'reverse',
+    'LR0R': 'reverse', 'LR3': 'reverse', 'LR5': 'reverse', 'LR6': 'reverse',
+    'NL1': 'forward', 'NL4': 'reverse',
+}
 
 DEFAULT_MAX_REPORT_IMAGE_HEIGHT = 2400
 MIN_REPORT_IMAGE_HEIGHT = 600
@@ -195,13 +213,10 @@ class SangerRead:
     taxonomy_screen: str = ''
 
 
-def _open_text(path: str | Path):
-    if str(path).endswith('.gz'):
-        return gzip.open(path, 'rt', newline='')
-    return open(path, 'rt', newline='')
 
 
 def _read_abif_entries(path: str | Path) -> dict[tuple[str, int], bytes]:
+    import gzip
     if str(path).lower().endswith('.gz'):
         with gzip.open(path, 'rb') as handle:
             data = handle.read()
@@ -419,7 +434,7 @@ def read_ab1(path: str | Path) -> tuple[str, list[int]]:
 
 def read_fastq(path: str | Path) -> list[tuple[str, str, list[int]]]:
     records = []
-    with _open_text(path) as handle:
+    with open_text(path) as handle:
         while True:
             header = handle.readline()
             if not header:
@@ -544,7 +559,7 @@ def infer_read_info(path_or_id: str, primers: Iterable[str] = DEFAULT_PRIMERS) -
             if re.search(rf'(^|[_\-. ]){re.escape(item)}($|[_\-. ])', stem, flags=re.IGNORECASE):
                 primer = item
                 break
-    direction = 'reverse' if primer.upper().endswith('R') else 'forward'
+    direction = DEFAULT_PRIMER_DIRECTIONS.get(primer, 'reverse' if primer.upper().endswith('R') else 'forward')
     if primer_index is not None:
         seq_tokens = tokens[:primer_index] + tokens[primer_index + 1:]
         sequence_id = '_'.join(seq_tokens) or stem
@@ -556,16 +571,12 @@ def infer_read_info(path_or_id: str, primers: Iterable[str] = DEFAULT_PRIMERS) -
     return sequence_id, primer or 'unknown', direction
 
 
-def _normalise_column(name: object) -> str:
-    return str(name or '').strip().lstrip('\ufeff').lower().replace('-', '_').replace(' ', '_')
-
-
 def _normalise_row(row: dict) -> dict[str, str]:
     norm = {}
     for key, value in row.items():
         if key is None:
             continue
-        norm[_normalise_column(key)] = '' if value is None else str(value).strip()
+        norm[normalise_header(key)] = '' if value is None else str(value).strip()
     return norm
 
 
@@ -648,8 +659,8 @@ def _is_supported_read_file(path: str | Path) -> bool:
 
 
 def _primer_from_column(column: str, primers: Iterable[str]) -> str:
-    normalised = _normalise_column(column)
-    primer_lookup = {_normalise_column(p): p for p in primers}
+    normalised = normalise_header(column)
+    primer_lookup = {normalise_header(p): p for p in primers}
     for key, primer in sorted(primer_lookup.items(), key=lambda item: -len(item[0])):
         if re.search(rf'(^|_){re.escape(key)}($|_)', normalised):
             return primer
@@ -710,15 +721,19 @@ def _load_sample_map(
         return {}, []
     metadata_path = Path(path).expanduser()
     base_dir = metadata_path.parent
-    with _open_text(path) as handle:
+    with open_text(path) as handle:
         sample = handle.read(4096)
         handle.seek(0)
-        delimiter = '\t' if str(path).endswith(('.tsv', '.tsv.gz', '.txt', '.txt.gz')) else ','
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=',\t')
-            delimiter = dialect.delimiter
-        except Exception:
-            pass
+        path_text = str(path).lower()
+        if path_text.endswith(('.tsv', '.tsv.gz', '.txt', '.txt.gz')):
+            delimiter = '\t'
+        elif path_text.endswith(('.csv', '.csv.gz')):
+            delimiter = ','
+        else:
+            try:
+                delimiter = csv.Sniffer().sniff(sample, delimiters=',\t').delimiter
+            except csv.Error:
+                delimiter = '\t'
         rows = [_normalise_row(row) for row in csv.DictReader(handle, delimiter=delimiter)]
 
     meta = {}
@@ -970,6 +985,37 @@ def find_best_overlap(
     }
 
 
+def diagnose_overlap(seq_a: str, seq_b: str, *, min_overlap: int, min_identity: float) -> dict[str, object]:
+    """Return overlap evidence even when a read pair fails assembly thresholds."""
+    columns = _pairwise_alignment_columns(seq_a, [30] * len(seq_a), seq_b, [30] * len(seq_b))
+    paired = [i for i, (a, _qa, b, _qb) in enumerate(columns) if a != '-' and b != '-']
+    if not paired:
+        return {'overlap_length': 0, 'compared_bases': 0, 'matches': 0,
+                'mismatches': 0, 'indel_columns': 0, 'identity': 0.0,
+                'accepted': False, 'reason': 'NO_ALIGNED_OVERLAP'}
+    first, last = paired[0], paired[-1]
+    compared = matches = indels = 0
+    for i in range(first, last + 1):
+        a, _qa, b, _qb = columns[i]
+        if a == '-' or b == '-':
+            indels += 1
+        elif a != 'N' and b != 'N':
+            compared += 1
+            matches += int(a == b)
+    mismatches = compared - matches
+    denominator = compared + indels
+    identity = matches / denominator if denominator else 0.0
+    reasons = []
+    if compared < int(min_overlap):
+        reasons.append('OVERLAP_BELOW_MINIMUM')
+    if identity < float(min_identity):
+        reasons.append('IDENTITY_BELOW_MINIMUM')
+    return {'overlap_length': last - first + 1, 'compared_bases': compared,
+            'matches': matches, 'mismatches': mismatches, 'indel_columns': indels,
+            'identity': identity, 'accepted': not reasons,
+            'reason': 'PASS' if not reasons else ';'.join(reasons)}
+
+
 def merge_pair(
     seq_a: str,
     qual_a: list[int],
@@ -1069,7 +1115,14 @@ def assemble_read_group(
     min_overlap: int = DEFAULT_QC_POLICY.min_overlap,
     min_identity: float = DEFAULT_QC_POLICY.min_overlap_identity,
     quality_difference: int = DEFAULT_QC_POLICY.quality_difference,
+    fallback_read_id: str | None = None,
 ):
+    """Assemble usable reads; if no overlap exists, retain one selected read.
+
+    ``fallback_read_id`` is a reviewer selection and is applied only when a
+    consensus cannot be formed. Otherwise the best usable pair is assembled.
+    Automatic fallback selection uses the shared longest-usable-read ranking.
+    """
     usable = [
         read for read in reads
         if read.status == 'kept' and read.oriented_sequence
@@ -1086,23 +1139,43 @@ def assemble_read_group(
             'method': 'failed_no_reads',
             'qualities': [],
             'used_read_ids': [],
+            'selected_read_id': '',
+            'selection_source': 'NO_USABLE_READ',
+            'fallback_reason': 'no_reads_passed_read_qc',
         }
-    usable.sort(key=lambda r: (r.direction != 'forward', -len(r.oriented_sequence), r.read_id))
+
+    usable = sorted(usable, key=lambda read: _read_selection_key(read), reverse=True)
+    usable_by_id = {read.read_id: read for read in usable}
+
     if len(usable) == 1:
         only = usable[0]
-        consensus = only.oriented_sequence
-        qualities = only.oriented_qualities or [0] * len(consensus)
-        return consensus, {
+        selection_warning = ''
+        selection_source = 'ONLY_USABLE_READ'
+        if fallback_read_id and fallback_read_id != only.read_id:
+            selection_warning = f'manual_fallback_read_no_longer_passes_qc:{fallback_read_id}'
+            logger.warning(
+                'Ignoring saved fallback read %s for %s because it no longer passes individual QC; using %s.',
+                fallback_read_id, only.sequence_id, only.read_id,
+            )
+        elif fallback_read_id:
+            selection_source = 'MANUAL'
+        qualities = only.oriented_qualities or [0] * len(only.oriented_sequence)
+        return only.oriented_sequence, {
             'status': 'single_read', 'read_count': len(reads), 'used_reads': 1,
             'overlap_identity': 'NA', 'overlap_length': 'NA', 'conflicts': 0,
-            'ambiguous_conflicts': 0, 'unmerged_reads': '',
+            'ambiguous_conflicts': 0,
+            'unmerged_reads': ';'.join(read.read_id for read in reads if read.read_id != only.read_id),
             'mean_quality': round(_mean_quality(qualities), 2),
             'method': 'single_read', 'qualities': qualities,
             'used_read_ids': [only.read_id],
+            'selected_read_id': only.read_id,
+            'selection_source': selection_source,
+            'fallback_reason': 'only_one_read_passed_read_qc',
+            'selection_warning': selection_warning,
         }
 
-    # Choose the strongest pair first. This avoids making the consensus depend
-    # on filename or primer order when three or more reads are supplied.
+    # Evaluate all usable read pairs; do not let forward/reverse orientation or
+    # input order decide which sequence is retained when no pair overlaps.
     pair_candidates = []
     for left_idx in range(len(usable)):
         for right_idx in range(left_idx + 1, len(usable)):
@@ -1126,16 +1199,41 @@ def assemble_read_group(
                 left.read_id, right.read_id,
             )
             pair_candidates.append((key, left_idx, right_idx, got))
+
     if not pair_candidates:
-        seed = usable[0]
-        return seed.oriented_sequence, {
-            'status': 'partial_no_overlap', 'read_count': len(reads), 'used_reads': 1,
-            'overlap_identity': 'NA', 'overlap_length': 'NA', 'conflicts': 0,
+        selection_warning = ''
+        fallback = usable_by_id.get(str(fallback_read_id)) if fallback_read_id else None
+        if fallback is not None:
+            selection_source = 'MANUAL'
+        else:
+            fallback = usable[0]
+            selection_source = 'AUTO_LONGEST_USABLE_READ'
+            if fallback_read_id:
+                selection_warning = f'manual_fallback_read_no_longer_passes_qc:{fallback_read_id}'
+                logger.warning(
+                    'Ignoring saved fallback read %s for %s because it no longer passes individual QC; using %s.',
+                    fallback_read_id, reads[0].sequence_id if reads else 'unknown', fallback.read_id,
+                )
+        fallback_sequence = fallback.oriented_sequence
+        fallback_qualities = fallback.oriented_qualities or [0] * len(fallback_sequence)
+        unmerged = sorted(read.read_id for read in usable if read.read_id != fallback.read_id)
+        return fallback_sequence, {
+            'status': 'partial_no_overlap',
+            'read_count': len(reads),
+            'used_reads': 1,
+            'overlap_identity': 'NA',
+            'overlap_length': 'NA',
+            'conflicts': 0,
             'ambiguous_conflicts': 0,
-            'unmerged_reads': ';'.join(read.read_id for read in usable[1:]),
-            'mean_quality': round(_mean_quality(seed.oriented_qualities or []), 2),
-            'method': 'unmerged', 'qualities': seed.oriented_qualities or [],
-            'used_read_ids': [seed.read_id],
+            'unmerged_reads': ';'.join(unmerged),
+            'mean_quality': round(_mean_quality(fallback_qualities), 2),
+            'method': 'manual_read_no_overlap_fallback' if selection_source == 'MANUAL' else 'longest_read_no_overlap_fallback',
+            'qualities': fallback_qualities,
+            'used_read_ids': [fallback.read_id],
+            'selected_read_id': fallback.read_id,
+            'selection_source': selection_source,
+            'fallback_reason': 'no_qualifying_overlap',
+            'selection_warning': selection_warning,
         }
 
     _key, left_idx, right_idx, initial = max(pair_candidates, key=lambda item: item[0])
@@ -1173,17 +1271,13 @@ def assemble_read_group(
         remaining.remove(idx)
     unmerged = [usable[idx].read_id for idx in sorted(remaining)]
     used = len(used_indexes)
-    if merge_stats:
-        status = 'assembled'
-        overlap_identity = min(stat['identity'] for stat in merge_stats)
-        overlap_length = min(stat['overlap'] for stat in merge_stats)
-        conflicts = sum(stat['conflicts'] for stat in merge_stats)
-        ambiguous = sum(stat['ambiguous_conflicts'] for stat in merge_stats)
-        method = ';'.join(sorted({str(stat.get('method', 'unknown')) for stat in merge_stats}))
-    else:
-        raise RuntimeError('Internal assembly error: no merge statistics after selecting a seed pair')
+    overlap_identity = min(stat['identity'] for stat in merge_stats)
+    overlap_length = min(stat['overlap'] for stat in merge_stats)
+    conflicts = sum(stat['conflicts'] for stat in merge_stats)
+    ambiguous = sum(stat['ambiguous_conflicts'] for stat in merge_stats)
+    method = ';'.join(sorted({str(stat.get('method', 'unknown')) for stat in merge_stats}))
     return consensus, {
-        'status': status,
+        'status': 'assembled',
         'read_count': len(reads),
         'used_reads': used,
         'overlap_identity': overlap_identity,
@@ -1195,6 +1289,9 @@ def assemble_read_group(
         'method': method,
         'qualities': qualities,
         'used_read_ids': [usable[idx].read_id for idx in sorted(used_indexes)],
+        'selected_read_id': '',
+        'selection_source': 'CONSENSUS_ASSEMBLY',
+        'fallback_reason': '',
     }
 
 
@@ -1217,50 +1314,88 @@ def _resolve_group_processing_mode(
     return mode, warning
 
 
-def _read_quality_key(read: SangerRead) -> tuple[float, float, int, int, str]:
+def _read_selection_key(read: SangerRead) -> tuple[int, float, float, int, str]:
+    """Shared deterministic ranking: length first, then sequence quality.
+
+    Only reads that passed per-read QC are candidates in automatic selection.
+    Mean Phred, mean error probability and N content resolve length ties.
+    """
     qualities = read.oriented_qualities or read.trimmed_qualities or []
     sequence = read.oriented_sequence or read.trimmed_sequence
-    mean_q = _mean_quality(qualities)
-    mean_error = _mean_error_probability(qualities)
-    n_count = sequence.upper().count('N')
-    return (mean_q, -mean_error, len(sequence), -n_count, read.read_id)
+    return (
+        len(sequence),
+        _mean_quality(qualities),
+        -_mean_error_probability(qualities),
+        -sequence.upper().count('N'),
+        str(read.read_id),
+    )
 
 
-def select_best_read_group(reads: list[SangerRead]) -> tuple[str, dict[str, object]]:
+def _read_quality_key(read: SangerRead) -> tuple[int, float, float, int, str]:
+    """Backward-compatible alias for the shared read-selection ranking."""
+    return _read_selection_key(read)
+
+
+def _fallback_read_options(reads: Iterable[SangerRead]) -> list[dict[str, object]]:
+    """Return the per-read QC-passing candidates available for manual fallback."""
+    eligible = [read for read in reads if read.status == 'kept' and read.oriented_sequence]
+    eligible.sort(key=_read_selection_key, reverse=True)
+    options = []
+    for read in eligible:
+        sequence = read.oriented_sequence
+        qualities = read.oriented_qualities or []
+        options.append({
+            'read_id': str(read.read_id),
+            'primer': str(read.primer or ''),
+            'direction': str(read.direction or ''),
+            'length': len(sequence),
+            'mean_quality': round(_mean_quality(qualities), 2),
+            'expected_errors': round(_expected_errors(qualities, sequence), 4),
+            'n_percent': round(_n_percent(sequence), 3),
+            'qc_class': str(read.qc_class or ''),
+        })
+    return options
+
+
+def select_best_read_group(
+    reads: list[SangerRead],
+    *,
+    selected_read_id: str | None = None,
+) -> tuple[str, dict[str, object]]:
     kept = [read for read in reads if read.status == 'kept' and read.oriented_sequence]
     if not kept:
         return '', {
-            'status': 'failed_no_reads',
-            'read_count': len(reads),
-            'used_reads': 0,
-            'overlap_identity': 'NA',
-            'overlap_length': 'NA',
-            'conflicts': 'NA',
-            'ambiguous_conflicts': 'NA',
-            'unmerged_reads': ';'.join(read.read_id for read in reads),
-            'mean_quality': 0.0,
-            'selected_read_id': '',
-            'method': 'best_read',
-            'qualities': [],
-            'used_read_ids': [],
+            'status': 'failed_no_reads', 'read_count': len(reads), 'used_reads': 0,
+            'overlap_identity': 'NA', 'overlap_length': 'NA', 'conflicts': 'NA',
+            'ambiguous_conflicts': 'NA', 'unmerged_reads': ';'.join(read.read_id for read in reads),
+            'mean_quality': 0.0, 'selected_read_id': '', 'selection_source': 'NO_USABLE_READ',
+            'fallback_reason': 'no_reads_passed_read_qc', 'method': 'best_read',
+            'qualities': [], 'used_read_ids': [],
         }
-    best = max(kept, key=_read_quality_key)
+    by_id = {read.read_id: read for read in kept}
+    selection_warning = ''
+    best = by_id.get(str(selected_read_id)) if selected_read_id else None
+    if best is not None:
+        source = 'MANUAL'
+    else:
+        best = max(kept, key=_read_selection_key)
+        source = 'AUTO_LONGEST_USABLE_READ'
+        if selected_read_id:
+            selection_warning = f'manual_read_no_longer_passes_qc:{selected_read_id}'
+            logger.warning(
+                'Ignoring saved read selection %s for %s because it no longer passes individual QC; using %s.',
+                selected_read_id, reads[0].sequence_id if reads else 'unknown', best.read_id,
+            )
     qualities = best.oriented_qualities or []
     unselected = [read.read_id for read in kept if read.read_id != best.read_id]
     return best.oriented_sequence, {
-        'status': 'best_read',
-        'read_count': len(reads),
-        'used_reads': 1,
-        'overlap_identity': 'NA',
-        'overlap_length': 'NA',
-        'conflicts': 'NA',
-        'ambiguous_conflicts': 'NA',
-        'unmerged_reads': ';'.join(unselected),
+        'status': 'best_read', 'read_count': len(reads), 'used_reads': 1,
+        'overlap_identity': 'NA', 'overlap_length': 'NA', 'conflicts': 'NA',
+        'ambiguous_conflicts': 'NA', 'unmerged_reads': ';'.join(unselected),
         'mean_quality': round(_mean_quality(qualities), 2),
-        'selected_read_id': best.read_id,
-        'method': 'best_read',
-        'qualities': qualities,
-        'used_read_ids': [best.read_id],
+        'selected_read_id': best.read_id, 'selection_source': source,
+        'fallback_reason': 'single_best_read_mode', 'selection_warning': selection_warning, 'method': 'best_read',
+        'qualities': qualities, 'used_read_ids': [best.read_id],
     }
 
 
@@ -1289,9 +1424,15 @@ def _classify_read_qc(
     if read.quality_source == 'fasta_quality_unverified':
         warn_reasons.append('quality_scores_unavailable_fasta_not_assumed')
     elif not quality_verified and not allow_missing_quality:
-        fail_reasons.append(f'quality_scores_missing_{read.quality_source}')
+        if read.quality_source == 'ab1_zero_filled_pcon':
+            fail_reasons.append('quality_scores_zero_filled_pcon_not_measured_quality')
+        else:
+            fail_reasons.append(f'quality_scores_missing_{read.quality_source}')
     elif not quality_verified:
-        warn_reasons.append(f'quality_scores_missing_allowed_{read.quality_source}')
+        if read.quality_source == 'ab1_zero_filled_pcon':
+            warn_reasons.append('quality_scores_zero_filled_pcon_allowed_quality_unverified')
+        else:
+            warn_reasons.append(f'quality_scores_missing_allowed_{read.quality_source}')
     if read.quality_source.startswith('ab1_') and not read.trace_available:
         warn_reasons.append('chromatogram_trace_channels_unavailable')
     if read.mixed_peak_percent > float(max_mixed_peak_percent):
@@ -1392,6 +1533,9 @@ def _classify_output_qc(
         )
     if mode_warning:
         warn_reasons.append(mode_warning)
+    if consensus and not quality_verified:
+        # Phred values were not measured, so the output can never be a high-confidence pass.
+        warn_reasons.append('output_quality_unverified')
     failed_reads = [read.read_id for read in group if read.qc_class == 'FAIL_QC']
     if failed_reads and (processing_mode == 'assemble' or not consensus):
         warn_reasons.append('failed_reads_' + str(len(failed_reads)))
@@ -1436,6 +1580,20 @@ def _classify_output_qc(
     }
 
 
+def _group_quality_status(group) -> str:
+    """Summarise measured-versus-unverified Phred evidence for the reads of one isolate."""
+    reads = [read for read in group if read.status == 'kept'] or list(group)
+    if not reads:
+        return 'NO_READS'
+    if all(read.quality_available for read in reads):
+        return 'PHRED_VERIFIED'
+    labels = sorted({
+        str(read.quality_source).upper() for read in reads if not read.quality_available
+    })
+    prefix = 'PHRED_PARTIAL' if any(read.quality_available for read in reads) else 'PHRED_UNVERIFIED'
+    return prefix + ':' + ','.join(labels)
+
+
 def _clean_field(value: object) -> str:
     return str(value if value is not None else '').replace('\t', ' ').replace('\r', ' ').replace('\n', ' ')
 
@@ -1452,6 +1610,60 @@ def _review_sequence_for_failed_read(read: SangerRead) -> str:
     if not read.oriented_sequence and read.direction == 'reverse':
         return reverse_complement(seq).upper()
     return str(seq).upper()
+
+
+
+def _failed_review_read_quality_key(read: SangerRead) -> tuple[int, float, float, int, str]:
+    """Use the same length-first ranking when finding a recoverable read."""
+    sequence = _review_sequence_for_failed_read(read)
+    qualities = (
+        getattr(read, 'oriented_qualities', None)
+        or getattr(read, 'masked_qualities', None)
+        or getattr(read, 'trimmed_qualities', None)
+        or getattr(read, 'raw_qualities', None)
+        or []
+    )
+    return (
+        len(sequence), _mean_quality(qualities), -_mean_error_probability(qualities),
+        -sequence.upper().count('N'), str(read.read_id),
+    )
+
+
+def _select_failed_qc_review_candidate(
+    consensus: str,
+    reads: Iterable[SangerRead],
+    *,
+    assembly_stats: dict[str, object] | None = None,
+) -> tuple[str, str, str]:
+    """Return the actual sequence candidate offered for failed-QC review.
+
+    For a no-overlap/single-read result the output sequence is an individual
+    read, not a consensus, and its provenance must be recorded accordingly.
+    """
+    reads = list(reads)
+    assembly_stats = assembly_stats or {}
+    selected_id = str(assembly_stats.get('selected_read_id') or '')
+    status = str(assembly_stats.get('assembly_status') or assembly_stats.get('status') or '')
+    if status in {'partial_no_overlap', 'single_read', 'best_read'} and selected_id:
+        selected = next((read for read in reads if read.read_id == selected_id), None)
+        if selected is not None:
+            sequence = _review_sequence_for_failed_read(selected)
+            if sequence:
+                return sequence, 'BEST_RECOVERABLE_READ', selected.read_id
+
+    consensus = ''.join(str(consensus or '').split()).upper()
+    if consensus:
+        return consensus, 'FAILED_FINAL_CONSENSUS', ''
+
+    recoverable = []
+    for read in reads:
+        sequence = _review_sequence_for_failed_read(read)
+        if sequence:
+            recoverable.append((read, sequence))
+    if not recoverable:
+        return '', 'NO_CANDIDATE', ''
+    best_read, best_sequence = max(recoverable, key=lambda item: _failed_review_read_quality_key(item[0]))
+    return best_sequence, 'BEST_RECOVERABLE_READ', str(best_read.read_id)
 
 
 def _mean_quality(qualities: list[int] | None) -> float:
@@ -1477,10 +1689,115 @@ def _expected_errors(qualities: list[int] | None, sequence: str | None = None) -
     return total
 
 
+
+def _classify_consensus_observations(calls: list[tuple[str, str]]) -> tuple[bool, str]:
+    """Classify read support without treating ambiguous calls as agreement."""
+    bases = [base.upper() for _read_id, base in calls if base.upper() in 'ACGT']
+    distinct = sorted(set(bases))
+    disagreement = len(distinct) > 1
+    if not calls:
+        klass = 'NO_READ_SUPPORT'
+    elif len(calls) == 1 and len(bases) == 1:
+        klass = 'SINGLE_READ_SUPPORT'
+    elif disagreement:
+        klass = 'READ_DISAGREEMENT'
+    elif len(bases) == 0:
+        klass = 'AMBIGUOUS_READ_SUPPORT'
+    elif len(bases) < len(calls):
+        klass = 'PARTIAL_AMBIGUOUS_SUPPORT'
+    else:
+        klass = 'MULTI_READ_AGREEMENT'
+    return disagreement, klass
+
 def _n_percent(sequence: str) -> float:
     if not sequence:
         return 0.0
     return (sequence.upper().count('N') / len(sequence)) * 100.0
+
+
+def _read_level_review_evidence(reads: Iterable[SangerRead]) -> str:
+    """Summarise per-read QC metrics separately from final-consensus metrics.
+
+    An empty consensus has no meaningful N percentage. In that situation the
+    reviewer table should still expose the trimmed/masked read measurements
+    that explain why the isolate did not produce an output sequence.
+    """
+    evidence = []
+    for read in reads:
+        trimmed = str(read.trimmed_sequence or '')
+        masked = str(read.masked_sequence or trimmed)
+        n_text = f'{_n_percent(masked):.3f}%' if masked else 'NA'
+        primer_direction = '/'.join(
+            part for part in (str(read.primer or '').strip(), str(read.direction or '').strip())
+            if part
+        ) or 'primer/direction unknown'
+        qc_class = str(read.qc_class or 'UNKNOWN')
+        status = str(read.status or 'unknown')
+        item = (
+            f'{read.read_id} ({primer_direction}): {qc_class} · {status}; '
+            f'trimmed {len(trimmed)} bp; masked N {n_text}'
+        )
+        if str(read.warning or '').strip():
+            item += f'; reasons: {str(read.warning).strip()}'
+        evidence.append(item)
+    return ' | '.join(evidence)
+
+
+def _failed_qc_manual_acceptance(
+    consensus: str,
+    qc_row: dict[str, object],
+    *,
+    final_min_length: int,
+) -> dict[str, object]:
+    """Determine whether a failed marker has a candidate for human review.
+
+    Failed-QC approval is a reviewer-controlled override, not another automated
+    pass gate. Any non-empty failed consensus or best-recoverable read can be approved explicitly by a reviewer,
+    irrespective of the QC metric(s) that caused failure. The underlying QC
+    classification and all measurements remain unchanged. A record with no
+    candidate sequence cannot be approved because there is no sequence to assess.
+
+    The automated threshold failures remain visible in the QC evidence and are
+    intentionally not used to restrict the reviewer's ability to decide.
+    """
+    sequence = ''.join(str(consensus or '').split()).upper()
+    length = len(sequence)
+    n_percent = _n_percent(sequence)
+    deficit = max(0, int(final_min_length) - length)
+
+    failures_raw = qc_row.get('FailureReasons', '')
+    if isinstance(failures_raw, (list, tuple)):
+        hard_failures = [str(value) for value in failures_raw if str(value)]
+    else:
+        hard_failures = [value for value in str(failures_raw or '').split(';') if value]
+    failure_text = '; '.join(hard_failures) or str(qc_row.get('Reasons') or 'automated QC failure')
+
+    if not sequence:
+        return {
+            'eligible': False,
+            'basis': 'NO_CANDIDATE_SEQUENCE',
+            'reason': (
+                'Not eligible for manual acceptance: no non-empty candidate sequence is available. '
+                'The marker can be rejected or marked for resequencing, but cannot be assessed for inclusion.'
+            ),
+            'minimum_acceptable_length': '',
+            'length_deficit_bp': deficit,
+        }
+
+    return {
+        'eligible': True,
+        'basis': 'HUMAN_REVIEW_OVERRIDE',
+        'reason': (
+            f'A candidate sequence is available ({length} bp; {n_percent:.3f}% Ns). '
+            f'Automated QC classification remains FAIL_QC; recorded hard failure(s): {failure_text}. '
+            'The reviewer may explicitly approve this sequence regardless of which automated QC threshold(s) '
+            'failed. Inspect the chromatogram/read evidence, length, ambiguous bases, quality metrics, '
+            'overlap/assembly evidence and taxonomy evidence, then record a specific rationale. '
+            'This eligibility flag permits human review; it is not an automated pass.'
+        ),
+        'minimum_acceptable_length': '',
+        'length_deficit_bp': deficit,
+    }
 
 
 def _longest_true_run(values: Iterable[bool]) -> int:
@@ -2213,6 +2530,210 @@ def _write_visual_report_manifest(path: Path, rows: list[dict[str, object]]) -> 
         writer.writerows(rows)
 
 
+# Taxonomic screening policy for independent Sanger primer reads.
+# These are intentionally more stringent than a broad first-pass similarity search.
+TAXONOMY_SCREEN_MIN_IDENTITY = 90.0
+TAXONOMY_SCREEN_MIN_QUERY_COVERAGE = 80.0
+TAXONOMY_SCREEN_MIN_TARGET_COVERAGE = 50.0
+TAXONOMY_SCREEN_NEAR_BEST_IDENTITY_DELTA = 0.5
+# Bounded VSEARCH search settings: retain a useful near-best hit set without
+# scanning every candidate surviving the k-mer prefilter.
+TAXONOMY_SCREEN_MAX_ACCEPTS = 20
+TAXONOMY_SCREEN_MAX_REJECTS = 256  # Avoid premature rejection while retaining a finite search bound.
+TAXONOMY_SCREEN_MAX_HITS = 20
+TAXONOMY_SCREEN_POLICY_VERSION = '2.3'
+
+
+def _taxonomy_lineage_values(taxonomy: str, parse_taxon_string) -> dict[str, str]:
+    """Return populated GTDB-style rank values from a taxonomy lineage."""
+    if not taxonomy:
+        return {}
+    try:
+        parsed = parse_taxon_string(taxonomy) or {}
+    except Exception:
+        return {}
+    values = {}
+    for rank in ('d', 'p', 'c', 'o', 'f', 'g', 's', 't'):
+        value = str(parsed.get(rank) or '').strip()
+        if value and value.lower() not in {'na', 'none', 'unclassified', 'unknown'}:
+            values[rank] = value
+    return values
+
+
+def _lineage_prefix(values: dict[str, str], terminal_rank: str) -> str:
+    """Rebuild a lineage prefix ending at *terminal_rank*."""
+    fields = []
+    for rank in ('d', 'p', 'c', 'o', 'f', 'g', 's', 't'):
+        value = values.get(rank)
+        if value:
+            fields.append(f'{rank}__{value}')
+        if rank == terminal_rank:
+            break
+    return ';'.join(fields)
+
+
+def _resolve_near_best_taxonomy(hits: list[dict], parse_taxon_string) -> dict[str, object]:
+    """Resolve near-best read hits by dominant rank-wise lineage consensus.
+
+    A rank is retained only when >=70% of hits within the near-best identity
+    window support it, it leads the runner-up by >=20 percentage points, and
+    at least three distinct reference accessions support it. Lower ranks are
+    evaluated within the selected parent clade, not against off-clade hits.
+    """
+    if not hits:
+        return {
+            'best_identity': None, 'near_best_hits': [], 'assigned_rank': 'NA',
+            'taxonomy': '', 'status': 'NO_QUALIFYING_HIT', 'conflicts': [],
+            'support_pct': 0.0, 'lead_pct_points': 0.0,
+        }
+
+    best_identity = max(float(hit['identity']) for hit in hits)
+    near_best = [hit for hit in hits if float(hit['identity']) >= best_identity - TAXONOMY_SCREEN_NEAR_BEST_IDENTITY_DELTA]
+    lineages = []
+    for hit in near_best:
+        lineages.append((hit, _taxonomy_lineage_values(str(hit.get('taxonomy') or ''), parse_taxon_string)))
+    rank_order = ('d', 'p', 'c', 'o', 'f', 'g', 's', 't')
+    rank_names = {'d':'domain', 'p':'phylum', 'c':'class', 'o':'order', 'f':'family', 'g':'genus', 's':'species', 't':'strain'}
+    selected: dict[str, str] = {}
+    parent_subset = lineages
+    conflicts = []
+    assigned_rank = 'NA'
+    support_pct = lead_pct_points = 0.0
+    for rank in rank_order:
+        available = [(hit, lineage) for hit, lineage in parent_subset if lineage.get(rank)]
+        if not available:
+            break
+        counts, refs = {}, {}
+        for hit, lineage in available:
+            taxon = lineage[rank]
+            counts[taxon] = counts.get(taxon, 0) + 1
+            refs.setdefault(taxon, set()).add(str(hit.get('target') or ''))
+        ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        winner, winner_count = ordered[0]
+        runner_count = ordered[1][1] if len(ordered) > 1 else 0
+        denominator = len(available)
+        support = winner_count / denominator
+        lead = (winner_count - runner_count) / denominator
+        distinct_refs = len({value for value in refs[winner] if value})
+        if len(ordered) > 1:
+            conflicts.append({
+                'rank': rank_names[rank], 'dominant_taxon': winner,
+                'dominant_support_pct': 100.0 * support,
+                'runner_up_taxon': ordered[1][0],
+                'runner_up_support_pct': 100.0 * runner_count / denominator,
+                'lead_pct_points': 100.0 * lead,
+                'distinct_supporting_references': distinct_refs,
+                'candidate_count': denominator,
+            })
+        if support < 0.70 or lead < 0.20 or distinct_refs < 3:
+            break
+        selected[rank] = winner
+        assigned_rank = rank
+        support_pct, lead_pct_points = 100.0 * support, 100.0 * lead
+        parent_subset = [(hit, lineage) for hit, lineage in available if lineage.get(rank) == winner]
+
+    taxonomy = _lineage_prefix(selected, assigned_rank) if assigned_rank != 'NA' else ''
+    status = 'CONFIDENT' if assigned_rank in {'s', 't'} else ('PROVISIONAL' if assigned_rank not in {'NA', 'd'} else 'UNRESOLVED')
+    if assigned_rank == 'd':
+        status = 'UNRESOLVED'
+    if not any(lineage for _hit, lineage in lineages):
+        status = 'TAXONOMY_UNMAPPED'
+    return {
+        'best_identity': best_identity, 'near_best_hits': near_best,
+        'assigned_rank': assigned_rank, 'taxonomy': taxonomy, 'status': status,
+        'conflicts': conflicts, 'support_pct': support_pct,
+        'lead_pct_points': lead_pct_points,
+    }
+
+
+
+def _compare_primer_read_taxonomy_group(
+    group: list[SangerRead],
+    read_summaries: dict[str, dict[str, object]],
+    parse_taxon_string,
+) -> dict[str, object]:
+    """Compare read-level near-best taxonomy summaries at genus/family rank."""
+    read_lineages = []
+    evidence = []
+    for read in group:
+        summary = read_summaries.get(read.read_id, {})
+        lineage = _taxonomy_lineage_values(str(summary.get('taxonomy') or ''), parse_taxon_string)
+        read_lineages.append((read.read_id, lineage))
+        best_id = summary.get('best_identity')
+        identity_text = 'NA' if best_id is None else f'{float(best_id):.2f}%'
+        evidence.append(
+            f"{read.read_id}: best={summary.get('best_hit') or 'none'} "
+            f"({identity_text}); qcov={summary.get('best_query_coverage') or 'NA'}; "
+            f"near_best={summary.get('near_best_hit_count', 0)}; "
+            f"assigned={summary.get('assigned_rank', 'NA')}; "
+            f"support={summary.get('support', 'NA')}"
+        )
+
+    genus_assignments = [
+        (read_id, lineage['g']) for read_id, lineage in read_lineages if lineage.get('g')
+    ]
+    family_assignments = [
+        (read_id, lineage['f']) for read_id, lineage in read_lineages if lineage.get('f')
+    ]
+    genus_values = {taxon for _read_id, taxon in genus_assignments}
+    family_values = {taxon for _read_id, taxon in family_assignments}
+
+    if len(genus_values) > 1:
+        compared_rank, compared = 'genus', genus_assignments
+        conflict = True
+        reason = 'different genus assignments among near-best read classifications'
+    elif len(family_values) > 1:
+        compared_rank, compared = 'family', family_assignments
+        conflict = True
+        reason = 'different family assignments among near-best read classifications'
+    elif len(genus_assignments) >= 2:
+        compared_rank, compared = 'genus', genus_assignments
+        conflict = False
+        reason = f'concordant genus assignment: g__{genus_assignments[0][1]}'
+    elif len(family_assignments) >= 2:
+        compared_rank, compared = 'family', family_assignments
+        conflict = False
+        reason = f'concordant family assignment: f__{family_assignments[0][1]}'
+    else:
+        compared_rank, compared = 'NA', []
+        conflict = False
+        reason = 'fewer than two primer reads had genus/family resolution from near-best reference hits'
+
+    weak_support = bool(conflict) and any(
+        read_summaries.get(read_id, {}).get('near_best_hit_count', 0) < 2
+        for read_id, _taxon in compared
+    )
+    if conflict and weak_support:
+        status = 'POTENTIAL_CONFLICT'
+        reason += '; at least one read has only a single near-best reference hit'
+    elif conflict:
+        status = 'CONFLICT'
+    elif compared_rank != 'NA':
+        status = 'CONCORDANT'
+    else:
+        status = 'INSUFFICIENT_CLASSIFICATION'
+
+    rank_prefix = {'genus': 'g', 'family': 'f'}.get(compared_rank, '')
+    assignments = ' | '.join(
+        f'{read_id}={rank_prefix}__{taxon}' for read_id, taxon in compared
+    ) or 'insufficient common-rank assignments'
+    full_taxonomies = ' | '.join(
+        f'{read.read_id}={read.taxonomy_screen or "NA"}' for read in group
+    )
+    return {
+        'conflict': conflict,
+        'status': status,
+        'compared_rank': compared_rank,
+        'assignments': assignments,
+        'full_taxonomies': full_taxonomies,
+        'reason': reason,
+        'read_evidence': ' | '.join(evidence),
+    }
+
+def _write_tsv(path: Path, fieldnames: list[str], rows: list[dict]) -> None:
+    write_tsv(path, fieldnames, rows)
+
+
 def _screen_primer_read_taxonomy(
     reads: list[SangerRead],
     trimmed_fasta: Path,
@@ -2222,98 +2743,284 @@ def _screen_primer_read_taxonomy(
     taxa_tsv: Optional[str | Path],
     threads: int,
 ) -> tuple[dict[str, dict[str, object]], Optional[str]]:
-    """Flag isolate groups whose independently classified primer reads disagree."""
+    """Screen each primer read against multiple near-best taxonomy references.
+
+    Unlike the general-purpose classifier's single-best-hit mode, this screen
+    retains all VSEARCH hits that pass its similarity criteria, then derives a
+    conservative lowest-common taxonomy across near-best hits. This prevents
+    reference ordering from deciding the reported genus.
+    """
     if not ref_fasta:
         return {}, None
+
     from branchmanager.pipeline import classify
     from branchmanager.taxonomy import parse_taxon_string
 
     screen_dir = outdir / 'read_taxonomy_screen'
     screen_dir.mkdir(parents=True, exist_ok=True)
-    taxonomy_path = classify.run_classification(
-        str(trimmed_fasta), str(screen_dir), ref_fasta=str(ref_fasta),
-        taxa_tsv=str(taxa_tsv) if taxa_tsv else None, threads=threads,
-        db_name=classify._derive_db_name(str(ref_fasta)),
+    reference_path = classify._ensure_uncompressed(
+        str(ref_fasta), str(screen_dir), out_name='screen_reference.fasta',
     )
-    by_read = {}
-    with open(taxonomy_path) as handle:
-        for row in csv.DictReader(handle, delimiter='\t'):
-            by_read[str(row.get('ID') or '')] = row
-    for read in reads:
-        row = by_read.get(read.read_id, {})
-        taxon_value = row.get('Taxon') or next(
-            (value for key, value in row.items() if key.startswith('Taxon_')),
-            None,
+
+    if taxa_tsv:
+        taxonomy_map = classify._load_taxa_map(str(taxa_tsv))
+        try:
+            warnings = classify.validate_reference_taxonomy_consistency(reference_path, str(taxa_tsv))
+            if warnings:
+                classify.write_reference_taxonomy_warnings(str(screen_dir), warnings)
+        except Exception as exc:
+            logger.warning('[PAPER TRAIL] Could not validate taxonomy/reference consistency: %s', exc)
+    else:
+        taxonomy_map, warnings = classify._load_taxa_map_from_reference_fasta(reference_path)
+        if warnings:
+            classify.write_reference_taxonomy_warnings(str(screen_dir), warnings)
+
+    safe_query, query_id_map = classify._vsearch_safe_query(str(trimmed_fasta), str(screen_dir))
+    matches_path = screen_dir / 'matches.tsv'
+    command = [
+        'vsearch', '--usearch_global', str(safe_query),
+        '--db', str(reference_path),
+        '--id', f'{TAXONOMY_SCREEN_MIN_IDENTITY / 100.0:.4f}',
+        '--strand', 'both',
+        '--userout', str(matches_path),
+        '--userfields', classify.VSEARCH_USERFIELDS,
+        # Bound the search to avoid the very large runtime/output of an
+        # effectively unbounded multi-hit search. Twenty accepted references
+        # provide a useful near-best set; a finite 256-reject allowance avoids
+        # premature stopping on ambiguous primer reads without scanning forever.
+        '--maxaccepts', str(TAXONOMY_SCREEN_MAX_ACCEPTS),
+        '--maxrejects', str(TAXONOMY_SCREEN_MAX_REJECTS),
+        '--maxhits', str(TAXONOMY_SCREEN_MAX_HITS),
+        '--query_cov', f'{TAXONOMY_SCREEN_MIN_QUERY_COVERAGE / 100.0:.2f}',
+        '--threads', str(max(1, int(threads or 1))),
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            'VSEARCH is required for primer-read taxonomy screening but was not found on PATH.'
+        ) from exc
+    if completed.returncode != 0:
+        raise RuntimeError(
+            'VSEARCH primer-read taxonomy screening failed '
+            f'(exit {completed.returncode}): {completed.stderr.strip() or completed.stdout.strip()}'
         )
-        read.taxonomy_screen = str(taxon_value or 'NA')
+
+    # Parse and de-duplicate strand-specific records for the same read/reference.
+    parsed_hits: dict[str, dict[str, dict]] = {}
+    try:
+        with open(matches_path) as handle:
+            for line in handle:
+                fields = line.rstrip('\r\n').split('\t')
+                hit = classify._parse_vsearch_match(fields)
+                if not hit:
+                    continue
+                read_id = query_id_map.get(hit['query'], hit['query'])
+                hit['read_id'] = read_id
+                taxonomy, confidence = classify._lookup_tax(hit['target'], taxonomy_map)
+                hit['taxonomy'] = str(taxonomy or '')
+                hit['taxonomy_confidence'] = confidence
+                query_coverage = float(hit.get('query_coverage') or 0.0)
+                target_coverage = float(hit.get('target_coverage') or 0.0)
+                hit['qualified'] = (
+                    float(hit['identity']) >= TAXONOMY_SCREEN_MIN_IDENTITY
+                    and query_coverage >= TAXONOMY_SCREEN_MIN_QUERY_COVERAGE
+                    and target_coverage >= TAXONOMY_SCREEN_MIN_TARGET_COVERAGE
+                )
+                by_target = parsed_hits.setdefault(read_id, {})
+                previous = by_target.get(hit['target'])
+                score = (
+                    float(hit['identity']), query_coverage, target_coverage,
+                    int(hit.get('alignment_length') or 0),
+                )
+                previous_score = (
+                    float(previous['identity']),
+                    float(previous.get('query_coverage') or 0.0),
+                    float(previous.get('target_coverage') or 0.0),
+                    int(previous.get('alignment_length') or 0),
+                ) if previous else None
+                if previous is None or score > previous_score:
+                    by_target[hit['target']] = hit
+    except FileNotFoundError as exc:
+        raise RuntimeError(f'VSEARCH did not produce the expected hit file: {matches_path}') from exc
+
+    read_summaries: dict[str, dict[str, object]] = {}
+    hit_rows: list[dict] = []
+    taxonomy_conflict_rows: list[dict] = []
+    for read in reads:
+        read_id = read.read_id
+        all_hits = list(parsed_hits.get(read_id, {}).values())
+        qualifying_hits = [hit for hit in all_hits if hit['qualified']]
+        resolution = _resolve_near_best_taxonomy(qualifying_hits, parse_taxon_string)
+        for conflict in resolution.get('conflicts', []):
+            taxonomy_conflict_rows.append({
+                'ReadID': read_id, 'AssignmentStatus': resolution.get('status', ''),
+                'ReportedTaxonomy': resolution.get('taxonomy', '') or 'NA',
+                'AssignedRank': resolution.get('assigned_rank', 'NA'),
+                'ConflictRank': conflict['rank'], 'DominantTaxon': conflict['dominant_taxon'],
+                'DominantSupportPct': f"{conflict['dominant_support_pct']:.2f}",
+                'RunnerUpTaxon': conflict['runner_up_taxon'],
+                'RunnerUpSupportPct': f"{conflict['runner_up_support_pct']:.2f}",
+                'LeadPctPoints': f"{conflict['lead_pct_points']:.2f}",
+                'DistinctSupportingReferences': conflict['distinct_supporting_references'],
+                'CandidateCount': conflict['candidate_count'],
+            })
+        near_targets = {hit['target'] for hit in resolution['near_best_hits']}
+        for hit in sorted(all_hits, key=lambda item: (-float(item['identity']), str(item['target']))):
+            hit_rows.append({
+                'ReadID': read_id,
+                'TargetID': hit['target'],
+                'Identity': f"{float(hit['identity']):.3f}",
+                'QueryCoverage': f"{float(hit.get('query_coverage') or 0.0):.2f}",
+                'TargetCoverage': f"{float(hit.get('target_coverage') or 0.0):.2f}",
+                'AlignmentLength': hit.get('alignment_length', ''),
+                'Taxonomy': hit.get('taxonomy', ''),
+                'Qualified': 'yes' if hit['qualified'] else 'no',
+                'NearBest': 'yes' if hit['target'] in near_targets else 'no',
+                'BestIdentity': (
+                    f"{float(resolution['best_identity']):.3f}"
+                    if resolution['best_identity'] is not None else ''
+                ),
+                'IdentityDelta': (
+                    f"{float(resolution['best_identity']) - float(hit['identity']):.3f}"
+                    if resolution['best_identity'] is not None else ''
+                ),
+            })
+
+        near_best = resolution['near_best_hits']
+        best_hit = max(qualifying_hits, key=lambda item: float(item['identity'])) if qualifying_hits else {}
+        read.taxonomy_screen = str(resolution.get('taxonomy') or 'NA')
+        if not near_best:
+            support = 'NO_QUALIFYING_REFERENCE_HITS'
+        elif len(near_best) == 1:
+            support = 'SINGLE_NEAR_BEST_REFERENCE_HIT'
+        elif resolution['assigned_rank'] in {'g', 's', 't'}:
+            support = 'MULTIPLE_NEAR_BEST_HITS_AGREE_AT_GENUS'
+        elif resolution['assigned_rank'] == 'f':
+            support = 'MULTIPLE_NEAR_BEST_HITS_AGREE_AT_FAMILY'
+        else:
+            support = 'MULTIPLE_NEAR_BEST_HITS_WITHOUT_GENUS_FAMILY_RESOLUTION'
+        read_summaries[read_id] = {
+            'taxonomy': read.taxonomy_screen,
+            'assigned_rank': resolution['assigned_rank'],
+            'status': resolution['status'],
+            'support': support,
+            'taxonomy_support_pct': resolution.get('support_pct', 0.0),
+            'taxonomy_lead_pct_points': resolution.get('lead_pct_points', 0.0),
+            'best_hit': best_hit.get('target', ''),
+            'best_identity': resolution['best_identity'],
+            'best_query_coverage': best_hit.get('query_coverage'),
+            'best_target_coverage': best_hit.get('target_coverage'),
+            'qualified_hit_count': len(qualifying_hits),
+            'near_best_hit_count': len(near_best),
+            'near_best_hits': near_best,
+        }
+
+    taxonomy_rows = []
+    for read_id, summary in read_summaries.items():
+        taxonomy_rows.append({
+            'ID': read_id,
+            'BestHit': summary['best_hit'],
+            'Identity': '' if summary['best_identity'] is None else f"{float(summary['best_identity']):.3f}",
+            'QueryCoverage': '' if summary['best_query_coverage'] is None else f"{float(summary['best_query_coverage']):.2f}",
+            'TargetCoverage': '' if summary['best_target_coverage'] is None else f"{float(summary['best_target_coverage']):.2f}",
+            'QualifiedHitCount': summary['qualified_hit_count'],
+            'NearBestHitCount': summary['near_best_hit_count'],
+            'NearBestIdentityDelta': TAXONOMY_SCREEN_NEAR_BEST_IDENTITY_DELTA,
+            'AssignedRank': summary['assigned_rank'],
+            'Taxon': summary['taxonomy'],
+            'ReadClassificationStatus': summary['status'],
+            'TaxonomySupport': summary['support'],
+            'TaxonomySupportPct': f"{float(summary.get('taxonomy_support_pct') or 0.0):.2f}",
+            'TaxonomyLeadPctPoints': f"{float(summary.get('taxonomy_lead_pct_points') or 0.0):.2f}",
+        })
+    write_tsv(
+        screen_dir / 'taxonomy.tsv',
+        ['ID', 'BestHit', 'Identity', 'QueryCoverage', 'TargetCoverage',
+         'QualifiedHitCount', 'NearBestHitCount', 'NearBestIdentityDelta',
+         'AssignedRank', 'Taxon', 'ReadClassificationStatus', 'TaxonomySupport',
+         'TaxonomySupportPct', 'TaxonomyLeadPctPoints'],
+        taxonomy_rows,
+    )
+    write_tsv(
+        screen_dir / 'read_taxonomy_hits.tsv',
+        ['ReadID', 'TargetID', 'Identity', 'QueryCoverage', 'TargetCoverage',
+         'AlignmentLength', 'Taxonomy', 'Qualified', 'NearBest', 'BestIdentity',
+         'IdentityDelta'],
+        hit_rows,
+    )
+    write_tsv(
+        screen_dir / 'read_taxonomy_conflicts.tsv',
+        ['ReadID', 'AssignmentStatus', 'ReportedTaxonomy', 'AssignedRank',
+         'ConflictRank', 'DominantTaxon', 'DominantSupportPct', 'RunnerUpTaxon',
+         'RunnerUpSupportPct', 'LeadPctPoints', 'DistinctSupportingReferences',
+         'CandidateCount'],
+        taxonomy_conflict_rows,
+    )
+    version_result = subprocess.run(
+        ['vsearch', '--version'], capture_output=True, text=True, check=False,
+    )
+    version_text = (version_result.stdout or version_result.stderr or 'unknown').strip().splitlines()[0]
+    write_tsv(
+        screen_dir / 'taxonomy_screen_policy.tsv',
+        ['PolicyVersion', 'VSEARCHVersion', 'ReferenceFASTA', 'TaxonomyFile',
+         'SearchMinimumIdentityPct', 'SearchMinimumQueryCoveragePct',
+         'FilterMinimumQueryCoveragePct', 'FilterMinimumTargetCoveragePct',
+         'NearBestIdentityDeltaPct', 'MaxAccepts', 'MaxRejects', 'MaxHits'],
+        [{
+            'PolicyVersion': TAXONOMY_SCREEN_POLICY_VERSION,
+            'VSEARCHVersion': version_text,
+            'ReferenceFASTA': str(Path(ref_fasta).expanduser().resolve()),
+            'TaxonomyFile': str(Path(taxa_tsv).expanduser().resolve()) if taxa_tsv else 'reference FASTA headers',
+            'SearchMinimumIdentityPct': TAXONOMY_SCREEN_MIN_IDENTITY,
+            'SearchMinimumQueryCoveragePct': 70.0,
+            'FilterMinimumQueryCoveragePct': TAXONOMY_SCREEN_MIN_QUERY_COVERAGE,
+            'FilterMinimumTargetCoveragePct': TAXONOMY_SCREEN_MIN_TARGET_COVERAGE,
+            'NearBestIdentityDeltaPct': TAXONOMY_SCREEN_NEAR_BEST_IDENTITY_DELTA,
+            'MaxAccepts': TAXONOMY_SCREEN_MAX_ACCEPTS,
+            'MaxRejects': TAXONOMY_SCREEN_MAX_REJECTS,
+            'MaxHits': TAXONOMY_SCREEN_MAX_HITS,
+        }],
+    )
 
     results: dict[str, dict[str, object]] = {}
     groups: dict[str, list[SangerRead]] = {}
     for read in reads:
         groups.setdefault(read.sequence_id, []).append(read)
+
     report_path = outdir / 'read_taxonomy_concordance.tsv'
-    with open(report_path, 'w') as handle:
-        handle.write(
-            'SequenceID\tReadIDs\tTaxonomies\tComparedRank\tComparedAssignments\t'
-            'ConcordanceStatus\tConcordant\tReason\n'
+    report_rows = []
+    for sequence_id, group in sorted(groups.items()):
+        comparison = _compare_primer_read_taxonomy_group(
+            group, read_summaries, parse_taxon_string,
         )
-        for sequence_id, group in sorted(groups.items()):
-            resolved = []
-            for read in group:
-                parsed = parse_taxon_string(read.taxonomy_screen)
-                genus = str(parsed.get('g') or '').strip()
-                family = str(parsed.get('f') or '').strip()
-                if genus or family:
-                    resolved.append({
-                        'read_id': read.read_id,
-                        'genus': genus,
-                        'family': family,
-                        'taxonomy': read.taxonomy_screen,
-                    })
-            compared_rank = 'NA'
-            compared = []
-            if len(resolved) >= 2 and all(row['genus'] for row in resolved):
-                compared_rank = 'genus'
-                compared = [(str(row['read_id']), str(row['genus'])) for row in resolved]
-            elif len(resolved) >= 2 and all(row['family'] for row in resolved):
-                compared_rank = 'family'
-                compared = [(str(row['read_id']), str(row['family'])) for row in resolved]
-            rank_prefix = {'genus': 'g', 'family': 'f'}.get(compared_rank, '')
-            assignments = ' | '.join(
-                f'{read_id}={rank_prefix}__{taxon}' if rank_prefix else f'{read_id}={taxon}'
-                for read_id, taxon in compared
-            ) or 'insufficient common-rank assignments'
-            distinct = {taxon for _read_id, taxon in compared}
-            conflict = len(distinct) > 1
-            if conflict:
-                status = 'CONFLICT'
-                reason = f'different {compared_rank} assignments: {assignments}'
-            elif compared:
-                status = 'CONCORDANT'
-                taxon = next(iter(distinct))
-                display_taxon = f'{rank_prefix}__{taxon}' if rank_prefix else taxon
-                reason = f'concordant {compared_rank} assignment: {display_taxon}'
-            else:
-                status = 'INSUFFICIENT_CLASSIFICATION'
-                reason = 'fewer than two primer reads had taxonomy resolved at a common genus/family rank'
-            concordant = 'no' if conflict else ('yes' if compared else 'NA')
-            results[sequence_id] = {
-                'conflict': conflict,
-                'status': status,
-                'compared_rank': compared_rank,
-                'assignments': assignments,
-                'full_taxonomies': ' | '.join(
-                    f'{read.read_id}={read.taxonomy_screen or "NA"}' for read in group
-                ),
-                'reason': reason,
-            }
-            handle.write(
-                f'{_clean_field(sequence_id)}\t'
-                f'{_clean_field(";".join(read.read_id for read in group))}\t'
-                f'{_clean_field(results[sequence_id]["full_taxonomies"])}\t'
-                f'{compared_rank}\t{_clean_field(assignments)}\t{status}\t'
-                f'{concordant}\t{_clean_field(reason)}\n'
-            )
+        results[sequence_id] = comparison
+        report_rows.append({
+            'SequenceID': sequence_id,
+            'ReadIDs': ';'.join(read.read_id for read in group),
+            'Taxonomies': comparison['full_taxonomies'],
+            'ComparedRank': comparison['compared_rank'],
+            'ComparedAssignments': comparison['assignments'],
+            'ConcordanceStatus': comparison['status'],
+            'Concordant': 'no' if comparison['conflict'] else (
+                'yes' if comparison['status'] == 'CONCORDANT' else 'NA'
+            ),
+            'Reason': comparison['reason'],
+            'ReadEvidence': comparison['read_evidence'],
+            'TaxonomyScreenPolicy': TAXONOMY_SCREEN_POLICY_VERSION,
+            'MinimumIdentity': TAXONOMY_SCREEN_MIN_IDENTITY,
+            'MinimumQueryCoverage': TAXONOMY_SCREEN_MIN_QUERY_COVERAGE,
+            'MinimumTargetCoverage': TAXONOMY_SCREEN_MIN_TARGET_COVERAGE,
+            'NearBestIdentityDelta': TAXONOMY_SCREEN_NEAR_BEST_IDENTITY_DELTA,
+        })
+    write_tsv(
+        report_path,
+        ['SequenceID', 'ReadIDs', 'Taxonomies', 'ComparedRank', 'ComparedAssignments',
+         'ConcordanceStatus', 'Concordant', 'Reason', 'ReadEvidence',
+         'TaxonomyScreenPolicy', 'MinimumIdentity', 'MinimumQueryCoverage',
+         'MinimumTargetCoverage', 'NearBestIdentityDelta'],
+        report_rows,
+    )
     return results, str(report_path)
 
 
@@ -2412,6 +3119,7 @@ def run_paper_trail(
     min_overlap_identity: float = DEFAULT_QC_POLICY.min_overlap_identity,
     screen_ref: Optional[str | Path] = None,
     screen_taxa: Optional[str | Path] = None,
+    selected_read_ids: Optional[dict[str, str]] = None,
     threads: int = 4,
     assemble: bool = True,
     recursive: bool = True,
@@ -2591,6 +3299,10 @@ def run_paper_trail(
     per_base_error_tsv = out / 'per_base_error.tsv'
     assembly_tsv = out / 'assembly_report.tsv'
     assembly_placements_tsv = out / 'assembly_read_placements.tsv'
+    overlap_candidates_tsv = out / 'assembly_overlap_candidates.tsv'
+    assembly_candidates_tsv = out / 'assembly_candidates.tsv'
+    candidate_assemblies_fasta = out / 'assembly_candidates.fasta'
+    consensus_evidence_tsv = out / 'consensus_position_evidence.tsv'
     recommendations_tsv = out / 'resequence_recommendations.tsv'
     marker_review_template_tsv = out / 'marker_review_template.tsv'
     qc_policy_tsv = out / 'paper_trail_qc_policy.tsv'
@@ -2606,6 +3318,7 @@ def run_paper_trail(
     failed_qc_dir = out / 'failed_qc_sequences'
     failed_final_fasta = failed_qc_dir / 'failed_final_sequences.fasta'
     failed_read_fasta = failed_qc_dir / 'failed_read_sequences.fasta'
+    failed_review_candidates_fasta = failed_qc_dir / 'failed_review_candidates.fasta'
     failed_manifest_tsv = failed_qc_dir / 'failed_qc_manifest.tsv'
     failed_read_manifest_tsv = failed_qc_dir / 'failed_read_manifest.tsv'
     failed_qc_guide = failed_qc_dir / 'failed_qc_guide.txt'
@@ -2671,9 +3384,28 @@ def run_paper_trail(
     for read in reads:
         groups.setdefault(read.sequence_id, []).append(read)
 
+    # Record every usable read-pair comparison, including rejected overlaps.
+    # This is diagnostic only and does not alter the assembler's pair ranking.
+    with open(overlap_candidates_tsv, 'w') as handle:
+        handle.write('SequenceID\tReadA\tReadB\tOverlapLength\tComparedBases\tMatches\tMismatches\tIndelColumns\tIdentity\tMinOverlap\tMinIdentity\tAccepted\tReason\n')
+        for sequence_id, group in sorted(groups.items()):
+            usable = sorted((r for r in group if r.status == 'kept' and r.oriented_sequence), key=lambda r: r.read_id)
+            for i, left in enumerate(usable):
+                for right in usable[i + 1:]:
+                    evidence = diagnose_overlap(left.oriented_sequence, right.oriented_sequence,
+                                                min_overlap=min_overlap, min_identity=min_overlap_identity)
+                    handle.write(
+                        f'{_clean_field(sequence_id)}\t{_clean_field(left.read_id)}\t{_clean_field(right.read_id)}\t'
+                        f"{evidence['overlap_length']}\t{evidence['compared_bases']}\t{evidence['matches']}\t"
+                        f"{evidence['mismatches']}\t{evidence['indel_columns']}\t{evidence['identity']:.6f}\t"
+                        f'{int(min_overlap)}\t{float(min_overlap_identity):.6f}\t'
+                        f"{'yes' if evidence['accepted'] else 'no'}\t{evidence['reason']}\n"
+                    )
+
     assembled_records = []
     failed_final_records = []
     failed_read_records = []
+    failed_review_candidate_records = []
     failed_read_manifest_rows: list[dict[str, object]] = []
     failed_isolate_manifest_rows: list[dict[str, object]] = []
     for read in reads:
@@ -2711,19 +3443,34 @@ def run_paper_trail(
             'TaxonomyConcordance\tTaxonomyComparedRank\tReadTaxonomyAssignments\t'
             'OverlapIdentity\tOverlapLength\tConflicts\tAmbiguousConflicts\tUnmergedReads\t'
             'ReadIDs\tKeptReadIDs\tUsedReadIDs\tMergeMethod\tProcessingMode\tSelectedReadID\t'
-            'PassLengthQC\tReasons\tSuggestedAction\tFailedReadIDs\tModeWarning\n'
+            'SelectionSource\tFallbackReason\tSelectionWarning\tRecommendedReadID\tFallbackReadOptions\tAssemblyStatus\t'
+            'PassLengthQC\tReasons\tSuggestedAction\tFailedReadIDs\tModeWarning\tQualityStatus\n'
         )
         for sequence_id, group in sorted(groups.items()):
             processing_mode, mode_warning = _resolve_group_processing_mode(group, default_mode)
+            requested_read_id = str((selected_read_ids or {}).get(sequence_id) or '').strip() or None
             if processing_mode == 'assemble':
                 consensus, stats = assemble_read_group(
                     group,
                     min_overlap=min_overlap,
                     min_identity=min_overlap_identity,
                     quality_difference=quality_difference,
+                    fallback_read_id=requested_read_id,
                 )
             else:
-                consensus, stats = select_best_read_group(group)
+                consensus, stats = select_best_read_group(
+                    group, selected_read_id=requested_read_id,
+                )
+            assembly_status = str(stats.get('status') or '')
+            stats['assembly_status'] = assembly_status
+            fallback_options = (
+                _fallback_read_options(group)
+                if assembly_status == 'partial_no_overlap' else []
+            )
+            stats['fallback_read_options'] = fallback_options
+            stats['recommended_read_id'] = (
+                str(fallback_options[0]['read_id']) if fallback_options else ''
+            )
             taxonomy_result = taxonomy_screen_results.get(sequence_id, {})
             stats['taxonomy_conflict'] = bool(taxonomy_result.get('conflict', False))
             stats['taxonomy_screen_status'] = taxonomy_result.get('status', 'NOT_SCREENED')
@@ -2763,6 +3510,7 @@ def run_paper_trail(
             used_read_ids = [str(read_id) for read_id in stats.get('used_read_ids', [])]
             read_placements = _build_read_placements(consensus, group, used_read_ids)
             reasons = _join_reasons(final_qc.get('reasons', []))
+            quality_status = _group_quality_status(group)
             row = {
                 'SequenceID': sequence_id,
                 'Status': stats['status'],
@@ -2789,25 +3537,47 @@ def run_paper_trail(
                 'MergeMethod': stats.get('method', 'NA'),
                 'ProcessingMode': processing_mode,
                 'SelectedReadID': stats.get('selected_read_id', ''),
+                'SelectionSource': stats.get('selection_source', ''),
+                'FallbackReason': stats.get('fallback_reason', ''),
+                'SelectionWarning': stats.get('selection_warning', ''),
+                'RecommendedReadID': stats.get('recommended_read_id', ''),
+                'FallbackReadOptions': json.dumps(fallback_options, separators=(',', ':')) if fallback_options else '',
+                'AssemblyStatus': assembly_status,
                 'PassLengthQC': pass_length_qc if consensus else 'no',
+                '_FallbackReadOptions': fallback_options,
                 'Reasons': reasons,
                 'SuggestedAction': final_qc.get('suggested_action', ''),
                 'FailedReadIDs': final_qc.get('failed_read_ids', ''),
                 'ModeWarning': mode_warning,
+                'QualityStatus': quality_status,
                 '_ConsensusSequence': consensus,
                 '_ReadPlacements': read_placements,
             }
-            assembly_rows.append(row)
-            recommendation_rows.append(row)
             if row['QCClass'] == 'FAIL_QC':
+                candidate_sequence, candidate_source, candidate_read_id = (
+                    _select_failed_qc_review_candidate(consensus, group, assembly_stats=stats)
+                )
+                row['_ReviewCandidateSequence'] = candidate_sequence
+                row['_ReviewCandidateSource'] = candidate_source
+                row['_ReviewCandidateReadID'] = candidate_read_id
+                row['_ReviewCandidateLength'] = len(candidate_sequence)
+                row['_ReviewCandidateNPercent'] = _n_percent(candidate_sequence) if candidate_sequence else None
+                if candidate_sequence:
+                    failed_review_candidate_records.append((sequence_id, candidate_sequence))
                 failed_group_reads = [read for read in group if read.qc_class == 'FAIL_QC']
                 recoverable_reads = [
                     read for read in group if _review_sequence_for_failed_read(read)
                 ]
-                best_recoverable = (
-                    max(recoverable_reads, key=_read_quality_key)
-                    if recoverable_reads else None
-                )
+                selected_fallback_id = str(stats.get('selected_read_id') or '')
+                best_recoverable = next(
+                    (read for read in recoverable_reads if read.read_id == selected_fallback_id),
+                    None,
+                ) if selected_fallback_id else None
+                if best_recoverable is None:
+                    best_recoverable = (
+                        max(recoverable_reads, key=_failed_review_read_quality_key)
+                        if recoverable_reads else None
+                    )
                 best_recoverable_sequence = (
                     _review_sequence_for_failed_read(best_recoverable)
                     if best_recoverable else ''
@@ -2850,10 +3620,93 @@ def run_paper_trail(
                 f'{_clean_field(stats["unmerged_reads"])}\t{read_ids}\t{kept_read_ids}\t{_clean_field(row["UsedReadIDs"])}\t'
                 f'{_clean_field(stats.get("method", "NA"))}\t{processing_mode}\t'
                 f'{_clean_field(stats.get("selected_read_id", ""))}\t'
+                f'{_clean_field(stats.get("selection_source", ""))}\t'
+                f'{_clean_field(stats.get("fallback_reason", ""))}\t'
+                f'{_clean_field(stats.get("selection_warning", ""))}\t'
+                f'{_clean_field(stats.get("recommended_read_id", ""))}\t'
+                f'{_clean_field(row.get("FallbackReadOptions", ""))}\t'
+                f'{_clean_field(assembly_status)}\t'
                 f'{pass_length_qc if consensus else "no"}\t{_clean_field(reasons)}\t'
                 f'{_clean_field(row["SuggestedAction"])}\t{_clean_field(row["FailedReadIDs"])}\t'
-                f'{_clean_field(mode_warning)}\n'
+                f'{_clean_field(mode_warning)}\t{_clean_field(quality_status)}\n'
             )
+            # Keep the complete per-isolate row for downstream report writers.
+            # The TSV above is streamed directly, but the visual report and
+            # marker-review template are generated from these in-memory lists.
+            # Omitting these appends silently produced header-only review files.
+            assembly_rows.append(row)
+            recommendation_rows.append(row)
+
+
+    # Generate independently selectable combinations from all reads with an
+    # oriented sequence. QC-failed reads are included as explicit review-only
+    # candidates so a user can inspect a potentially recoverable pair; they are
+    # never silently promoted into the default assembly.
+    candidate_rows: list[dict[str, object]] = []
+    candidate_fasta_records: list[tuple[str, str]] = []
+    for sequence_id, group in sorted(groups.items()):
+        eligible = [read for read in group if read.oriented_sequence]
+        candidate_number = 0
+        for size in range(2, len(eligible) + 1):
+            for subset in itertools.combinations(eligible, size):
+                candidate_number += 1
+                candidate_id = f'{sequence_id}__candidate_{candidate_number:02d}'
+                candidate_group = copy.deepcopy(list(subset))
+                candidate_consensus, candidate_stats = assemble_read_group(
+                    candidate_group,
+                    min_overlap=min_overlap,
+                    min_identity=min_overlap_identity,
+                    quality_difference=quality_difference,
+                )
+                if not candidate_consensus:
+                    continue
+                candidate_qc = _classify_output_qc(
+                    candidate_consensus,
+                    list(candidate_stats.get('qualities') or []),
+                    candidate_stats,
+                    candidate_group,
+                    final_min_length=final_min_length,
+                    min_mean_quality=float(min_mean_quality),
+                    max_output_expected_errors=float(max_output_expected_errors),
+                    warn_n_percent=float(warn_n_percent),
+                    max_n_percent=float(max_n_percent),
+                    max_conflict_density=float(max_conflict_density),
+                    max_ambiguous_overlap_conflicts_without_review=int(max_ambiguous_overlap_conflicts_without_review),
+                    processing_mode='assemble',
+                    mode_warning='',
+                )
+                used = [str(x) for x in candidate_stats.get('used_read_ids', [])]
+                all_ids = [read.read_id for read in subset]
+                candidate_rows.append({
+                    'SequenceID': sequence_id,
+                    'CandidateID': candidate_id,
+                    'ReadIDs': ';'.join(all_ids),
+                    'UsedReadIDs': ';'.join(used),
+                    'ReadCount': len(subset),
+                    'ReadQC': ';'.join(f'{read.read_id}:{read.status}' for read in subset),
+                    'IncludesFailedRead': 'yes' if any(read.status != 'kept' for read in subset) else 'no',
+                    'UsedReads': candidate_stats.get('used_reads', 0),
+                    'OutputLength': len(candidate_consensus),
+                    'OverlapLength': candidate_stats.get('overlap_length', 0),
+                    'OverlapIdentity': candidate_stats.get('overlap_identity', ''),
+                    'Conflicts': candidate_stats.get('conflicts', 0),
+                    'AmbiguousConflicts': candidate_stats.get('ambiguous_conflicts', ''),
+                    'UnmergedReads': candidate_stats.get('unmerged_reads', ''),
+                    'QCClass': candidate_qc.get('qc_class', 'FAIL_QC'),
+                    'Recommendation': candidate_qc.get('recommendation', 'RESEQUENCE'),
+                    'Reasons': _join_reasons(candidate_qc.get('reasons', [])),
+                })
+                candidate_fasta_records.append((candidate_id, candidate_consensus))
+
+    with open(assembly_candidates_tsv, 'w') as handle:
+        fields = ['SequenceID', 'CandidateID', 'ReadIDs', 'UsedReadIDs', 'ReadCount',
+                  'ReadQC', 'IncludesFailedRead', 'UsedReads', 'OutputLength', 'OverlapLength', 'OverlapIdentity',
+                  'Conflicts', 'AmbiguousConflicts', 'UnmergedReads', 'QCClass',
+                  'Recommendation', 'Reasons']
+        handle.write('\t'.join(fields) + '\n')
+        for row in candidate_rows:
+            handle.write('\t'.join(_clean_field(row.get(field, '')) for field in fields) + '\n')
+    write_fasta(candidate_fasta_records, str(candidate_assemblies_fasta))
 
     with open(assembly_placements_tsv, 'w') as handle:
         handle.write(
@@ -2867,9 +3720,12 @@ def run_paper_trail(
                 read = reads_by_id.get(read_id)
                 start = placement.get('consensus_start')
                 end = placement.get('consensus_end')
+                # Preserve both consensus and read coordinates. The Studio uses
+                # these to render an auditable multiple-read alignment rather
+                # than inferring read positions from summary overlap lengths.
                 segments = ';'.join(
-                    f'{consensus_start + 1}-{consensus_end}'
-                    for consensus_start, consensus_end, _read_start, _read_end
+                    f'{consensus_start + 1}-{consensus_end}:{read_start + 1}-{read_end}'
+                    for consensus_start, consensus_end, read_start, read_end
                     in placement.get('segments', [])
                 )
                 handle.write(
@@ -2884,16 +3740,50 @@ def run_paper_trail(
                     f'{segments}\n'
                 )
 
+
+    # Position-level evidence for the default consensus. Coordinates are 1-based.
+    with open(consensus_evidence_tsv, 'w') as evidence_handle:
+        evidence_handle.write(
+            'SequenceID\tConsensusPosition\tConsensusBase\tSupportingReadCount\t'
+            'SupportingReads\tObservedBases\tDisagreement\tEvidenceClass\n'
+        )
+        for row in assembly_rows:
+            sequence_id = str(row.get('SequenceID', ''))
+            consensus = str(row.get('_ConsensusSequence') or '')
+            group = groups.get(sequence_id, [])
+            placements = row.get('_ReadPlacements') or {}
+            observations: dict[int, list[tuple[str, str]]] = {}
+            for read in group:
+                placement = placements.get(read.read_id, {})
+                sequence = _read_sequence_for_placement(read)
+                for c_start, c_end, r_start, r_end in placement.get('segments', []):
+                    span = min(int(c_end) - int(c_start), int(r_end) - int(r_start))
+                    for offset in range(max(0, span)):
+                        cp, rp = int(c_start) + offset, int(r_start) + offset
+                        if 0 <= cp < len(consensus) and 0 <= rp < len(sequence):
+                            observations.setdefault(cp, []).append((read.read_id, sequence[rp]))
+            for pos, consensus_base in enumerate(consensus):
+                calls = observations.get(pos, [])
+                disagreement, klass = _classify_consensus_observations(calls)
+                evidence_handle.write(
+                    f'{_clean_field(sequence_id)}\t{pos + 1}\t{consensus_base}\t{len(calls)}\t'
+                    f'{_clean_field(";".join(rid for rid, _base in calls))}\t'
+                    f'{_clean_field(";".join(base for _rid, base in calls))}\t'
+                    f'{"yes" if disagreement else "no"}\t{klass}\n'
+                )
+
     write_fasta(assembled_records, str(assembled_fasta))
     failed_qc_dir.mkdir(parents=True, exist_ok=True)
     write_fasta(failed_final_records, str(failed_final_fasta))
     write_fasta(failed_read_records, str(failed_read_fasta))
+    write_fasta(failed_review_candidate_records, str(failed_review_candidates_fasta))
     with open(failed_manifest_tsv, 'w') as handle:
         handle.write(
             'SequenceID\tQCClass\tRecommendation\tStatus\tReasons\tReadCount\t'
             'KeptReadCount\tFailedReadCount\tReadIDs\tKeptReadIDs\tFailedReadIDs\t'
             'SourceFiles\tReadFailureReasons\tOutputLength\tMeanQuality\t'
             'OutputExpectedErrors\tOutputNPercent\tProcessingMode\tSelectedReadID\t'
+            'SelectionSource\tFallbackReason\tRecommendedReadID\tFallbackReadOptions\t'
             'MergeMethod\tBestRecoverableReadID\tBestRecoverableLength\t'
             'BestRecoverableNPercent\n'
         )
@@ -2911,7 +3801,12 @@ def run_paper_trail(
                 f'{row.get("OutputLength", 0)}\t{row.get("MeanQuality", 0.0)}\t'
                 f'{row.get("OutputExpectedErrors", 0.0)}\t{row.get("OutputNPercent", 0.0)}\t'
                 f'{_clean_field(row.get("ProcessingMode", ""))}\t'
-                f'{_clean_field(row.get("SelectedReadID", ""))}\t{_clean_field(row.get("MergeMethod", ""))}\t'
+                f'{_clean_field(row.get("SelectedReadID", ""))}\t'
+                f'{_clean_field(row.get("SelectionSource", ""))}\t'
+                f'{_clean_field(row.get("FallbackReason", ""))}\t'
+                f'{_clean_field(row.get("RecommendedReadID", ""))}\t'
+                f'{_clean_field(row.get("FallbackReadOptions", ""))}\t'
+                f'{_clean_field(row.get("MergeMethod", ""))}\t'
                 f'{_clean_field(row.get("BestRecoverableReadID", ""))}\t'
                 f'{row.get("BestRecoverableLength", 0)}\t'
                 f'{row.get("BestRecoverableNPercent", 0.0):.3f}\n'
@@ -2967,7 +3862,8 @@ def run_paper_trail(
             'TaxonomyConcordance\tTaxonomyComparedRank\tReadTaxonomyAssignments\t'
             'Status\tProcessingMode\tOutputLength\tMeanQuality\tOutputExpectedErrors\t'
             'OutputNPercent\tConflictDensity\tReadCount\tUsedReads\tReadIDs\t'
-            'KeptReadIDs\tFailedReadIDs\tSelectedReadID\tMergeMethod\n'
+            'KeptReadIDs\tFailedReadIDs\tSelectedReadID\tSelectionSource\tFallbackReason\t'
+            'SelectionWarning\tRecommendedReadID\tFallbackReadOptions\tAssemblyStatus\tMergeMethod\n'
         )
         for row in recommendation_rows:
             handle.write(
@@ -2984,43 +3880,119 @@ def run_paper_trail(
                 f'{row.get("ReadCount", 0)}\t{row.get("UsedReads", 0)}\t'
                 f'{_clean_field(row.get("ReadIDs", ""))}\t{_clean_field(row.get("KeptReadIDs", ""))}\t'
                 f'{_clean_field(row.get("FailedReadIDs", ""))}\t{_clean_field(row.get("SelectedReadID", ""))}\t'
-                f'{_clean_field(row.get("MergeMethod", ""))}\n'
+                f'{_clean_field(row.get("SelectionSource", ""))}\t{_clean_field(row.get("FallbackReason", ""))}\t'
+                f'{_clean_field(row.get("SelectionWarning", ""))}\t{_clean_field(row.get("RecommendedReadID", ""))}\t{_clean_field(row.get("FallbackReadOptions", ""))}\t'
+                f'{_clean_field(row.get("AssemblyStatus", ""))}\t{_clean_field(row.get("MergeMethod", ""))}\n'
             )
     with open(marker_review_template_tsv, 'w') as handle:
         handle.write(
             'sequence_id\tdecision\treviewer\treviewed_at\tnotes\treview_type\t'
-            'eligible_for_manual_acceptance\tcandidate_fasta\tqc_class\tqc_reasons\t'
-            'taxonomy_concordance\tread_taxonomy_assignments\toutput_length\tn_percent\n'
+            'eligible_for_manual_acceptance\tcandidate_fasta\tcandidate_source\t'
+            'candidate_read_id\tcandidate_length\tcandidate_n_percent\t'
+            'qc_class\tqc_reasons\ttaxonomy_concordance\tread_taxonomy_assignments\t'
+            'output_length\tn_percent\tread_level_evidence\tquality_status\tmanual_acceptance_basis\t'
+            'manual_acceptance_reason\tminimum_acceptable_length\t'
+            'length_deficit_bp\tprocessing_mode\tassembly_status\toutput_type\t'
+            'fallback_read_options\trecommended_read_id\tselected_read_id\t'
+            'read_selection_source\tfallback_reason\n'
         )
         for row in recommendation_rows:
             recommendation = str(row.get('Recommendation') or '').upper()
             qc_class = str(row.get('QCClass') or '').upper()
             consensus = str(row.get('_ConsensusSequence') or '')
             output_length = len(consensus)
-            output_n_percent = _n_percent(consensus)
-            if recommendation == 'MANUAL_REVIEW':
-                review_type = 'WARNING_REVIEW'
-            elif (
-                qc_class == 'FAIL_QC'
-                and consensus
-                and output_length >= final_min_length
-                and output_n_percent <= float(max_n_percent)
-            ):
-                # Only expose failed consensuses that are long enough and do not
-                # exceed the hard ambiguity ceiling. Short/no-output/high-N
-                # failures cannot be rescued by a review spreadsheet decision.
+            assembly_status = str(row.get('AssemblyStatus') or row.get('Status') or '')
+            processing_mode = str(row.get('ProcessingMode') or '')
+            output_is_individual_read = (
+                processing_mode == 'best_read'
+                or assembly_status in {'single_read', 'best_read', 'partial_no_overlap'}
+            )
+            output_type = 'INDIVIDUAL_READ' if output_is_individual_read else (
+                'CONSENSUS_ASSEMBLY' if consensus else 'NO_SEQUENCE'
+            )
+            candidate_sequence = (
+                str(row.get('_ReviewCandidateSequence') or '')
+                if qc_class == 'FAIL_QC' else consensus
+            )
+            candidate_source = (
+                str(row.get('_ReviewCandidateSource') or 'NO_CANDIDATE')
+                if qc_class == 'FAIL_QC' else (
+                    'BEST_RECOVERABLE_READ' if output_is_individual_read and consensus
+                    else 'FINAL_SEQUENCE' if consensus else 'NO_CANDIDATE'
+                )
+            )
+            candidate_read_id = (
+                str(row.get('_ReviewCandidateReadID') or '') if qc_class == 'FAIL_QC'
+                else str(row.get('SelectedReadID') or '') if output_is_individual_read else ''
+            )
+            candidate_length = len(candidate_sequence)
+            candidate_n_percent = _n_percent(candidate_sequence) if candidate_sequence else None
+            # N% is undefined when there is no final sequence. Do not write 0.0,
+            # which can be mistaken for a clean sequence with zero ambiguous bases.
+            output_n_percent = _n_percent(consensus) if consensus else None
+            read_level_evidence = _read_level_review_evidence(
+                groups.get(str(row.get('SequenceID') or ''), [])
+            )
+            if qc_class == 'FAIL_QC':
+                # Every failed isolate enters the shared review queue. A reviewer
+                # may approve any non-empty candidate, irrespective of its failed
+                # QC metric(s); no candidate means there is nothing to approve.
                 review_type = 'FAILED_QC_REVIEW'
+            elif recommendation == 'MANUAL_REVIEW':
+                review_type = 'WARNING_REVIEW'
             else:
                 continue
-            eligible = bool(consensus and output_length >= final_min_length and output_n_percent <= float(max_n_percent))
-            candidate_path = str(failed_final_fasta) if qc_class == 'FAIL_QC' else str(assembled_fasta)
+
+            if qc_class == 'FAIL_QC':
+                acceptance = _failed_qc_manual_acceptance(
+                    candidate_sequence,
+                    row,
+                    final_min_length=final_min_length,
+                )
+                eligible = bool(acceptance['eligible'])
+                manual_acceptance_basis = str(acceptance['basis'])
+                manual_acceptance_reason = str(acceptance['reason'])
+                minimum_acceptable_length = acceptance['minimum_acceptable_length']
+                length_deficit_bp = acceptance['length_deficit_bp']
+            else:
+                # Warning-level markers retain their existing approval rules.
+                eligible = bool(
+                    consensus
+                    and output_length >= final_min_length
+                    and output_n_percent <= float(max_n_percent)
+                )
+                manual_acceptance_basis = ''
+                manual_acceptance_reason = ''
+                minimum_acceptable_length = ''
+                length_deficit_bp = max(0, final_min_length - output_length)
+
+            candidate_path = str(failed_review_candidates_fasta) if qc_class == 'FAIL_QC' else str(assembled_fasta)
+            if qc_class == 'FAIL_QC' and candidate_source == 'BEST_RECOVERABLE_READ':
+                manual_acceptance_reason = (
+                    str(manual_acceptance_reason).rstrip() + ' '
+                    'This candidate is the best recoverable individual read, not an assembled consensus. '
+                    f'Read ID: {candidate_read_id}. Inspect its chromatogram and read-level QC evidence carefully.'
+                )
             handle.write(
                 f'{_clean_field(row.get("SequenceID", ""))}\t\t\t\t\t{review_type}\t'
-                f'{"yes" if eligible else "no"}\t{_clean_field(candidate_path)}\t{qc_class}\t'
-                f'{_clean_field(row.get("Reasons", ""))}\t'
+                f'{"yes" if eligible else "no"}\t{_clean_field(candidate_path)}\t'
+                f'{_clean_field(candidate_source)}\t{_clean_field(candidate_read_id)}\t'
+                f'{candidate_length}\t{f"{candidate_n_percent:.3f}" if candidate_n_percent is not None else ""}\t'
+                f'{qc_class}\t{_clean_field(row.get("Reasons", ""))}\t'
                 f'{_clean_field(row.get("TaxonomyConcordance", ""))}\t'
                 f'{_clean_field(row.get("ReadTaxonomyAssignments", ""))}\t'
-                f'{row.get("OutputLength", 0)}\t{row.get("OutputNPercent", 0.0)}\n'
+                f'{output_length}\t{f"{output_n_percent:.3f}" if output_n_percent is not None else ""}\t'
+                f'{_clean_field(read_level_evidence)}\t'
+                f'{_clean_field(row.get("QualityStatus", ""))}\t'
+                f'{_clean_field(manual_acceptance_basis)}\t'
+                f'{_clean_field(manual_acceptance_reason)}\t'
+                f'{minimum_acceptable_length}\t{length_deficit_bp}\t'
+                f'{_clean_field(processing_mode)}\t{_clean_field(assembly_status)}\t{_clean_field(output_type)}\t'
+                f'{_clean_field(row.get("FallbackReadOptions", ""))}\t'
+                f'{_clean_field(row.get("RecommendedReadID", ""))}\t'
+                f'{_clean_field(row.get("SelectedReadID", ""))}\t'
+                f'{_clean_field(row.get("SelectionSource", ""))}\t'
+                f'{_clean_field(row.get("FallbackReason", ""))}\n'
             )
     qc_policy_tsv.write_text(
         '\n'.join([
@@ -3036,6 +4008,10 @@ def run_paper_trail(
             f'max_output_expected_errors\t{float(max_output_expected_errors):g}\tMaximum expected errors among called A/C/G/T bases in the final isolate sequence',
             f'warn_n_percent\t{float(warn_n_percent):g}\tPercent N above which a passing read/final sequence requires manual review',
             f'max_n_percent\t{float(max_n_percent):g}\tMaximum percent N allowed before read/final QC failure',
+            'manual_review_template_policy\tall_non_passing\tInclude all FAIL_QC and MANUAL_REVIEW records; eligibility controls approval only',
+            'failed_qc_manual_acceptance_policy\tany_nonempty_candidate\tA reviewer may approve any non-empty FAIL_QC consensus or best-recoverable individual read; QC class and reasons remain unchanged',
+            'read_selection_policy\tlongest_usable_then_quality\tAmong reads passing individual QC, prefer greatest trimmed usable length; mean Phred, mean error probability and N percentage break ties',
+            'no_overlap_fallback_policy\tmanual_or_longest_usable_read\tWhen no qualifying overlap is found, the reviewer-selected read is used when supplied; otherwise the longest usable read is selected and alternatives are listed in the review template',
             f'warn_internal_low_quality_run\t{int(warn_internal_low_quality_run)}\tInternal low-quality/ambiguous run above which manual review is required',
             f'max_internal_low_quality_run\t{int(max_internal_low_quality_run)}\tLongest internal low-quality/ambiguous run allowed before read failure',
             f'max_conflict_density\t{float(max_conflict_density):g}\tMaximum overlap conflicts per 100 final bases before final failure',
@@ -3089,11 +4065,16 @@ def run_paper_trail(
             f'Per-base error profile: {per_base_error_tsv}',
             f'Assembly report: {assembly_tsv}',
             f'Assembly read placements: {assembly_placements_tsv}',
+            f'Assembly overlap candidates: {overlap_candidates_tsv}',
+            f'Alternative assembly candidates: {assembly_candidates_tsv}',
+            f'Alternative assembly FASTA: {candidate_assemblies_fasta}',
+            f'Consensus position evidence: {consensus_evidence_tsv}',
             f'Resequencing recommendations: {recommendations_tsv}',
             f'Marker review template: {marker_review_template_tsv}',
             f'QC policy: {qc_policy_tsv}',
             f'Failed QC final FASTA: {failed_final_fasta}',
             f'Failed QC read FASTA: {failed_read_fasta}',
+            f'Failed QC manual-review candidates FASTA: {failed_review_candidates_fasta}',
             f'Failed isolate manifest: {failed_manifest_tsv}',
             f'Failed read manifest: {failed_read_manifest_tsv}',
             f'Failed QC guide: {failed_qc_guide}',
@@ -3114,12 +4095,17 @@ def run_paper_trail(
         'per_base_error_tsv': str(per_base_error_tsv),
         'assembly_tsv': str(assembly_tsv),
         'assembly_placements_tsv': str(assembly_placements_tsv),
+        'overlap_candidates_tsv': str(overlap_candidates_tsv),
+        'assembly_candidates_tsv': str(assembly_candidates_tsv),
+        'candidate_assemblies_fasta': str(candidate_assemblies_fasta),
+        'consensus_evidence_tsv': str(consensus_evidence_tsv),
         'recommendations_tsv': str(recommendations_tsv),
         'marker_review_template_tsv': str(marker_review_template_tsv),
         'qc_policy_tsv': str(qc_policy_tsv),
         'failed_qc_dir': str(failed_qc_dir),
         'failed_final_fasta': str(failed_final_fasta),
         'failed_read_fasta': str(failed_read_fasta),
+        'failed_review_candidates_fasta': str(failed_review_candidates_fasta),
         'failed_manifest_tsv': str(failed_manifest_tsv),
         'failed_read_manifest_tsv': str(failed_read_manifest_tsv),
         'failed_qc_guide': str(failed_qc_guide),

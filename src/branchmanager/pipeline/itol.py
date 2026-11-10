@@ -406,14 +406,14 @@ def generate_itol_colours(taxonomy_tsv: str, outdir: str, user_colour_csv: str =
                 for p in tdir.glob('*_id_map.tsv'):
                     candidates.append(p)
             except Exception:
-                pass
+                logger.debug('Could not glob ID map files in %s', tdir)
             try:
                 for cand_name in ("filing_cabinet_id_map.tsv", "user_id_map.tsv"):
                     p = out / cand_name
                     if p.exists():
                         candidates.append(p)
             except Exception:
-                pass
+                logger.debug('Could not check output directory %s for ID map files', out)
 
             # Mapping files contain short and original IDs, with an optional header.
             for p in candidates:
@@ -441,8 +441,10 @@ def generate_itol_colours(taxonomy_tsv: str, outdir: str, user_colour_csv: str =
                             id_map[orig] = short
                             id_map[short] = short
                 except Exception:
+                    logger.debug('Could not read ID map file %s', p)
                     continue
         except Exception:
+            logger.debug('Could not discover ID map files near %s', taxonomy_tsv)
             id_map = {}
 
     def _map_id(qid: str):
@@ -456,7 +458,7 @@ def generate_itol_colours(taxonomy_tsv: str, outdir: str, user_colour_csv: str =
                 if k.lower() == lk:
                     return v
             except Exception:
-                continue
+                continue  # key comparison failed; trying next key
         if '|' in qid:
             last = qid.split('|')[-1]
             if last in id_map:
@@ -861,7 +863,7 @@ def generate_itol_colours(taxonomy_tsv: str, outdir: str, user_colour_csv: str =
                         for m in sorted(set(missing)):
                             mf.write(m + '\n')
             except Exception:
-                pass
+                logger.debug('Could not write iTOL missing IDs file')
             return out
 
         ph_pairs_tree = _build_tree_pairs(ph_pairs)

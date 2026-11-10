@@ -8,14 +8,17 @@ Key design decisions
 --------------------
 - Reference anchors (BRANCHMANAGER_REF_* headers) are excluded from output.
 - The taxonomy lookup map is built once at load time for performance.
-- vsearch is run at --id 0.8 minimum identity — this is for taxonomy only.
-  Novelty detection (novelty.py) runs its own separate vsearch at a lower
-  threshold to compute true nearest-neighbour distances.
-- Output columns are database-labeled, e.g. ID  BestHit_GTDB_r232  Identity_GTDB_r232  Taxon_GTDB_r232  Confidence_GTDB_r232
-  Confidence comes from the taxa TSV/CSV when provided (e.g. QIIME2 classifier
-  score, 0–1 scale). When taxonomy is read directly from reference FASTA headers
-  (no --taxa flag), Confidence is derived from the VSEARCH alignment identity
-  (identity / 100), so a 98.5% identity hit yields 0.9850.
+- Taxonomy classification uses a high-stringency production identity/coverage
+  ladder (98/95 down to 90/85), followed by a separately labelled diagnostic
+  ladder ending at the legacy 80/70 sensitivity; diagnostic-only assignments
+  remain explicitly tentative.
+- Taxonomy is assigned by rank-wise dominant consensus across near-best hits;
+  conflicts and assignment support are retained as explicit review evidence.
+  Novelty detection (novelty.py) runs separate nearest-hit and density searches.
+- Output columns are database-labeled. Identity is percent identity across the
+  aligned region. Query/target coverage report how much of each sequence aligned.
+  SourceClassifierConfidence is populated only when a source taxonomy table
+  explicitly supplies a confidence value; it is never inferred from identity.
 """
 
 from __future__ import annotations
@@ -27,10 +30,13 @@ import shlex
 from pathlib import Path
 from typing import Optional
 
+from branchmanager.pipeline.evidence_policy import classification_evidence_interpretation
+from branchmanager.utils.reference import ensure_uncompressed_reference
 from branchmanager.taxonomy import parse_reference_header_taxonomy, reference_lookup_keys
 from branchmanager.taxonomy_io import iter_taxonomy_assignment_rows
 from branchmanager.utils.fasta import read_fasta, write_fasta
 from branchmanager.utils.subprocess import run_cmd
+from branchmanager.pipeline.vsearch_audit import run_vsearch_audited
 from branchmanager.pipeline.tree import is_ref_anchor
 
 logger = logging.getLogger(__name__)
@@ -113,48 +119,14 @@ def _alignment_columns(hit: Optional[dict]) -> list[str]:
     ]
 
 
-# ID normalisation helpers
-
-def _norm_id(x: str) -> str:
-    """
-    Light normalisation: take first whitespace token, prefer last pipe field,
-    strip coordinate suffixes, collapse non-alnum to underscore.
-    """
-    if not x:
-        return ""
-    x = str(x).split()[0]
-    if "|" in x:
-        x = x.split("|")[-1]
-    if "#" in x:
-        x = x.split("#")[0]
-    if ":" in x:
-        x = x.split(":")[0]
-    x = x.strip("()[]{}").strip()
-    x = re.sub(r"[^0-9A-Za-z]+", "_", x).strip("_")
-    return x
-
-
-def _canon_id(x: str) -> str:
-    """
-    Aggressive canonicalisation: remove node fragments, coordinates,
-    prefer last pipe field, collapse to underscore.
-    """
-    if not x:
-        return ""
-    y = str(x).split()[0]
-    if "#" in y:
-        y = y.split("#")[0]
-    y = re.sub(r":\d+-\d+\(.*\)$", "", y)
-    y = re.sub(r":\d+-\d+$", "", y)
-    if "|" in y:
-        y = y.split("|")[-1]
-    y = re.sub(r"[^0-9A-Za-z]+", "_", y).strip("_")
-    return y
+# Re-export consolidated ID normalisation helpers for backward compatibility
+from branchmanager.utils.text import norm_id as _norm_id
+from branchmanager.utils.text import canon_id as _canon_id
 
 
 # Taxonomy map loading
 
-def _load_taxa_map(taxa_tsv: str) -> dict[str, tuple[str, Optional[float]]]:
+def _load_taxa_map(taxa_tsv: str, wanted_ids: Optional[set[str]] = None) -> dict[str, tuple[str, Optional[float]]]:
     """
     Load a taxonomy TSV/CSV into a lookup dict.
 
@@ -171,6 +143,9 @@ def _load_taxa_map(taxa_tsv: str) -> dict[str, tuple[str, Optional[float]]]:
     Returns {key: (taxon_string, confidence_float_or_None)}
     """
     taxa_map: dict[str, tuple[str, Optional[float]]] = {}
+    if wanted_ids is not None and not wanted_ids:
+        logger.info('[CLASSIFY] No matched reference IDs; skipping taxonomy-table scan: %s', taxa_tsv)
+        return taxa_map
 
     try:
         # Log start of taxonomy loading
@@ -181,8 +156,17 @@ def _load_taxa_map(taxa_tsv: str) -> dict[str, tuple[str, Optional[float]]]:
             logger.info("[CLASSIFY] Loading taxonomy map from %s...", taxa_tsv)
 
         rows_loaded = 0
+        wanted_keys = set()
+        if wanted_ids is not None:
+            for wanted in wanted_ids:
+                wanted_keys.update(reference_lookup_keys(wanted))
+                wanted_keys.update((_norm_id(wanted), _canon_id(wanted)))
         for row in iter_taxonomy_assignment_rows(taxa_tsv):
             fid = str(row.get('id', '')).strip()
+            if wanted_ids is not None:
+                candidate_keys = set(reference_lookup_keys(fid)) | {_norm_id(fid), _canon_id(fid)}
+                if not candidate_keys.intersection(wanted_keys):
+                    continue
             tax = str(row.get('taxonomy', '')).strip()
             conf = row.get('confidence')
             _add_taxa_entry(fid, tax, conf, taxa_map)
@@ -196,7 +180,7 @@ def _load_taxa_map(taxa_tsv: str) -> dict[str, tuple[str, Optional[float]]]:
     return taxa_map
 
 
-def _load_taxa_map_from_reference_fasta(ref_fasta: str) -> tuple[dict[str, tuple[str, Optional[float]]], list[dict[str, str]]]:
+def _load_taxa_map_from_reference_fasta(ref_fasta: str, wanted_ids: Optional[set[str]] = None) -> tuple[dict[str, tuple[str, Optional[float]]], list[dict[str, str]]]:
     """Build taxonomy lookups directly from reference FASTA headers.
 
     Supports GTDB 16S headers where the accession is followed by a lineage.
@@ -204,11 +188,22 @@ def _load_taxa_map_from_reference_fasta(ref_fasta: str) -> tuple[dict[str, tuple
     """
     taxa_map: dict[str, tuple[str, Optional[float]]] = {}
     warning_rows = []
+    if wanted_ids is not None and not wanted_ids:
+        return taxa_map, warning_rows
     total = 0
     parsed = 0
+    wanted_keys = set()
+    if wanted_ids is not None:
+        for wanted in wanted_ids:
+            wanted_keys.update(reference_lookup_keys(wanted))
+            wanted_keys.update((_norm_id(wanted), _canon_id(wanted)))
     for header, _ in read_fasta(ref_fasta):
-        total += 1
         ref_id, taxonomy = parse_reference_header_taxonomy(header)
+        if wanted_ids is not None:
+            header_keys = set(reference_lookup_keys(header)) | set(reference_lookup_keys(ref_id or ''))
+            if not header_keys.intersection(wanted_keys):
+                continue
+        total += 1
         if not ref_id or not taxonomy:
             warning_rows.append({
                 'category': 'REFERENCE_HEADER_WITHOUT_TAXONOMY',
@@ -272,66 +267,8 @@ def _lookup_tax(sid: str, taxa_map: dict) -> tuple[Optional[str], Optional[float
 # Reference decompression
 
 def _ensure_uncompressed(ref_fasta: str, outdir: str, out_name: str = "ref_uncompressed.fasta") -> str:
-    """Decompress *ref_fasta* to *outdir/<out_name>* if it is gzipped.
-
-    ``out_name`` is exposed so callers can give each database its own cached
-    filename and avoid different databases overwriting each other's decompressed
-    copy.
-    """
-    if not str(ref_fasta).endswith(".gz"):
-        return ref_fasta
-    ref_unc = os.path.join(outdir, out_name)
-    if os.path.exists(ref_unc):
-        # File already exists - check if it's non-empty
-        try:
-            size = os.path.getsize(ref_unc)
-            if size > 0:
-                logger.info("[CLASSIFY] Using existing decompressed reference: %s (%.1f MB)", ref_unc, size / (1024*1024))
-                return ref_unc
-            else:
-                logger.warning("[CLASSIFY] Existing decompressed file is empty; re-decompressing")
-                os.remove(ref_unc)
-        except Exception as e:
-            logger.warning("[CLASSIFY] Could not check existing file: %s; re-decompressing", e)
-
-    # Get compressed file size for progress estimation
-    import time
-    try:
-        compressed_size = os.path.getsize(ref_fasta)
-        logger.info("[CLASSIFY] Decompressing %s (%.1f MB compressed) → %s",
-                   ref_fasta, compressed_size / (1024*1024), ref_unc)
-        if compressed_size > 100 * 1024 * 1024:  # > 100 MB
-            logger.warning("[CLASSIFY] Large reference file detected (%.1f MB compressed). "
-                          "Decompression may take several minutes depending on disk I/O speed. "
-                          "Please be patient...", compressed_size / (1024*1024))
-    except Exception:
-        logger.info("[CLASSIFY] Decompressing %s → %s", ref_fasta, ref_unc)
-
-    import gzip as _gzip
-    import shutil as _shutil
-    # Decompress using fast byte-level streaming
-    start_time = time.time()
-
-    try:
-        with _gzip.open(ref_fasta, 'rb') as _src, open(ref_unc, 'wb') as _dst:
-            _shutil.copyfileobj(_src, _dst, length=1 << 20)  # 1 MiB buffer
-
-        elapsed = time.time() - start_time
-        final_size = os.path.getsize(ref_unc)
-        final_mb = final_size / (1024 * 1024)
-        logger.info("[CLASSIFY] Decompression complete: %.1f MB written in %.1f seconds (%.1f MB/s)",
-                    final_mb, elapsed, final_mb / elapsed if elapsed > 0 else 0)
-    except Exception as e:
-        logger.error("[CLASSIFY] Decompression failed: %s", e)
-        # Clean up partial file
-        try:
-            if os.path.exists(ref_unc):
-                os.remove(ref_unc)
-        except Exception:
-            pass
-        raise
-
-    return ref_unc
+    """Return a validated, source-specific uncompressed reference cache."""
+    return ensure_uncompressed_reference(ref_fasta, outdir, out_name=out_name)
 
 
 def _iter_taxa_file_rows(taxa_tsv: str):
@@ -363,7 +300,7 @@ def validate_reference_taxonomy_consistency(ref_fasta: Optional[str], taxa_tsv: 
             )
             return warnings
     except Exception:
-        pass  # If we can't get file size, proceed with validation
+        logger.debug('Could not check reference file size; proceeding with validation')
 
     ref_ids = []
     ref_key_to_id = {}
@@ -429,130 +366,13 @@ def run_classification(
     threads: Optional[int] = None,
     db_name: Optional[str] = None,
 ) -> str:
-    """
-    Classify sequences in input_fasta against ref_fasta using VSEARCH.
-
-    Parameters
-    ----------
-    input_fasta  : Query FASTA (QC-filtered, dereplicated)
-    outdir       : Output directory
-    ref_fasta    : Reference FASTA database for VSEARCH search
-    taxa_tsv     : Optional TSV/CSV mapping reference IDs to taxonomy strings.
-                   If omitted, only the best-hit accession is reported.
-    threads      : VSEARCH thread count
-
-    Output
-    ------
-    outdir/taxonomy.tsv  — TSV with database-labeled columns, e.g.:
-        ID  BestHit_GTDB_r232  Identity_GTDB_r232  Taxon_GTDB_r232  Confidence_GTDB_r232
-
-    Reference anchor sequences (BRANCHMANAGER_REF_*) are excluded from output.
-
-    Returns
-    -------
-    Path to taxonomy.tsv
-    """
-    output = os.path.join(outdir, "taxonomy.tsv")
-
-    if ref_fasta is None:
+    """Compatibility entry point using the same adaptive classifier as multi-DB runs."""
+    if not ref_fasta:
         raise ValueError("ref_fasta must be provided to run_classification")
-
-    ref_to_use = _ensure_uncompressed(ref_fasta, outdir)
-
-    taxa_map: dict = {}
-    if taxa_tsv:
-        try:
-            warning_rows = validate_reference_taxonomy_consistency(ref_to_use, taxa_tsv)
-            if warning_rows:
-                warn_path = write_reference_taxonomy_warnings(outdir, warning_rows)
-                logger.warning('[CLASSIFY] Reference/taxonomy consistency warnings written to %s', warn_path)
-        except Exception as e:
-            logger.warning('[CLASSIFY] Failed to validate reference/taxonomy consistency: %s', e)
-        taxa_map = _load_taxa_map(taxa_tsv)
-    else:
-        try:
-            taxa_map, warning_rows = _load_taxa_map_from_reference_fasta(ref_to_use)
-            if warning_rows:
-                warn_path = write_reference_taxonomy_warnings(outdir, warning_rows)
-                logger.warning('[CLASSIFY] Reference-header taxonomy warnings written to %s', warn_path)
-            if taxa_map:
-                logger.info('[CLASSIFY] Using taxonomy parsed directly from reference FASTA headers')
-        except Exception as e:
-            logger.warning('[CLASSIFY] Failed to parse taxonomy from reference FASTA headers: %s', e)
-            taxa_map = {}
-
-    matches_path = os.path.join(outdir, "matches.tsv")
-    thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ""
-
-    safe_query, query_id_map = _vsearch_safe_query(input_fasta, outdir)
-    cmd = (
-        f"vsearch --usearch_global {shlex.quote(str(safe_query))}"
-        f" --db {shlex.quote(str(ref_to_use))}"
-        f" --id 0.8"
-        f" --strand both"
-        f" --userout {shlex.quote(str(matches_path))}"
-        f" --userfields {VSEARCH_USERFIELDS}"
-        f" --maxaccepts 1 --maxhits 1"
-        f" --query_cov 0.7"   # require 70% query coverage
-        f"{thread_flag}"
-    )
-    logger.info("[CLASSIFY] Running vsearch classification")
-    run_cmd(cmd)
-    logger.info("[CLASSIFY] vsearch done → %s", matches_path)
-
-    # Build a dict of all query sequences present in the input FASTA so we
-    # can emit a row for every sequence (including those with no hit).
-    all_query_ids = [
-        h for h, _ in read_fasta(input_fasta)
-        if not is_ref_anchor(h)
-    ]
-
-    # Parse best hits from matches file
-    best_hits: dict[str, dict] = {}
-    try:
-        with open(matches_path) as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split("\t")
-                hit = _parse_vsearch_match(parts)
-                if not hit:
-                    continue
-                # Keep highest identity hit (should only be one since maxhits=1)
-                qid = query_id_map.get(hit['query'], hit['query'])
-                if qid not in best_hits or hit['identity'] > best_hits[qid]['identity']:
-                    best_hits[qid] = hit
-    except FileNotFoundError:
-        logger.warning("[CLASSIFY] matches.tsv not found — classification may have failed")
-
-    # Write output
-    written = 0
-    no_hit = 0
-    with open(output, "w") as out_fh:
-        out_fh.write('\t'.join(_classification_header(db_name or _derive_db_name(ref_fasta))) + '\n')
-        for qid in all_query_ids:
-            if qid not in best_hits:
-                out_fh.write(f"{qid}\tNA\t0.0\tNA\tNA\t" + '\t'.join(_alignment_columns(None)) + "\n")
-                no_hit += 1
-                continue
-            hit = best_hits[qid]
-            sid, pct = hit['target'], hit['identity']
-            tax, conf = _lookup_tax(sid, taxa_map)
-            # Use alignment identity as confidence proxy when the taxa source
-            # has no confidence column (e.g. taxonomy parsed from FASTA headers).
-            if conf is None:
-                conf = round(pct / 100.0, 4)
-            out_fh.write(
-                f"{qid}\t{sid}\t{pct:.2f}"
-                f"\t{tax if tax is not None else 'NA'}"
-                f"\t{conf:.4f}\t" + '\t'.join(_alignment_columns(hit)) + "\n"
-            )
-            written += 1
-
-    logger.info(
-        "[CLASSIFY] %d/%d sequences classified, %d with no hit → %s",
-        written, len(all_query_ids), no_hit, output,
+    output, _results = run_classification_single(
+        input_fasta=input_fasta, outdir=outdir, ref_fasta=ref_fasta,
+        taxa_tsv=taxa_tsv, threads=threads, db_name='main',
+        column_db_name=db_name or 'primary',
     )
     return output
 
@@ -582,8 +402,404 @@ def _classification_header(db_name: str) -> list[str]:
     ]
     return [
         'ID', f'BestHit_{safe}', f'Identity_{safe}', f'Taxon_{safe}',
-        f'Confidence_{safe}', *[f'{metric}_{safe}' for metric in metrics],
+        f'SourceClassifierConfidence_{safe}', *[f'{metric}_{safe}' for metric in metrics],
+        f'AssignmentStatus_{safe}', f'TaxonomySupportPct_{safe}',
+        f'TaxonomyLeadPct_{safe}', f'AssignedRank_{safe}',
+        f'EvidenceTier_{safe}', f'TaxonomyCandidateCount_{safe}',
+        f'AlignmentEvidenceStatus_{safe}', f'AssignmentEvidenceLevel_{safe}',
+        f'EvidenceInterpretation_{safe}',
     ]
+
+
+
+# High-stringency adaptive 16S classification. Each tier is a minimum identity
+# and query-coverage requirement. Only queries with fewer than the required
+# number of distinct candidate references advance to the next tier.
+CLASSIFICATION_SEARCH_TIERS = (
+    (98.0, 95.0),
+    (97.0, 95.0),
+    (96.0, 95.0),
+    (95.0, 95.0),
+    (93.0, 90.0),
+    (90.0, 85.0),
+)
+CLASSIFICATION_MIN_CANDIDATES = 3
+CLASSIFICATION_MAX_ACCEPTS = 20
+CLASSIFICATION_MAX_REJECTS = 256
+CLASSIFICATION_MAX_HITS = 20
+# Diagnostic searches are run only for queries not sufficiently represented by
+# the production ladder. The final tier reproduces the previous background
+# check's sensitivity (80% identity / 70% query coverage) and hit limits.
+DIAGNOSTIC_SEARCH_TIERS = (
+    (90.0, 80.0),
+    (90.0, 75.0),
+    (85.0, 80.0),
+    (85.0, 75.0),
+    (80.0, 70.0),
+)
+LEGACY_DIAGNOSTIC_MAX_ACCEPTS = 10
+LEGACY_DIAGNOSTIC_MAX_HITS = 10
+
+# Conservative rank-wise consensus across near-best 16S reference hits.
+TAXONOMY_CONSENSUS_MIN_SUPPORT = 0.70
+TAXONOMY_CONSENSUS_MIN_LEAD = 0.20
+TAXONOMY_CONSENSUS_MIN_REFERENCES = 3
+
+
+def _run_adaptive_classification_search(
+    safe_query: str, query_id_map: dict[str, str], ref_fasta: str,
+    matches_path: str, outdir: str, db_name: str, threads: Optional[int],
+) -> dict[str, list[dict]]:
+    """Run production and diagnostic VSEARCH tiers for unresolved queries.
+
+    The production ladder is evaluated first. Queries with fewer than
+    CLASSIFICATION_MIN_CANDIDATES distinct references then enter the diagnostic
+    ladder, which ends with the legacy 80% identity / 70% query-coverage search.
+    Diagnostic-only hits remain explicitly labelled and cannot be mistaken for
+    production-supported classifications.
+    """
+    import csv
+    import tempfile
+
+    records = list(read_fasta(safe_query))
+    sequences = dict(records)
+    hits_by_query: dict[str, dict[str, dict]] = {}
+    summary = []
+    thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ""
+    out_path = Path(matches_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix=f'.{out_path.stem}_tiers_', dir=str(out_path.parent)) as temp_dir:
+        root = Path(temp_dir)
+        unresolved = set(sequences)
+        for tier_index, (identity, coverage) in enumerate(CLASSIFICATION_SEARCH_TIERS, 1):
+            if not unresolved:
+                break
+            queries_this_tier = len(unresolved)
+            query_path = root / f'queries_tier_{tier_index}.fasta'
+            raw_path = root / f'hits_tier_{tier_index}.tsv'
+            write_fasta([(qid, sequences[qid]) for qid in sorted(unresolved)], str(query_path))
+            cmd = (
+                f"vsearch --usearch_global {shlex.quote(str(query_path))} "
+                f"--db {shlex.quote(str(ref_fasta))} --id {identity / 100.0:.2f} "
+                f"--query_cov {coverage / 100.0:.2f} --strand both "
+                f"--userout {shlex.quote(str(raw_path))} --userfields {VSEARCH_USERFIELDS} "
+                f"--maxaccepts {CLASSIFICATION_MAX_ACCEPTS} "
+                f"--maxrejects {CLASSIFICATION_MAX_REJECTS} "
+                f"--maxhits {CLASSIFICATION_MAX_HITS}{thread_flag}"
+            )
+            logger.info(
+                '[CLASSIFY][%s][LADDER] tier=%d identity=%.1f%% qcov=%.1f%% queries=%d',
+                db_name, tier_index, identity, coverage, len(unresolved),
+            )
+            run_vsearch_audited(
+                cmd, audit_path=out_path.parent / 'vsearch_search_audit.tsv',
+                stage='A', purpose=f'taxonomic_classification:{db_name}:tier{tier_index}',
+                query_fasta=query_path, reference_fasta=ref_fasta, runner=run_cmd,
+            )
+            tier_hits = 0
+            if raw_path.exists():
+                with raw_path.open(encoding='utf-8', errors='replace') as handle:
+                    for line in handle:
+                        hit = _parse_vsearch_match(line.rstrip('\n').split('\t'))
+                        if hit is not None:
+                            hit['_raw_line'] = line.rstrip('\n')
+                        if not hit or hit['query'] not in unresolved:
+                            continue
+                        qid = hit['query']
+                        target = str(hit.get('target') or '')
+                        if not target:
+                            continue
+                        # Keep the strongest evidence for a repeated target.
+                        previous = hits_by_query.setdefault(qid, {}).get(target)
+                        rank = (hit.get('identity') or 0, hit.get('query_coverage') or 0, hit.get('alignment_length') or 0)
+                        old_rank = (previous.get('identity') or 0, previous.get('query_coverage') or 0, previous.get('alignment_length') or 0) if previous else None
+                        if old_rank is None or rank > old_rank:
+                            hits_by_query[qid][target] = hit
+                        tier_hits += 1
+            resolved_now = 0
+            for qid in list(unresolved):
+                if len(hits_by_query.get(qid, {})) >= CLASSIFICATION_MIN_CANDIDATES:
+                    unresolved.remove(qid)
+                    resolved_now += 1
+            summary.append({
+                'database': db_name, 'tier': tier_index, 'minimum_identity_pct': identity,
+                'minimum_query_coverage_pct': coverage, 'queries_searched': queries_this_tier,
+                'raw_hits': tier_hits, 'queries_resolved_at_tier': resolved_now,
+                'queries_remaining': len(unresolved),
+            })
+            logger.info(
+                '[CLASSIFY][%s][LADDER] tier=%d raw_hits=%d newly_resolved=%d remaining=%d',
+                db_name, tier_index, tier_hits, resolved_now, len(unresolved),
+            )
+
+        # Diagnostic rescue ladder for queries without a qualifying production
+        # hit. These lower thresholds are explicitly diagnostic, not part of the
+        # production assignment policy. Queries stop once three distinct rescue
+        # references have been collected, matching the production candidate rule.
+        diagnostic_unresolved = set(unresolved)
+        for diagnostic_index, (identity, coverage) in enumerate(DIAGNOSTIC_SEARCH_TIERS, 1):
+            if not diagnostic_unresolved:
+                break
+            query_path = root / f'queries_diagnostic_{diagnostic_index}.fasta'
+            raw_path = root / f'hits_diagnostic_{diagnostic_index}.tsv'
+            write_fasta(
+                [(qid, sequences[qid]) for qid in sorted(diagnostic_unresolved)],
+                str(query_path),
+            )
+            # The final 80/70 tier deliberately matches the previous background
+            # check's maxaccepts/maxhits settings as well as its identity/qcov.
+            is_legacy_tier = (identity, coverage) == (80.0, 70.0)
+            max_accepts = LEGACY_DIAGNOSTIC_MAX_ACCEPTS if is_legacy_tier else CLASSIFICATION_MAX_ACCEPTS
+            max_hits = LEGACY_DIAGNOSTIC_MAX_HITS if is_legacy_tier else CLASSIFICATION_MAX_HITS
+            cmd = (
+                f"vsearch --usearch_global {shlex.quote(str(query_path))} "
+                f"--db {shlex.quote(str(ref_fasta))} --id {identity / 100.0:.2f} "
+                f"--query_cov {coverage / 100.0:.2f} --strand both "
+                f"--userout {shlex.quote(str(raw_path))} --userfields {VSEARCH_USERFIELDS} "
+                f"--maxaccepts {max_accepts} --maxrejects {CLASSIFICATION_MAX_REJECTS} "
+                f"--maxhits {max_hits}{thread_flag}"
+            )
+            tier_label = f'DIAGNOSTIC_{int(identity)}_{int(coverage)}'
+            logger.info(
+                '[CLASSIFY][%s][DIAGNOSTIC] tier=%d identity=%.1f%% qcov=%.1f%% queries=%d',
+                db_name, diagnostic_index, identity, coverage, len(diagnostic_unresolved),
+            )
+            run_vsearch_audited(
+                cmd, audit_path=out_path.parent / 'vsearch_search_audit.tsv',
+                stage='A_DIAGNOSTIC',
+                purpose=f'taxonomic_classification_diagnostic:{db_name}:{int(identity)}_{int(coverage)}',
+                query_fasta=query_path, reference_fasta=ref_fasta, runner=run_cmd,
+            )
+            tier_hits = 0
+            if raw_path.exists():
+                with raw_path.open(encoding='utf-8', errors='replace') as handle:
+                    for line in handle:
+                        hit = _parse_vsearch_match(line.rstrip('\n').split('\t'))
+                        if not hit or hit['query'] not in diagnostic_unresolved:
+                            continue
+                        hit['_raw_line'] = line.rstrip('\n')
+                        hit['_evidence_tier'] = tier_label
+                        qid, target = hit['query'], str(hit.get('target') or '')
+                        if not target:
+                            continue
+                        previous = hits_by_query.setdefault(qid, {}).get(target)
+                        rank = (
+                            hit.get('identity') or 0,
+                            hit.get('query_coverage') or 0,
+                            hit.get('alignment_length') or 0,
+                        )
+                        old_rank = (
+                            previous.get('identity') or 0,
+                            previous.get('query_coverage') or 0,
+                            previous.get('alignment_length') or 0,
+                        ) if previous else None
+                        if old_rank is None or rank > old_rank:
+                            hits_by_query[qid][target] = hit
+                        tier_hits += 1
+            resolved_now = 0
+            for qid in list(diagnostic_unresolved):
+                diagnostic_count = sum(
+                    1 for hit in hits_by_query.get(qid, {}).values()
+                    if str(hit.get('_evidence_tier', '')).startswith('DIAGNOSTIC_')
+                )
+                if diagnostic_count >= CLASSIFICATION_MIN_CANDIDATES:
+                    diagnostic_unresolved.remove(qid)
+                    resolved_now += 1
+            summary.append({
+                'database': db_name, 'tier': tier_label,
+                'minimum_identity_pct': identity,
+                'minimum_query_coverage_pct': coverage,
+                'queries_searched': len(diagnostic_unresolved) + resolved_now,
+                'raw_hits': tier_hits,
+                'queries_resolved_at_tier': resolved_now,
+                'queries_remaining': len(diagnostic_unresolved),
+            })
+            logger.info(
+                '[CLASSIFY][%s][DIAGNOSTIC] tier=%d raw_hits=%d newly_resolved=%d remaining=%d',
+                db_name, diagnostic_index, tier_hits, resolved_now, len(diagnostic_unresolved),
+            )
+
+    # Write one combined, headerless VSEARCH userout for compatibility with
+    # existing downstream parsers. Restore original query IDs.
+    with out_path.open('w', encoding='utf-8') as handle:
+        for qsafe, _seq in records:
+            for hit in hits_by_query.get(qsafe, {}).values():
+                raw_line = hit.get('_raw_line')
+                if raw_line:
+                    handle.write(raw_line + '\n')
+
+    summary_path = out_path.with_name(f'classify_search_summary_{re.sub(r"[^A-Za-z0-9]+", "_", db_name)}.tsv')
+    fields = ['database', 'tier', 'minimum_identity_pct', 'minimum_query_coverage_pct', 'queries_searched', 'raw_hits', 'queries_resolved_at_tier', 'queries_remaining']
+    with summary_path.open('w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t')
+        writer.writeheader()
+        writer.writerows(summary)
+    standard_with_hits = sum(
+        any(not str(hit.get('_evidence_tier', '')).startswith('DIAGNOSTIC_') for hit in hits_by_query.get(q, {}).values())
+        for q in sequences
+    )
+    diagnostic_only = sum(
+        bool(hits_by_query.get(q)) and
+        not any(not str(hit.get('_evidence_tier', '')).startswith('DIAGNOSTIC_') for hit in hits_by_query.get(q, {}).values())
+        for q in sequences
+    )
+    no_hits_after_diagnostic = sum(not bool(hits_by_query.get(q)) for q in sequences)
+    logger.info(
+        '[CLASSIFY][%s][LADDER] complete queries=%d standard_hits=%d diagnostic_only=%d no_hits_after_diagnostic=%d summary=%s',
+        db_name, len(records), standard_with_hits, diagnostic_only,
+        no_hits_after_diagnostic, summary_path,
+    )
+
+    # Convert safe query IDs to the original IDs for the caller.
+    return {query_id_map.get(qid, qid): list(targets.values()) for qid, targets in hits_by_query.items()}
+
+def _taxonomy_parts(taxonomy: object) -> list[str]:
+    if taxonomy is None:
+        return []
+    return [part.strip() for part in str(taxonomy).split(';') if part.strip()]
+
+
+def _dominant_taxonomy_consensus(candidates: list[dict], taxa_map: dict) -> dict:
+    """Return the deepest defensible rank and retain conflicts at every rank.
+
+    Conflicts below the reported rank do not invalidate a broader assignment.
+    Strict confidence still requires the existing support, lead and reference
+    diversity thresholds at every rank through species. A plurality supported
+    lineage is retained at the deepest rank with >50% support and a positive
+    lead; unresolved lower ranks are recorded in the conflict ledger.
+    """
+    ranked = []
+    for hit in candidates:
+        tax, _confidence = _lookup_tax(hit.get('target', ''), taxa_map)
+        parts = _taxonomy_parts(tax)
+        if parts:
+            ranked.append((hit, parts))
+    if not ranked:
+        return {'taxonomy': None, 'status': 'UNRESOLVED', 'support': 0.0,
+                'lead': 0.0, 'rank': '', 'conflicts': [], 'near_best_count': 0,
+                'strict_rank': '', 'candidate_taxonomy': None}
+
+    selected, conflicts, rank_evidence = [], [], []
+    parent_subset = ranked
+    strict_rank = ''
+    rank_names = ('domain', 'phylum', 'class', 'order', 'family', 'genus', 'species')
+    max_depth = max(len(parts) for _hit, parts in ranked)
+
+    for index in range(max_depth):
+        available = [(hit, parts) for hit, parts in parent_subset if len(parts) > index]
+        if not available:
+            break
+        counts, refs = {}, {}
+        for hit, parts in available:
+            lineage = parts[index]
+            counts[lineage] = counts.get(lineage, 0) + 1
+            refs.setdefault(lineage, set()).add(str(hit.get('target') or ''))
+
+        top_lineage = next((parts[index] for _hit, parts in available), None)
+        winner_count = max(counts.values())
+        tied = {taxon for taxon, count in counts.items() if count == winner_count}
+        winner = top_lineage if top_lineage in tied else sorted(tied)[0]
+        ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        runner_count = max((count for taxon, count in counts.items() if taxon != winner), default=0)
+        denominator = len(available)
+        support = winner_count / denominator
+        lead = (winner_count - runner_count) / denominator
+        distinct_refs = len({ref for ref in refs[winner] if ref})
+        rank_name = rank_names[index] if index < len(rank_names) else f'rank_{index + 1}'
+        strict = (support >= TAXONOMY_CONSENSUS_MIN_SUPPORT
+                  and lead >= TAXONOMY_CONSENSUS_MIN_LEAD
+                  and distinct_refs >= TAXONOMY_CONSENSUS_MIN_REFERENCES)
+        rank_evidence.append({
+            'rank': rank_name, 'taxon': winner, 'support': support,
+            'lead': lead, 'distinct_refs': distinct_refs, 'strict': strict,
+            'contested': len(ordered) > 1,
+        })
+        if strict:
+            strict_rank = rank_name
+        if len(ordered) > 1:
+            runner = max(
+                (taxon for taxon, count in counts.items() if taxon != winner and count == runner_count),
+                key=lambda taxon: next((i for i, (_hit, parts) in enumerate(available)
+                                        if parts[index] == taxon), len(available)),
+            )
+            conflicts.append({
+                'rank': rank_name, 'dominant_taxon': winner,
+                'dominant_support_pct': 100.0 * support,
+                'runner_up_taxon': runner,
+                'runner_up_support_pct': 100.0 * runner_count / denominator,
+                'lead_pct_points': 100.0 * lead,
+                'distinct_supporting_references': distinct_refs,
+                'candidate_count': denominator,
+            })
+        selected.append(winner)
+        parent_subset = [(hit, parts) for hit, parts in available if parts[index] == winner]
+
+    # Report the deepest rank with an actual majority and positive lead.
+    supported_depth = 0
+    for index, evidence in enumerate(rank_evidence):
+        if evidence['support'] >= 0.5 and evidence['lead'] > 0:
+            supported_depth = index + 1
+        else:
+            break
+    if supported_depth == 0:
+        supported_depth = 1  # retain the top-hit domain as a broad provisional call
+    reported = selected[:supported_depth]
+    reported_evidence = rank_evidence[supported_depth - 1]
+    reported_rank = reported_evidence['rank']
+    # Use the actual rank-evidence order rather than the fixed standard
+    # taxonomy tuple. This also supports additional ranks represented as
+    # rank_8, rank_9, etc.
+    rank_positions = {
+        evidence['rank']: index
+        for index, evidence in enumerate(rank_evidence)
+    }
+
+    conflicts_at_or_above = [
+        item for item in conflicts
+        if rank_positions.get(item['rank'], len(rank_evidence)) < supported_depth
+        or (
+            supported_depth == 1
+            and rank_positions.get(item['rank'], len(rank_evidence)) == 1
+        )
+    ]
+    if reported_rank == 'species' and all(item['strict'] for item in rank_evidence[:supported_depth]):
+        status = 'CONFIDENT'
+    elif conflicts_at_or_above:
+        status = 'CONTESTED'
+    else:
+        status = 'PROVISIONAL'
+    return {
+        'taxonomy': ';'.join(reported) if reported else None,
+        'candidate_taxonomy': ';'.join(selected) if selected else None,
+        'status': status,
+        'support': reported_evidence['support'],
+        'lead': reported_evidence['lead'],
+        'rank': reported_rank,
+        'conflicts': conflicts,
+        'near_best_count': len(ranked),
+        'strict_rank': strict_rank,
+    }
+
+
+def _diagnostic_hit_reason(candidates: list[dict]) -> str:
+    """Explain why no diagnostic candidate meets the production 90%/85% floor."""
+    if not candidates:
+        return 'NO_HIT_AT_DIAGNOSTIC_FLOOR'
+    has_identity = any(float(h.get('identity') or 0.0) >= 90.0 for h in candidates)
+    has_coverage = any(float(h.get('query_coverage') or 0.0) >= 85.0 for h in candidates)
+    has_joint = any(
+        float(h.get('identity') or 0.0) >= 90.0
+        and float(h.get('query_coverage') or 0.0) >= 85.0
+        for h in candidates
+    )
+    if has_joint:
+        return 'MEETS_PRODUCTION_FLOOR_DIAGNOSTIC_ONLY'
+    if has_identity and not has_coverage:
+        return 'QUERY_COVERAGE_LIMITED'
+    if has_coverage and not has_identity:
+        return 'IDENTITY_LIMITED'
+    return 'IDENTITY_AND_COVERAGE_LIMITED'
 
 
 def run_classification_single(
@@ -599,25 +815,25 @@ def run_classification_single(
 
     Parameters
     ----------
-    db_name : Label for this database.  When ``'main'``, outputs are written
-              to ``taxonomy.tsv`` / ``matches.tsv`` (the canonical filenames
-              expected by downstream code).  Any other name uses
+    db_name : Explicit label for this database. Named databases write
               ``taxonomy_<db_name>.tsv`` / ``matches_<db_name>.tsv``.
+              The special ``'main'`` label retains legacy filenames for direct callers.
 
     Returns
     -------
     (tsv_path, results_dict) where
-    results_dict = {qid: (hit_id, pct_identity, taxon, confidence)}
+    results_dict = {qid: (hit_id, pct_identity, taxon, source_classifier_confidence, alignment metrics, taxonomy status and evidence interpretation)}
     """
     import re as _re
 
+    safe_db_name = _re.sub(r'[^A-Za-z0-9]+', '_', str(db_name)).strip('_') or 'primary'
     if db_name == 'main':
+        # Legacy direct-call compatibility; multi-database runs use explicit names.
         tsv_name = 'taxonomy.tsv'
         match_name = 'matches.tsv'
     else:
-        safe = _re.sub(r'[^A-Za-z0-9]+', '_', db_name).strip('_')
-        tsv_name = f'taxonomy_{safe}.tsv'
-        match_name = f'matches_{safe}.tsv'
+        tsv_name = f'taxonomy_{safe_db_name}.tsv'
+        match_name = f'matches_{safe_db_name}.tsv'
 
     output = os.path.join(outdir, tsv_name)
     matches_path = os.path.join(outdir, match_name)
@@ -627,68 +843,209 @@ def run_classification_single(
     if db_name == 'main':
         decomp_name = 'ref_uncompressed.fasta'
     else:
-        safe_decomp = _re.sub(r'[^A-Za-z0-9]+', '_', db_name).strip('_')
-        decomp_name = f'ref_uncompressed_{safe_decomp}.fasta'
+        decomp_name = f'ref_uncompressed_{safe_db_name}.fasta'
     ref_to_use = _ensure_uncompressed(ref_fasta, outdir, out_name=decomp_name)
 
-    # Build taxa lookup map.
-    # When a --alt-taxa TSV/CSV is supplied it is used directly; otherwise taxonomy
-    # is parsed from the reference FASTA headers (GTDB-style lineage strings).
+    import time
+    import resource
+    started = time.monotonic()
+    try:
+        input_bytes = os.path.getsize(input_fasta)
+    except OSError:
+        input_bytes = -1
+    try:
+        ref_bytes = os.path.getsize(ref_to_use)
+    except OSError:
+        ref_bytes = -1
+    logger.info('[CLASSIFY][%s][DIAG] START pid=%d input=%s input_bytes=%d ref=%s ref_bytes=%d taxa=%s threads=%s',
+                db_name, os.getpid(), input_fasta, input_bytes, ref_to_use, ref_bytes,
+                taxa_tsv or 'FASTA_HEADERS', threads)
+
+    # Search first at high stringency. Taxonomy is loaded afterwards and can be
+    # restricted to the reference IDs actually returned by VSEARCH.
+    safe_query, query_id_map = _vsearch_safe_query(input_fasta, outdir)
+    logger.info('[CLASSIFY][%s][DIAG] SAFE_QUERY_READY records=%d path=%s', db_name, len(query_id_map), safe_query)
+    logger.info('[CLASSIFY][%s][DIAG] VSEARCH_LADDER_START output=%s', db_name, matches_path)
+    hits_by_query = _run_adaptive_classification_search(
+        safe_query, query_id_map, ref_to_use, matches_path, outdir, db_name, threads,
+    )
+    logger.info('[CLASSIFY][%s][DIAG] VSEARCH_LADDER_COMPLETE elapsed=%.2fs output_exists=%s', db_name, time.monotonic() - started, os.path.exists(matches_path))
+    all_query_ids = [h for h, _ in read_fasta(input_fasta) if not is_ref_anchor(h)]
+    matched_target_ids = {hit['target'] for candidates in hits_by_query.values() for hit in candidates}
     taxa_map: dict = {}
     if taxa_tsv:
-        logger.info("[CLASSIFY][%s] Loading taxa map from table: %s", db_name, taxa_tsv)
-        taxa_map = _load_taxa_map(taxa_tsv)
+        logger.info('[CLASSIFY][%s] Loading taxonomy only for %d matched reference IDs from %s', db_name, len(matched_target_ids), taxa_tsv)
+        taxa_map = _load_taxa_map(taxa_tsv, wanted_ids=matched_target_ids)
     else:
         try:
-            taxa_map, warning_rows = _load_taxa_map_from_reference_fasta(ref_to_use)
-            if taxa_map:
-                logger.info(
-                    "[CLASSIFY][%s] Parsed taxonomy from %d reference FASTA headers",
-                    db_name, len(taxa_map) // 3,
-                )
+            taxa_map, warning_rows = _load_taxa_map_from_reference_fasta(ref_to_use, wanted_ids=matched_target_ids)
             if warning_rows:
                 warn_path = write_reference_taxonomy_warnings(outdir, warning_rows)
-                logger.warning("[CLASSIFY][%s] Reference-header taxonomy warnings → %s", db_name, warn_path)
+                logger.warning('[CLASSIFY][%s] Reference-header taxonomy warnings → %s', db_name, warn_path)
         except Exception as e:
-            logger.warning("[CLASSIFY][%s] Could not parse taxa from FASTA headers: %s", db_name, e)
+            logger.warning('[CLASSIFY][%s] Could not parse matched reference taxonomy: %s', db_name, e)
+    logger.info('[CLASSIFY][%s][DIAG] TAXA_MAP_READY entries=%d elapsed=%.2fs', db_name, len(taxa_map), time.monotonic() - started)
 
-    # Run vsearch
-    thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ""
-    safe_query, query_id_map = _vsearch_safe_query(input_fasta, outdir)
-    cmd = (
-        f"vsearch --usearch_global {shlex.quote(str(safe_query))}"
-        f" --db {shlex.quote(str(ref_to_use))}"
-        f" --id 0.8"
-        f" --strand both"
-        f" --userout {shlex.quote(str(matches_path))}"
-        f" --userfields {VSEARCH_USERFIELDS}"
-        f" --maxaccepts 1 --maxhits 1"
-        f" --query_cov 0.7"
-        f"{thread_flag}"
-    )
-    logger.info("[CLASSIFY] Running vsearch for db=%s", db_name)
-    run_cmd(cmd)
-    logger.info("[CLASSIFY] vsearch done for db=%s → %s", db_name, matches_path)
+    # Retain multiple candidate hits, rank them deterministically, and preserve
+    # supporting evidence. VSEARCH's first accepted hit is not definitive.
 
-    all_query_ids = [h for h, _ in read_fasta(input_fasta) if not is_ref_anchor(h)]
+    def _rank_hit(hit):
+        return (
+            float(hit.get('identity') or 0.0),
+            float(hit.get('query_coverage') or 0.0),
+            int(hit.get('alignment_length') or 0),
+            str(hit.get('target') or ''),
+        )
 
-    # Parse best hits from matches file
     best_hits: dict[str, dict] = {}
-    try:
-        with open(matches_path) as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split("\t")
-                hit = _parse_vsearch_match(parts)
-                if not hit:
-                    continue
-                qid = query_id_map.get(hit['query'], hit['query'])
-                if qid not in best_hits or hit['identity'] > best_hits[qid]['identity']:
-                    best_hits[qid] = hit
-    except FileNotFoundError:
-        logger.warning("[CLASSIFY][%s] matches file not found", db_name)
+    consensus_by_query: dict[str, dict] = {}
+    support_path = os.path.join(outdir, f"classification_supporting_hits_{safe_db_name}.tsv")
+    conflicts_path = os.path.join(outdir, f"taxonomy_conflicts_{safe_db_name}.tsv")
+    with open(support_path, "w", encoding='utf-8') as support_fh:
+        support_fh.write("Query\tRank\tTarget\tIdentity\tQueryCoverage\tTargetCoverage\tAlignmentLength\tTaxonomy\tNearBest\tEvidenceTier\n")
+        for qid, candidates in hits_by_query.items():
+            candidates.sort(key=_rank_hit, reverse=True)
+            standard_candidates = [
+                h for h in candidates
+                if not str(h.get('_evidence_tier', '')).startswith('DIAGNOSTIC_')
+            ]
+            # Diagnostic hits may be retained as supporting/audit evidence,
+            # but they must never displace a production-ladder hit or alter
+            # the production-supported taxonomy consensus for that query.
+            assignment_candidates = standard_candidates or candidates
+            best_hits[qid] = assignment_candidates[0]
+            best_identity = float(assignment_candidates[0].get('identity') or 0.0)
+            near_best = [
+                h for h in assignment_candidates
+                if float(h.get('identity') or 0.0) >= best_identity - 1.0
+            ]
+            consensus_by_query[qid] = _dominant_taxonomy_consensus(near_best, taxa_map)
+            if not standard_candidates:
+                # A tentative lineage can be useful, but it must never be
+                # presented as equivalent to a hit meeting the production floor.
+                consensus_by_query[qid]['status'] = 'LOW_SIMILARITY'
+            near_targets = {str(h.get('target') or '') for h in near_best}
+            for rank, hit in enumerate(candidates, 1):
+                candidate_tax, _tax_conf = _lookup_tax(hit['target'], taxa_map)
+                support_fh.write(
+                    f"{qid}\t{rank}\t{hit['target']}\t{hit['identity']:.2f}\t"
+                    f"{hit.get('query_coverage') if hit.get('query_coverage') is not None else 'NA'}\t"
+                    f"{hit.get('target_coverage') if hit.get('target_coverage') is not None else 'NA'}\t"
+                    f"{hit.get('alignment_length') if hit.get('alignment_length') is not None else 'NA'}\t"
+                    f"{candidate_tax or 'NA'}\t{'YES' if str(hit.get('target') or '') in near_targets else 'NO'}\t{hit.get('_evidence_tier', 'STANDARD_LADDER')}\n"
+                )
+
+    with open(conflicts_path, 'w', encoding='utf-8') as conflict_fh:
+        conflict_fh.write('Query\tAssignmentStatus\tReportedTaxonomy\tAssignedRank\tConflictRank\tDominantTaxon\tDominantSupportPct\tRunnerUpTaxon\tRunnerUpSupportPct\tLeadPctPoints\tDistinctSupportingReferences\tCandidateCount\n')
+        for qid, consensus in consensus_by_query.items():
+            for conflict in consensus['conflicts']:
+                conflict_fh.write(
+                    f"{qid}\t{consensus['status']}\t{consensus['taxonomy'] or 'NA'}\t"
+                    f"{consensus['rank'] or 'NA'}\t{conflict['rank']}\t{conflict['dominant_taxon']}\t"
+                    f"{conflict['dominant_support_pct']:.2f}\t{conflict['runner_up_taxon']}\t"
+                    f"{conflict['runner_up_support_pct']:.2f}\t{conflict['lead_pct_points']:.2f}\t"
+                    f"{conflict['distinct_supporting_references']}\t{conflict['candidate_count']}\n"
+                )
+    logger.info('[CLASSIFY][%s] Supporting hits → %s; taxonomy conflicts/review → %s',
+                db_name, support_path, conflicts_path)
+
+    logger.info('[CLASSIFY][%s][DIAG] MATCH_PARSE_COMPLETE queries_with_hits=%d candidate_hits=%d', db_name, len(best_hits), sum(map(len, hits_by_query.values())))
+
+    # A successful VSEARCH match is not a successful taxonomic assignment.
+    # Fail explicitly if every matched reference lacks a taxonomy lookup; this
+    # prevents malformed/unsupported header formats (as previously happened
+    # with SILVA) from silently producing an all-NA taxonomy table.
+    # Count a query as taxonomically supported when any retained candidate
+    # maps to taxonomy; the top-scoring accession itself may lack a taxonomy
+    # row while another near-best accession is correctly mapped.
+    taxonomic_hits = sum(
+        1 for candidates in hits_by_query.values()
+        if any(_lookup_tax(hit.get('target', ''), taxa_map)[0] is not None for hit in candidates)
+    )
+    logger.info(
+        '[CLASSIFY][%s][DIAG] TAXONOMY_LOOKUP_SUMMARY matched_hits=%d taxonomic_hits=%d missing_taxonomy=%d taxa_map_entries=%d',
+        db_name, len(best_hits), taxonomic_hits,
+        max(0, len(best_hits) - taxonomic_hits), len(taxa_map),
+    )
+    if best_hits and taxonomic_hits == 0:
+        message = (
+            f'{db_name}: VSEARCH returned {len(best_hits)} hit(s), but none could '
+            'be mapped to taxonomy. Check the reference-header parser or taxa file; '
+            'refusing to report this database as successfully classified.'
+        )
+        logger.error('[CLASSIFY][%s][DIAG] TAXONOMY_LOOKUP_FAILED %s', db_name, message)
+        raise RuntimeError(message)
+    if best_hits and taxonomic_hits < len(best_hits):
+        logger.warning(
+            '[CLASSIFY][%s] Taxonomy missing for %d/%d VSEARCH hits (%.1f%%).',
+            db_name, len(best_hits) - taxonomic_hits, len(best_hits),
+            100.0 * (len(best_hits) - taxonomic_hits) / len(best_hits),
+        )
+
+    diagnostic_path = os.path.join(outdir, f"classification_diagnostics_{safe_db_name}.tsv")
+    with open(diagnostic_path, 'w', encoding='utf-8') as diagnostic_fh:
+        diagnostic_fh.write(
+            'Query\tSearchDiagnosticStatus\tAssignmentDiagnosticStatus\t'
+            'BestHit\tBestIdentityPct\tBestQueryCoveragePct\tBestTargetCoveragePct\t'
+            'AlignmentLength\tQueryLength\tTargetLength\tAssignedTaxonomy\tAssignedRank\t'
+            'CandidateCount\tEvidenceTier\tAssignmentStatus\tTaxonomySupportPct\t'
+            'AlignmentEvidenceStatus\tAssignmentEvidenceLevel\tEvidenceInterpretation\n'
+        )
+        for qid in all_query_ids:
+            candidates = hits_by_query.get(qid, [])
+            diagnostic_candidates = [h for h in candidates if str(h.get('_evidence_tier', '')).startswith('DIAGNOSTIC_')]
+            standard_candidates = [h for h in candidates if not str(h.get('_evidence_tier', '')).startswith('DIAGNOSTIC_')]
+            if standard_candidates:
+                best = sorted(standard_candidates, key=_rank_hit, reverse=True)[0]
+                reason, evidence = 'STANDARD_LADDER_HIT', 'STANDARD_LADDER'
+            elif diagnostic_candidates:
+                best = sorted(diagnostic_candidates, key=_rank_hit, reverse=True)[0]
+                reason = _diagnostic_hit_reason(diagnostic_candidates)
+                evidence = str(best.get('_evidence_tier') or 'DIAGNOSTIC_RESCUE')
+            else:
+                best, reason, evidence = None, 'NO_HIT_AT_DIAGNOSTIC_FLOOR', 'NONE'
+            consensus = consensus_by_query.get(qid, {})
+            assigned_taxonomy = consensus.get('taxonomy') or 'NA'
+            assigned_rank = consensus.get('rank') or 'NA'
+            if reason == 'NO_HIT_AT_DIAGNOSTIC_FLOOR':
+                assignment_reason = 'NO_TAXONOMIC_ASSIGNMENT_NO_REFERENCE_HIT'
+            elif reason != 'STANDARD_LADDER_HIT':
+                if not best or _lookup_tax(best.get('target', ''), taxa_map)[0] is None:
+                    assignment_reason = 'DIAGNOSTIC_HIT_TAXONOMY_UNMAPPED'
+                else:
+                    assignment_reason = 'LOW_SIMILARITY_TENTATIVE_ASSIGNMENT'
+            elif consensus.get('status') == 'UNRESOLVED':
+                mapped_taxonomies = [
+                    _lookup_tax(hit.get('target', ''), taxa_map)[0]
+                    for hit in candidates
+                ]
+                assignment_reason = (
+                    'TAXONOMY_LOOKUP_FAILED'
+                    if not any(value is not None for value in mapped_taxonomies)
+                    else 'TAXONOMY_LINEAGE_UNRESOLVED'
+                )
+            elif consensus.get('status') == 'CONTESTED':
+                assignment_reason = 'ADEQUATE_ALIGNMENT_CONSENSUS_CONTESTED'
+            else:
+                assignment_reason = 'ADEQUATE_ALIGNMENT_TAXONOMIC_ASSIGNMENT'
+            diagnostic_fh.write(
+                f"{qid}\t{reason}\t{assignment_reason}\t"
+                f"{best.get('target') if best else 'NA'}\t"
+                f"{best.get('identity', 'NA') if best else 'NA'}\t"
+                f"{best.get('query_coverage', 'NA') if best else 'NA'}\t"
+                f"{best.get('target_coverage', 'NA') if best else 'NA'}\t"
+                f"{best.get('alignment_length', 'NA') if best else 'NA'}\t"
+                f"{best.get('query_length', 'NA') if best else 'NA'}\t"
+                f"{best.get('target_length', 'NA') if best else 'NA'}\t"
+                f"{assigned_taxonomy}\t{assigned_rank}\t"
+                f"{consensus.get('near_best_count', len(candidates))}\t{evidence}\t"
+                f"{consensus.get('status', 'UNRESOLVED')}\t"
+                f"{float(consensus.get('support') or 0.0) * 100.0:.2f}\t"
+                f"{'NOT_ASSESSED' if not best else classification_evidence_interpretation(best.get('identity'), best.get('query_coverage'), best.get('target_coverage'), evidence_tier=evidence, assignment_status=consensus.get('status'), candidate_count=consensus.get('near_best_count'), alignment_length=best.get('alignment_length'), query_length=best.get('query_length'), target_length=best.get('target_length'))['alignment_evidence_status']}\t"
+                f"{'UNRESOLVED' if not best else classification_evidence_interpretation(best.get('identity'), best.get('query_coverage'), best.get('target_coverage'), evidence_tier=evidence, assignment_status=consensus.get('status'), candidate_count=consensus.get('near_best_count'), alignment_length=best.get('alignment_length'), query_length=best.get('query_length'), target_length=best.get('target_length'))['assignment_evidence_level']}\t"
+                f"{'insufficient alignment evidence' if not best else classification_evidence_interpretation(best.get('identity'), best.get('query_coverage'), best.get('target_coverage'), evidence_tier=evidence, assignment_status=consensus.get('status'), candidate_count=consensus.get('near_best_count'), alignment_length=best.get('alignment_length'), query_length=best.get('query_length'), target_length=best.get('target_length'))['evidence_interpretation']}\n"
+            )
+    logger.info('[CLASSIFY][%s] Per-query diagnostic summary → %s', db_name, diagnostic_path)
 
     results: dict = {}
     written = 0
@@ -697,27 +1054,58 @@ def run_classification_single(
         out_fh.write('\t'.join(_classification_header(column_db_name or (db_name if db_name != 'main' else 'primary'))) + '\n')
         for qid in all_query_ids:
             if qid not in best_hits:
-                out_fh.write(f"{qid}\tNA\t0.0\tNA\tNA\t" + '\t'.join(_alignment_columns(None)) + "\n")
-                results[qid] = ('NA', 0.0, 'NA', 'NA', None, None, None, None, None, None, None)
+                out_fh.write(f"{qid}\tNA\tNA\tNA\tNA\t" + '\t'.join(_alignment_columns(None)) + "\tUNRESOLVED\t0.00\t0.00\tNA\tNONE\t0\tNOT_ASSESSED\tUNRESOLVED\tinsufficient alignment evidence\n")
+                results[qid] = ('NA', 0.0, 'NA', None, None, None, None, None, None, None, None, 'UNRESOLVED', 0.0, 0.0, 'NA', 'NONE', 0, 'NOT_ASSESSED', 'UNRESOLVED', 'insufficient alignment evidence')
                 no_hit += 1
                 continue
             hit = best_hits[qid]
             sid, pct = hit['target'], hit['identity']
-            tax, conf = _lookup_tax(sid, taxa_map)
-            if conf is None:
-                conf = round(pct / 100.0, 4)
+            _top_tax, conf = _lookup_tax(sid, taxa_map)
+            consensus = consensus_by_query.get(qid, {'taxonomy': None, 'status': 'UNRESOLVED', 'support': 0.0, 'lead': 0.0, 'rank': ''})
+            tax = consensus.get('taxonomy')
+            # A missing source classifier confidence stays missing. Never
+            # substitute percent identity: identity is not a probability.
             tax_str = tax if tax is not None else 'NA'
+            status = consensus.get('status', 'UNRESOLVED')
+            support_pct = float(consensus.get('support') or 0.0) * 100.0
+            lead_pct = float(consensus.get('lead') or 0.0) * 100.0
+            assigned_rank = consensus.get('rank') or 'NA'
+            if status != 'CONFIDENT':
+                logger.warning(
+                    '[CLASSIFY][%s] Query %s assignment=%s taxonomy=%s support=%.1f%% lead=%.1fpp rank=%s; review=%s',
+                    db_name, qid, status, tax_str, support_pct, lead_pct, assigned_rank, conflicts_path,
+                )
+            evidence_tier = str(hit.get('_evidence_tier') or 'STANDARD_LADDER')
+            evidence_summary = classification_evidence_interpretation(
+                pct, hit.get('query_coverage'), hit.get('target_coverage'),
+                evidence_tier=evidence_tier, assignment_status=status,
+                candidate_count=consensus.get('near_best_count', len(consensus_by_query.get(qid, {}).get('conflicts', []))),
+                alignment_length=hit.get('alignment_length'),
+                query_length=hit.get('query_length'),
+                target_length=hit.get('target_length'),
+            )
+            candidate_count = int(consensus.get('near_best_count', 0) or 0)
+            source_confidence = f'{float(conf):.4f}' if conf is not None else 'NA'
+            interpretation = evidence_summary['evidence_interpretation'].replace('\t', ' ').replace('\n', ' ')
             out_fh.write(
-                f"{qid}\t{sid}\t{pct:.2f}\t{tax_str}\t{conf:.4f}\t"
-                + '\t'.join(_alignment_columns(hit)) + "\n"
+                f"{qid}\t{sid}\t{pct:.2f}\t{tax_str}\t{source_confidence}\t"
+                + '\t'.join(_alignment_columns(hit))
+                + f"\t{status}\t{support_pct:.2f}\t{lead_pct:.2f}\t{assigned_rank}"
+                + f"\t{evidence_tier}\t{candidate_count}\t{evidence_summary['alignment_evidence_status']}"
+                + f"\t{evidence_summary['assignment_evidence_level']}\t{interpretation}\n"
             )
             results[qid] = (
                 sid, pct, tax_str, conf, hit.get('query_coverage'), hit.get('target_coverage'),
                 hit.get('alignment_length'), hit.get('query_length'), hit.get('target_length'),
-                hit.get('mismatches'), hit.get('gaps'),
+                hit.get('mismatches'), hit.get('gaps'), status, support_pct, lead_pct, assigned_rank,
+                evidence_tier, candidate_count, evidence_summary['alignment_evidence_status'],
+                evidence_summary['assignment_evidence_level'], interpretation,
             )
             written += 1
 
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    logger.info('[CLASSIFY][%s][DIAG] OUTPUT_COMPLETE written=%d no_hit=%d results=%d elapsed=%.2fs maxrss=%s',
+                db_name, written, no_hit, len(results), time.monotonic() - started, usage.ru_maxrss)
     logger.info(
         "[CLASSIFY][%s] %d/%d sequences classified, %d with no hit → %s",
         db_name, written, len(all_query_ids), no_hit, output,
@@ -743,39 +1131,50 @@ def run_all_classifications(
     primary_taxa  : Optional taxa TSV/CSV for the primary reference.
     primary_name  : Display name for the primary database (default ``'main'``).
     alt_refs      : List of ``(ref_fasta, taxa_table_or_None, db_name)`` tuples.
-    main_db       : Which database (by name) should be written to the canonical
-                    ``taxonomy.tsv``.  Defaults to *primary_name*.
+    main_db       : Authoritative database name used to order the merged table.
+                    Every database retains its explicit name in its output filename.
 
     Returns
     -------
     (primary_taxonomy_tsv, all_results)
-    where ``all_results`` = ``{db_name: {qid: (hit, pct, tax, conf)}}``.
+    where ``all_results`` retains hit identity, source-provided classifier confidence (if any), alignment metrics, taxonomy consensus, and evidence interpretation.
 
     Side effects
     ------------
-    * ``taxonomy.tsv``                   - main DB
-    * ``taxonomy_<name>.tsv``            – one file per additional DB
-    * ``taxonomy_all_dbs.tsv``           – wide merged table (multi-DB only)
+    * ``taxonomy_<name>.tsv``            – one file per database, including primary
+    * ``matches_<name>.tsv``              – raw VSEARCH matches per database
+    * ``taxonomy_all_dbs.tsv``            – wide merged table (multi-DB only)
     """
+    # Older callers may omit primary_name. Resolve that to a meaningful
+    # reference-derived label rather than reintroducing generic 'main' output.
+    if primary_name == 'main':
+        primary_name = _derive_db_name(primary_ref)
     effective_main = main_db or primary_name
 
     all_dbs = [(primary_ref, primary_taxa, primary_name)] + (alt_refs or [])
     all_results: dict = {}
-
-    for ref, taxa, name in all_dbs:
-        # The database whose name matches effective_main writes to taxonomy.tsv
-        db_label = 'main' if name == effective_main else name
-        _, results = run_classification_single(
-            input_fasta, outdir, ref, taxa, threads, db_label, column_db_name=name,
+    logger.info('[CLASSIFY][MULTI][DIAG] START pid=%d primary=%s authoritative=%s databases=%s input=%s threads=%s',
+                os.getpid(), primary_name, effective_main, [n for _r, _t, n in all_dbs], input_fasta, threads)
+    for index, (ref, taxa, name) in enumerate(all_dbs, start=1):
+        logger.info('[CLASSIFY][MULTI][DIAG] DATABASE_BEGIN index=%d/%d name=%s ref=%s taxa=%s',
+                    index, len(all_dbs), name, ref, taxa or 'FASTA_HEADERS')
+        output_path, results = run_classification_single(
+            input_fasta, outdir, ref, taxa, threads, name, column_db_name=name,
         )
         all_results[name] = results
+        logger.info('[CLASSIFY][MULTI][DIAG] DATABASE_END index=%d/%d name=%s output=%s result_count=%d',
+                    index, len(all_dbs), name, output_path, len(results))
 
     # Write wide merged taxonomy when more than one database was used
     if len(all_dbs) > 1:
         all_query_ids = [h for h, _ in read_fasta(input_fasta) if not is_ref_anchor(h)]
         _write_merged_taxonomy(outdir, all_results, effective_main, all_query_ids)
 
-    primary_tsv = os.path.join(outdir, 'taxonomy.tsv')
+    safe_primary = re.sub(r'[^A-Za-z0-9]+', '_', str(effective_main)).strip('_') or 'primary'
+    primary_tsv = os.path.join(outdir, f'taxonomy_{safe_primary}.tsv')
+    if not os.path.isfile(primary_tsv):
+        raise RuntimeError(f'Primary taxonomy output was not created for {effective_main}: {primary_tsv}')
+    logger.info('[CLASSIFY][MULTI][DIAG] COMPLETE primary_output=%s databases=%d', primary_tsv, len(all_results))
     return primary_tsv, all_results
 
 
@@ -789,7 +1188,7 @@ def _write_merged_taxonomy(
 
     Every database, including the primary reference, has a suffixed set of
     columns (``BestHit_<DB>``, ``Identity_<DB>``, ``Taxon_<DB>``,
-    ``Confidence_<DB>``) so assignments remain identifiable in merged tables.
+    ``SourceClassifierConfidence_<DB>``) so assignments remain identifiable in merged tables.
     """
     import re as _re
     output = os.path.join(outdir, 'taxonomy_all_dbs.tsv')
@@ -801,8 +1200,13 @@ def _write_merged_taxonomy(
         header = ['ID']
         for name in db_names:
             safe = _re.sub(r'[^A-Za-z0-9]+', '_', name).strip('_')
-            header += [f'BestHit_{safe}', f'Identity_{safe}', f'Taxon_{safe}', f'Confidence_{safe}']
+            header += [f'BestHit_{safe}', f'Identity_{safe}', f'Taxon_{safe}', f'SourceClassifierConfidence_{safe}']
             header += [f'{metric}_{safe}' for metric in metric_names]
+            header += [f'AssignmentStatus_{safe}', f'TaxonomySupportPct_{safe}',
+                       f'TaxonomyLeadPct_{safe}', f'AssignedRank_{safe}',
+                       f'EvidenceTier_{safe}', f'TaxonomyCandidateCount_{safe}',
+                       f'AlignmentEvidenceStatus_{safe}', f'AssignmentEvidenceLevel_{safe}',
+                       f'EvidenceInterpretation_{safe}']
         fh.write('\t'.join(header) + '\n')
 
         primary_res = all_results.get(primary_name, {})
@@ -817,6 +1221,15 @@ def _write_merged_taxonomy(
                 f"{conf:.4f}" if isinstance(conf, float) else str(conf),
             ]
             row += ['NA' if value is None else (f'{value:.2f}' if isinstance(value, float) else str(value)) for value in result[4:11]]
+            row += [str(result[11]) if len(result) > 11 else 'UNRESOLVED',
+                    f'{float(result[12]):.2f}' if len(result) > 12 else '0.00',
+                    f'{float(result[13]):.2f}' if len(result) > 13 else '0.00',
+                    str(result[14]) if len(result) > 14 else 'NA',
+                    str(result[15]) if len(result) > 15 else 'NA',
+                    str(result[16]) if len(result) > 16 else 'NA',
+                    str(result[17]) if len(result) > 17 else 'NA',
+                    str(result[18]) if len(result) > 18 else 'NA',
+                    str(result[19]) if len(result) > 19 else 'NA']
             for name in db_names[1:]:
                 alt_result = all_results.get(name, {}).get(qid, ('NA', 0.0, 'NA', 'NA', None, None, None, None, None, None, None))
                 a_hit, a_pct, a_tax, a_conf = alt_result[:4]
@@ -827,6 +1240,15 @@ def _write_merged_taxonomy(
                     f"{a_conf:.4f}" if isinstance(a_conf, float) else str(a_conf),
                 ]
                 row += ['NA' if value is None else (f'{value:.2f}' if isinstance(value, float) else str(value)) for value in alt_result[4:11]]
+                row += [str(alt_result[11]) if len(alt_result) > 11 else 'UNRESOLVED',
+                        f'{float(alt_result[12]):.2f}' if len(alt_result) > 12 else '0.00',
+                        f'{float(alt_result[13]):.2f}' if len(alt_result) > 13 else '0.00',
+                        str(alt_result[14]) if len(alt_result) > 14 else 'NA',
+                        str(alt_result[15]) if len(alt_result) > 15 else 'NA',
+                        str(alt_result[16]) if len(alt_result) > 16 else 'NA',
+                        str(alt_result[17]) if len(alt_result) > 17 else 'NA',
+                        str(alt_result[18]) if len(alt_result) > 18 else 'NA',
+                        str(alt_result[19]) if len(alt_result) > 19 else 'NA']
             fh.write('\t'.join(row) + '\n')
 
     logger.info("[CLASSIFY] Wrote merged multi-db taxonomy → %s", output)

@@ -1,24 +1,26 @@
 {
   "schema_version": 1,
-  "project_directory": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live",
+  "project_directory": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/November_Release",
   "project": {
     "name": "Rumen Gateway",
     "collection_name": "Hungate Collection and partner rumen isolate collection",
-    "organism_scope": ["Bacteria"],
+    "organism_scope": [
+      "Bacteria"
+    ],
     "marker_gene": "16S rRNA",
     "taxonomy_authority": "GTDB",
     "partner_field": "partner_id",
     "selection_unit": "genome",
     "profile_notes": "Rumen Gateway defaults for project database setup and recurring partner reviews.",
-    "selection_budget": 24
+    "selection_budget": 200
   },
   "data": {
-    "primary_taxonomy_fasta": "Taxa_Databases/GTDB/gtdb_r232_bac_arch_ssu_reps.fna.gz",
-    "secondary_taxonomy_fasta": "Taxa_Databases/GG2/2024.09.backbone.full-length.fna.gz",
-    "secondary_taxonomy_table": "Taxa_Databases/GG2/2024.09.taxonomy.id.tsv.gz",
-    "baseline_fasta": "Taxa_Databases/Hungate/Sanger_Hun.fasta",
-    "secondary_baseline_fasta": "Taxa_Databases/Rumen_Isolates/secondard_16s.fasta",
-    "secondary_baseline_taxonomy": "Taxa_Databases/Rumen_Isolates/pipeline_taxonomy.tsv",
+    "primary_taxonomy_fasta": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/GTDB/gtdb_r232_bac_arch_ssu_reps.fna.gz",
+    "secondary_taxonomy_fasta": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/GG2/2024.09.backbone.full-length.fna.gz",
+    "secondary_taxonomy_table": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/GG2/2024.09.taxonomy.id.tsv.gz",
+    "baseline_fasta": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/Hungate/Sanger_Hun.fasta",
+    "secondary_baseline_fasta": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/Rumen_Isolates/secondard_16s.fasta",
+    "secondary_baseline_taxonomy": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/Rumen_Isolates/pipeline_taxonomy.tsv",
     "partner_metadata": "Partner_Isolate_Catalogue.csv",
     "database": "project.sqlite",
     "most_wanted_list": "MWL.csv"
@@ -27,26 +29,26 @@
     "assistant": {
       "db": "project.sqlite",
       "partner_metadata": "Partner_Isolate_Catalogue.csv",
-      "ref": "Taxa_Databases/GTDB/gtdb_r232_bac_arch_ssu_reps.fna.gz",
+      "ref": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/GTDB/gtdb_r232_bac_arch_ssu_reps.fna.gz",
       "ref_name": "GTDB_r232",
       "alt_databases": [
         {
           "name": "GG2_2024_09",
-          "ref": "Taxa_Databases/GG2/2024.09.backbone.full-length.fna.gz",
-          "taxa": "Taxa_Databases/GG2/2024.09.taxonomy.id.tsv.gz"
+          "ref": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/GG2/2024.09.backbone.full-length.fna.gz",
+          "taxa": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/GG2/2024.09.taxonomy.id.tsv.gz"
         },
         {
           "name": "NCBI_16S_2026_08",
-          "ref": "Taxa_Databases/NCBI/ncbi_16s_formatted.fasta",
+          "ref": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/NCBI/ncbi_16s_formatted.fasta",
           "taxa": null
         },
         {
           "name": "SILVA_144",
-          "ref": "Taxa_Databases/SILVA/SILVA_144_SSURef_NR99_tax_silva_trunc.fasta.gz",
+          "ref": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/SILVA/SILVA_144_SSURef_NR99_tax_silva_trunc.fasta.gz",
           "taxa": null
         }
       ],
-      "baseline_fasta": "Taxa_Databases/Hungate/Sanger_Hun.fasta",
+      "baseline_fasta": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/Hungate/Sanger_Hun.fasta",
       "baseline_dataset": "Hungate",
       "baseline_tier": "priority",
       "mwl": "MWL.csv",
@@ -62,8 +64,7 @@
     },
     "filing-cabinet": {
       "db": "project.sqlite",
-      "ref": "Taxa_Databases/GTDB/gtdb_r232_bac_arch_ssu_reps.fna.gz",
-      "ref_name": "GTDB_r232",
+      "ref": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/GTDB/gtdb_r232_bac_arch_ssu_reps.fna.gz",
       "sequence_domain": "bacteria",
       "threads": 10,
       "tree_method": "fasttree"
@@ -71,20 +72,24 @@
     "performance-review": {
       "db": "project.sqlite",
       "partner_metadata": "Partner_Isolate_Catalogue.csv",
-      "ref": "Taxa_Databases/GTDB/gtdb_r232_bac_arch_ssu_reps.fna.gz",
+      "ref": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/GTDB/gtdb_r232_bac_arch_ssu_reps.fna.gz",
       "ref_name": "GTDB_r232",
       "alt_ref": [
-        "Taxa_Databases/GG2/2024.09.backbone.full-length.fna.gz",
-        "Taxa_Databases/NCBI/ncbi_16s_formatted.fasta",
-        "Taxa_Databases/SILVA/SILVA_144_SSURef_NR99_tax_silva_trunc.fasta.gz"
+        "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/GG2/2024.09.backbone.full-length.fna.gz",
+        "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/NCBI/ncbi_16s_formatted.fasta",
+        "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/SILVA/SILVA_144_SSURef_NR99_tax_silva_trunc.fasta.gz"
       ],
       "alt_taxa": [
-        "Taxa_Databases/GG2/2024.09.taxonomy.id.tsv.gz",
+        "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/GG2/2024.09.taxonomy.id.tsv.gz",
         null,
         null
       ],
-      "alt_ref_name": ["GG2_2024_09", "NCBI_16S_2026_08", "SILVA_144"],
-      "baseline_fasta": "Taxa_Databases/Hungate/Sanger_Hun.fasta",
+      "alt_ref_name": [
+        "GG2_2024_09",
+        "NCBI_16S_2026_08",
+        "SILVA_144"
+      ],
+      "baseline_fasta": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/Hungate/Sanger_Hun.fasta",
       "baseline_dataset": "Hungate",
       "baseline_tier": "priority",
       "mwl": "MWL.csv",
@@ -117,14 +122,14 @@
     {
       "dataset": "Hungate",
       "tier": "priority",
-      "fasta": "Taxa_Databases/Hungate/Sanger_Hun.fasta",
+      "fasta": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/Hungate/Sanger_Hun.fasta",
       "classify": true
     },
     {
       "dataset": "Secondary",
       "tier": "secondary",
-      "fasta": "Taxa_Databases/Rumen_Isolates/secondard_16s.fasta",
-      "taxonomy_assignments": "Taxa_Databases/Rumen_Isolates/pipeline_taxonomy.tsv",
+      "fasta": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/Rumen_Isolates/secondard_16s.fasta",
+      "taxonomy_assignments": "/mnt/Internal/Nextcloud/Current_Work/RGW/Live_BranchManager/Database_Live/Taxa_Databases/Rumen_Isolates/pipeline_taxonomy.tsv",
       "classify": false
     }
   ]

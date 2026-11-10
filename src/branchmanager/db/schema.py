@@ -42,6 +42,14 @@ CREATE TABLE IF NOT EXISTS classification_evidence (
     target_length INTEGER,
     mismatches INTEGER,
     gaps INTEGER,
+    source_classifier_confidence REAL,
+    assignment_status TEXT,
+    taxonomy_support_pct REAL,
+    taxonomy_candidate_count INTEGER,
+    evidence_tier TEXT,
+    alignment_evidence_status TEXT,
+    assignment_evidence_level TEXT,
+    evidence_interpretation TEXT,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (sequence_id, ref_db)
 );
@@ -183,7 +191,7 @@ CREATE TABLE IF NOT EXISTS genome_records (
     sequence_id TEXT NOT NULL,
     accession TEXT,
     genome_status TEXT NOT NULL,
-    genome_qc_pass INTEGER DEFAULT 0,
+    genome_qc_pass INTEGER DEFAULT NULL,
     completeness REAL,
     contamination REAL,
     gtdb_taxonomy TEXT,
@@ -239,6 +247,22 @@ CREATE TABLE IF NOT EXISTS marker_replacement_attempts (
     source_fasta TEXT,
     attempted_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS genome_annotation_evidence (
+    evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sequence_id TEXT NOT NULL,
+    genome_id TEXT NOT NULL,
+    evidence_type TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    tool_version TEXT,
+    source_file TEXT,
+    source_sha256 TEXT,
+    raw_json TEXT NOT NULL,
+    imported_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(sequence_id, evidence_type, source_sha256)
+);
+CREATE INDEX IF NOT EXISTS idx_genome_annotation_evidence_sequence
+    ON genome_annotation_evidence(sequence_id, evidence_type);
 
 CREATE INDEX IF NOT EXISTS idx_genome_records_sequence ON genome_records(sequence_id);
 CREATE INDEX IF NOT EXISTS idx_isolate_status_events_sequence ON isolate_status_events(sequence_id);

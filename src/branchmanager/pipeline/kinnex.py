@@ -9,21 +9,17 @@ selects an abundance-supported observed sequence as the marker representative.
 from __future__ import annotations
 
 import csv
-import gzip
 import shutil
 from collections import defaultdict
 from pathlib import Path
 
 from branchmanager.utils.fasta import write_fasta
+from branchmanager.utils.io import open_text
 from branchmanager.utils.subprocess import run_cmd
 
 
-def _open_text(path: Path):
-    return gzip.open(path, 'rt') if path.name.lower().endswith('.gz') else open(path)
-
-
 def _fastq_records(path: Path):
-    with _open_text(path) as handle:
+    with open_text(path) as handle:
         line_number = 0
         while True:
             header = handle.readline()

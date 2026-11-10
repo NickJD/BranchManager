@@ -1,4 +1,8 @@
 include README.md
 include LICENSE
-recursive-include src/branchmanager/db *
-recursive-include src/branchmanager/data *
+
+include src/branchmanager/data/rumen-gut_reference_anchors.fasta
+include src/branchmanager/data/rumen-gut_reference_anchors.tsv
+include src/branchmanager/data/sanger_studio.html
+
+recursive-include src/branchmanager/examples *.tsv *.jpg *.sh

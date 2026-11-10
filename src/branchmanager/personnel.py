@@ -3,24 +3,17 @@
 from __future__ import annotations
 
 import csv
-import gzip
 import json
 from pathlib import Path
 
 from branchmanager.utils.fasta import write_fasta
-
-
-def _open_text(path: str | Path):
-    return gzip.open(path, 'rt', newline='') if str(path).lower().endswith('.gz') else open(path, newline='')
-
-
-def _normalise_header(value: object) -> str:
-    return str(value or '').strip().lstrip('\ufeff').lower().replace('-', '_').replace(' ', '_')
+from branchmanager.utils.io import open_text
+from branchmanager.utils.text import normalise_header
 
 
 def _row_value(row: dict[str, str], *names: str) -> str:
     for name in names:
-        value = row.get(_normalise_header(name), '')
+        value = row.get(normalise_header(name), '')
         if value:
             return str(value).strip()
     return ''
@@ -41,7 +34,7 @@ def load_exit_requests(
     ]
     if input_path:
         source = Path(input_path).expanduser().resolve()
-        with _open_text(source) as handle:
+        with open_text(source) as handle:
             sample = handle.read(4096)
             handle.seek(0)
             delimiter = '\t' if str(source).lower().endswith(('.tsv', '.tsv.gz', '.txt', '.txt.gz')) else ','
@@ -51,7 +44,7 @@ def load_exit_requests(
                 pass
             for raw_row in csv.DictReader(handle, delimiter=delimiter):
                 row = {
-                    _normalise_header(key): str(value or '').strip()
+                    normalise_header(key): str(value or '').strip()
                     for key, value in raw_row.items() if key is not None
                 }
                 requests.append({

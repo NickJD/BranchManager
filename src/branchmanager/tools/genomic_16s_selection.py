@@ -14,8 +14,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import gzip
-import hashlib
 import json
 import logging
 import math
@@ -28,6 +26,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
+
+from branchmanager.utils.io import open_text, sha256sum, write_tsv
 
 FASTA_SUFFIXES = (".fna.gz", ".fasta.gz", ".fas.gz", ".fa.gz", ".ffn.gz",
                   ".fna", ".fasta", ".fas", ".fa", ".ffn")
@@ -67,12 +67,6 @@ class Candidate:
         return len(self.sequence)
 
 
-def _open_text(path: Path):
-    if path.name.lower().endswith(".gz"):
-        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
-    return path.open("rt", encoding="utf-8", errors="replace")
-
-
 def strip_fasta_suffix(name: str) -> str:
     low = name.lower()
     for suffix in sorted(FASTA_SUFFIXES, key=len, reverse=True):
@@ -108,7 +102,7 @@ def genome_aliases(value: str) -> set[str]:
 def read_fasta(path: Path) -> dict[str, str]:
     records: dict[str, list[str]] = {}
     current: Optional[str] = None
-    with _open_text(path) as handle:
+    with open_text(path) as handle:
         for line in handle:
             line = line.strip()
             if not line:
@@ -127,7 +121,7 @@ def read_fasta(path: Path) -> dict[str, str]:
 
 def iter_fasta_headers(path: Path) -> Iterable[tuple[str, str]]:
     """Yield (first-token ID, full description after '>') without loading reference bases."""
-    with _open_text(path) as handle:
+    with open_text(path) as handle:
         for line in handle:
             if line.startswith(">"):
                 description = line[1:].strip()
@@ -286,20 +280,6 @@ def quality_rank(quality: str) -> int:
     }.get(quality, 4)
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def write_tsv(path: Path, fieldnames: list[str], rows: Iterable[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter="\t", extrasaction="ignore", lineterminator="\n")
-        writer.writeheader()
-        writer.writerows(rows)
 
 
 def write_fasta(path: Path, records: Iterable[tuple[str, str]]) -> None:
@@ -391,7 +371,7 @@ def _run_one(payload: tuple) -> tuple[str, str, str, str, list[Candidate], str, 
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(f"Input/Barrnap error: {type(exc).__name__}: {exc}\n", encoding="utf-8")
         except Exception:
-            pass
+            logging.getLogger(__name__).debug('Failed to write error log for %s', genome_id)
         return genome_id, raw_genome_id, str(assembly_path), "INPUT_OR_BARRNAP_ERROR", [], str(gff_path), str(log_path), f"{type(exc).__name__}: {exc}"
 
 
@@ -552,23 +532,90 @@ def _selection_key(candidate: Candidate, evidence: dict, preferred_length: int) 
 def _run_vsearch(candidate_fasta: Path, reference_fasta: Path, raw_hits_path: Path, *,
                  vsearch_exe: str, threads: int, minimum_search_identity_pct: float,
                  minimum_search_query_coverage_pct: float, max_hits: int, no_hit_fasta: Path) -> list[str]:
-    user_fields = "query+target+id+alnlen+qcov+tcov+mism+opens+qstrand"
-    cmd = [
-        vsearch_exe, "--usearch_global", str(candidate_fasta), "--db", str(reference_fasta),
-        "--id", str(minimum_search_identity_pct / 100.0),
-        "--query_cov", str(minimum_search_query_coverage_pct / 100.0),
-        "--maxaccepts", str(max_hits), "--maxrejects", "0", "--strand", "both",
-        "--userout", str(raw_hits_path), "--userfields", user_fields,
-        "--output_no_hits", "--notmatched", str(no_hit_fasta), "--threads", str(threads),
-    ]
-    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-    raw_hits_path.with_suffix(raw_hits_path.suffix + ".log").write_text(
-        "COMMAND: " + " ".join(cmd) + f"\nRETURN_CODE: {proc.returncode}\n\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
-        encoding="utf-8",
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"VSEARCH failed with exit code {proc.returncode}; see {raw_hits_path}.log")
-    return cmd
+    """Run a high-stringency adaptive search, advancing only unresolved candidates.
+
+    The default path is 98/95, 97/95, 96/95, 95/95. User-specified lower
+    identity/coverage floors are appended as rescue tiers, never used first.
+    """
+    import tempfile
+
+    from branchmanager.utils.fasta import read_fasta, write_fasta
+
+    identity_floor = float(minimum_search_identity_pct)
+    coverage_floor = float(minimum_search_query_coverage_pct)
+    identity_steps = [98.0, 97.0, 96.0, 95.0, 93.0, 90.0, 85.0, 80.0, 75.0]
+    identity_steps = [value for value in identity_steps if value >= identity_floor]
+    if not identity_steps or identity_steps[-1] > identity_floor:
+        identity_steps.append(identity_floor)
+    coverage_steps = [max(95.0, coverage_floor)]
+    for value in (90.0, 85.0, 80.0, 75.0, 70.0):
+        if value < coverage_steps[-1] and value >= coverage_floor:
+            coverage_steps.append(value)
+    if coverage_steps[-1] > coverage_floor:
+        coverage_steps.append(coverage_floor)
+    tiers = [(identity, coverage_steps[0]) for identity in identity_steps]
+    tiers.extend((identity_floor, coverage) for coverage in coverage_steps[1:])
+
+    records = list(read_fasta(str(candidate_fasta)))
+    sequence_by_id = dict(records)
+    unresolved = set(sequence_by_id)
+    hits_by_query: dict[str, dict[str, tuple[tuple, str]]] = {}
+    commands: list[str] = []
+    raw_hits_path.parent.mkdir(parents=True, exist_ok=True)
+    no_hit_fasta.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="branchmanager_16s_ladder_", dir=str(raw_hits_path.parent)) as temp_name:
+        temp_dir = Path(temp_name)
+        for tier_index, (identity, coverage) in enumerate(tiers, 1):
+            if not unresolved:
+                break
+            tier_query = temp_dir / f"queries_tier_{tier_index}.fna"
+            tier_hits = temp_dir / f"hits_tier_{tier_index}.tsv"
+            write_fasta([(qid, sequence_by_id[qid]) for qid in sorted(unresolved)], str(tier_query))
+            cmd = [
+                vsearch_exe, "--usearch_global", str(tier_query), "--db", str(reference_fasta),
+                "--id", str(identity / 100.0), "--query_cov", str(coverage / 100.0),
+                "--maxaccepts", str(max_hits), "--maxrejects", "256", "--maxhits", str(max_hits),
+                "--strand", "both", "--userout", str(tier_hits),
+                "--userfields", "query+target+id+alnlen+qcov+tcov+mism+opens+qstrand",
+                "--threads", str(threads),
+            ]
+            commands.append(" ".join(cmd))
+            proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            tier_hits.with_suffix(tier_hits.suffix + ".log").write_text(
+                "COMMAND: " + " ".join(cmd) + f"\nRETURN_CODE: {proc.returncode}\n\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+                encoding="utf-8",
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(f"VSEARCH failed at adaptive tier {tier_index} ({identity:.1f}% identity, {coverage:.1f}% coverage); see {tier_hits}.log")
+
+            for line in tier_hits.read_text(encoding="utf-8", errors="replace").splitlines():
+                fields = line.split("\t")
+                if len(fields) < 9 or fields[0] not in unresolved or fields[1] in ("", "*"):
+                    continue
+                try:
+                    identity_value = float(fields[2])
+                    qcov_value = float(fields[4])
+                    aln_value = int(float(fields[3]))
+                except (ValueError, TypeError):
+                    continue
+                target = fields[1]
+                rank = (identity_value, qcov_value, aln_value, target)
+                previous = hits_by_query.setdefault(fields[0], {}).get(target)
+                if previous is None or rank > previous[0]:
+                    hits_by_query[fields[0]][target] = (rank, line)
+
+            # Three distinct candidates provide a useful near-top comparison set.
+            resolved = [qid for qid in unresolved if len(hits_by_query.get(qid, {})) >= min(3, max_hits)]
+            unresolved.difference_update(resolved)
+
+    with raw_hits_path.open("w", encoding="utf-8") as handle:
+        for qid, _sequence in records:
+            candidates = hits_by_query.get(qid, {})
+            for _rank, line in sorted(candidates.values(), key=lambda item: item[0], reverse=True):
+                handle.write(line + "\n")
+    write_fasta([(qid, sequence_by_id[qid]) for qid in sorted(unresolved)], str(no_hit_fasta))
+    return commands
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -589,10 +636,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                         help="Threads per Barrnap process; jobs × this value should fit the CPU allocation (default: 1).")
     parser.add_argument("--vsearch-threads", type=int, default=8,
                         help="CPU threads for the VSEARCH phase (default: 8).")
-    parser.add_argument("--minimum-search-identity", type=float, default=70.0,
-                        help="Minimum identity percentage passed to VSEARCH to collect candidate hits (default: 70).")
-    parser.add_argument("--minimum-search-query-coverage", type=float, default=70.0,
-                        help="Minimum query coverage percentage for VSEARCH search hits (default: 70).")
+    parser.add_argument("--minimum-search-identity", type=float, default=95.0,
+                        help="Minimum identity percentage passed to VSEARCH to collect candidate hits (default: 95).")
+    parser.add_argument("--minimum-search-query-coverage", type=float, default=95.0,
+                        help="Minimum query coverage percentage for VSEARCH search hits (default: 95).")
     parser.add_argument("--max-hits-per-candidate", type=int, default=20,
                         help="Maximum accepted GTDB reference hits retained per 16S candidate (default: 20).")
     parser.add_argument("--minimum-taxonomy-identity", type=float, default=94.5,
@@ -906,8 +953,8 @@ def run_cli(args: argparse.Namespace) -> int:
         "tool_version": "1.0.0",
         "started_with": {
             "genome_dir": str(genome_root), "reference": str(reference),
-            "reference_sha256": _sha256(reference), "gtdb_summary": [str(p.resolve()) for p in args.gtdb_summary],
-            "gtdb_summary_sha256": {str(p.resolve()): _sha256(p) for p in args.gtdb_summary},
+            "reference_sha256": sha256sum(reference), "gtdb_summary": [str(p.resolve()) for p in args.gtdb_summary],
+            "gtdb_summary_sha256": {str(p.resolve()): sha256sum(p) for p in args.gtdb_summary},
             "kingdom": args.kingdom, "jobs": args.jobs, "threads_per_genome": args.threads_per_genome,
             "vsearch_threads": args.vsearch_threads, "minimum_search_identity_pct": args.minimum_search_identity,
             "minimum_search_query_coverage_pct": args.minimum_search_query_coverage,

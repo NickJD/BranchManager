@@ -1,0 +1,25 @@
+ID	Taxon_GG2_2024_09	AssignmentStatus_GG2_2024_09	Identity_GG2_2024_09	QueryCoverage_GG2_2024_09	TargetCoverage_GG2_2024_09	EvidenceInterpretation_GG2_2024_09	AssignedRank_GG2_2024_09
+DEMO_001	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Erysipelotrichaceae;g__Winkia	PASS_HIGH_CONFIDENCE	97.9	92	88	Synthetic demonstration assignment.	GENUS
+DEMO_002	d__Bacteria;p__Bacteroidota;c__Clostridia;o__Eubacteriales;f__Prevotellaceae;g__Prevotella	PASS_HIGH_CONFIDENCE	98.3	93	89	Synthetic demonstration assignment.	GENUS
+DEMO_003	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Lachnospiraceae;g__Butyrivibrio	PASS_HIGH_CONFIDENCE	98.7	94	90	Synthetic demonstration assignment.	GENUS
+DEMO_004	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Oscillospiraceae;g__Ruminococcus;s__Ruminococcus_sp_demo_1	PASS_HIGH_CONFIDENCE	99.1	95	91	Synthetic demonstration assignment.	SPECIES
+DEMO_005	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Erysipelotrichaceae;g__Winkia	PASS_HIGH_CONFIDENCE	97.5	96	92	Synthetic demonstration assignment.	GENUS
+DEMO_006	d__Bacteria;p__Bacteroidota;c__Clostridia;o__Eubacteriales;f__Prevotellaceae;g__Prevotella	PASS_HIGH_CONFIDENCE	97.9	97	93	Synthetic demonstration assignment.	GENUS
+DEMO_007	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Lachnospiraceae;g__Butyrivibrio	PASS_HIGH_CONFIDENCE	98.3	91	94	Synthetic demonstration assignment.	GENUS
+DEMO_008	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Oscillospiraceae;g__Ruminococcus;s__Ruminococcus_sp_demo_2	PASS_HIGH_CONFIDENCE	98.7	92	87	Synthetic demonstration assignment.	SPECIES
+DEMO_009	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Erysipelotrichaceae;g__Winkia	PASS_HIGH_CONFIDENCE	99.1	93	88	Synthetic demonstration assignment.	GENUS
+DEMO_010	d__Bacteria;p__Bacteroidota;c__Clostridia;o__Eubacteriales;f__Prevotellaceae;g__Prevotella	PASS_HIGH_CONFIDENCE	97.5	94	89	Synthetic demonstration assignment.	GENUS
+DEMO_011	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Lachnospiraceae;g__Butyrivibrio	PASS_HIGH_CONFIDENCE	97.9	95	90	Synthetic demonstration assignment.	GENUS
+DEMO_012	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Oscillospiraceae;g__Ruminococcus;s__Ruminococcus_sp_demo_3	PASS_HIGH_CONFIDENCE	98.3	96	91	Synthetic demonstration assignment.	SPECIES
+DEMO_013	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Erysipelotrichaceae;g__Winkia	PASS_HIGH_CONFIDENCE	98.7	97	92	Synthetic demonstration assignment.	GENUS
+DEMO_014	d__Bacteria;p__Bacteroidota;c__Clostridia;o__Eubacteriales;f__Prevotellaceae;g__Prevotella	PASS_HIGH_CONFIDENCE	99.1	91	93	Synthetic demonstration assignment.	GENUS
+DEMO_015	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Lachnospiraceae;g__Butyrivibrio	PASS_HIGH_CONFIDENCE	97.5	92	94	Synthetic demonstration assignment.	GENUS
+DEMO_016	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Oscillospiraceae;g__Ruminococcus;s__Ruminococcus_sp_demo_4	PASS_HIGH_CONFIDENCE	97.9	93	87	Synthetic demonstration assignment.	SPECIES
+DEMO_017	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Erysipelotrichaceae;g__Winkia	PASS_HIGH_CONFIDENCE	98.3	94	88	Synthetic demonstration assignment.	GENUS
+DEMO_018	d__Bacteria;p__Bacteroidota;c__Clostridia;o__Eubacteriales;f__Prevotellaceae;g__Prevotella	PASS_HIGH_CONFIDENCE	98.7	95	89	Synthetic demonstration assignment.	GENUS
+DEMO_019	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Lachnospiraceae;g__Butyrivibrio	PASS_HIGH_CONFIDENCE	99.1	96	90	Synthetic demonstration assignment.	GENUS
+DEMO_020	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Oscillospiraceae;g__Ruminococcus;s__Ruminococcus_sp_demo_5	PASS_HIGH_CONFIDENCE	97.5	97	91	Synthetic demonstration assignment.	SPECIES
+DEMO_021	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Erysipelotrichaceae;g__Winkia	PASS_HIGH_CONFIDENCE	97.9	91	92	Synthetic demonstration assignment.	GENUS
+DEMO_022	d__Bacteria;p__Bacteroidota;c__Clostridia;o__Eubacteriales;f__Prevotellaceae;g__Prevotella	PASS_HIGH_CONFIDENCE	98.3	92	93	Synthetic demonstration assignment.	GENUS
+DEMO_023	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Lachnospiraceae;g__Butyrivibrio	PASS_HIGH_CONFIDENCE	98.7	93	94	Synthetic demonstration assignment.	GENUS
+DEMO_024	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Oscillospiraceae;g__Ruminococcus;s__Ruminococcus_sp_demo_6	PASS_HIGH_CONFIDENCE	99.1	94	87	Synthetic demonstration assignment.	SPECIES

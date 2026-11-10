@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import logging
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-from branchmanager.pipeline.neighbourhood import pairwise_leaf_distances
-from branchmanager.taxonomy import normalise_taxon_name, parse_taxon_string
+from branchmanager.pipeline.evidence_policy import evidence_quality as _shared_evidence_quality
+from branchmanager.pipeline.neighbourhood import pairwise_leaf_distances, _parse_tree, _mrca, _leaf_nodes
+from branchmanager.taxonomy import domain_designation, infer_taxon_rank, normalise_taxon_name, parse_taxon_string
 
+
+logger = logging.getLogger(__name__)
 
 RANKS = [('s', 'species'), ('g', 'genus'), ('f', 'family'), ('o', 'order'),
          ('c', 'class'), ('p', 'phylum'), ('d', 'domain')]
@@ -33,7 +37,7 @@ SELECTION_BLOCKING_PLACEMENT_FLAGS = frozenset({
     'CHIMERA_INDETERMINATE', 'CHIMERA_CHECK_SKIPPED', 'CHIMERA_NOT_RUN',
     'VERY_SHORT', 'HIGH_N_CONTENT', 'MARKER_QC_FAILED',
     'MARKER_QC_REVIEW_REQUIRED', 'MARKER_QC_UNVERIFIED',
-    'MARKER_REPLACEMENT_QC_FAILED',
+    'MARKER_REPLACEMENT_QC_FAILED', 'MANUAL_APPROVAL_SEVERE_QC_OVERRIDE',
 })
 
 
@@ -68,26 +72,7 @@ def _committed(row: dict) -> bool:
 
 
 def _evidence_quality(row: dict) -> str:
-    flag_set = {f.strip() for f in str(row.get('placement_flags') or '').upper().split(';') if f.strip()}
-    identity = _float(row.get('classification_identity'))
-    confidence = _float(row.get('classification_confidence'))
-    coverage = _float(row.get('classification_query_coverage'))
-    taxonomy = str(row.get('taxonomy') or '').strip().lower()
-    if flag_set & SELECTION_BLOCKING_PLACEMENT_FLAGS:
-        return 'LOW'
-    # MARKER_QC_REVIEW_APPROVED: manual approval has addressed QC concerns; fall through to
-    # standard identity/coverage checks so clean assemblies can still reach HIGH.
-    if identity is not None and identity < 90.0:
-        return 'LOW'
-    if coverage is not None and coverage < 80.0:
-        return 'LOW'
-    if identity is None and taxonomy in ('', 'na', 'none'):
-        return 'LOW'
-    if flag_set & {'LOW_CLASSIFICATION', 'LOW_CONFIDENCE', 'DISAGREEMENT', 'CONFLICT'}:
-        return 'MODERATE'
-    if (identity is not None and identity < 95.0) or (confidence is not None and confidence < 0.8) or (coverage is not None and coverage < 90.0):
-        return 'MODERATE'
-    return 'HIGH'
+    return _shared_evidence_quality(row)
 
 
 def _species(taxonomy: object) -> str:
@@ -95,24 +80,176 @@ def _species(taxonomy: object) -> str:
     return value if value and value.lower() not in ('na', 'none', 'unclassified') else ''
 
 
-def _group_for_row(row: dict) -> tuple[str, str, str]:
-    parsed = parse_taxon_string(str(row.get('taxonomy') or ''))
-    species = str(parsed.get('s') or '').strip()
-    if species:
-        return f'species:{normalise_taxon_name(species)}', 'assessment species', species
+def _assignment_status(row: dict) -> str:
+    """Return the primary classifier status across supported assessment schemas.
 
-    rank_key = 'unclassified'
-    taxon = 'unclassified'
-    rank_name = 'unclassified'
-    for key, name in RANKS[1:]:
-        value = str(parsed.get(key) or '').strip()
-        if value:
-            rank_key = f'{key}:{normalise_taxon_name(value)}'
-            taxon = value
-            rank_name = f'assessment {name}'
-            break
-    figure = str(row.get('local_neighbourhood_figure') or 'no_tree_context')
-    return f'local:{figure}|{rank_key}', f'local clade + {rank_name}', taxon
+    Regeneration reads the presentation-formatted sequence_assessment.tsv and
+    converts headers to snake_case. Depending on the producer/version, the
+    primary status is named classification_assignment_status,
+    gtdb_assignment_status, or taxonomy_assignment_status.  Prefer an
+    informative value over a placeholder so a default UNRESOLVED field cannot
+    mask a populated GTDB status.
+    """
+    keys = (
+        'classification_assignment_status', 'gtdb_assignment_status',
+        'assignment_status_gtdb_r232', 'assignment_status_gtdb',
+        'taxonomy_assignment_status', 'assignment_status',
+    )
+    values = [str(row.get(key) or '').strip().upper() for key in keys]
+    missing = {'', 'NA', 'NONE', 'NAN', 'NOT_AVAILABLE'}
+    # A generic unresolved field must not mask an informative database-specific
+    # result (the common case in regenerated assessments).
+    for value in values:
+        if value and value not in missing | {'UNRESOLVED', 'NOT_CONFIDENT', 'NOT_ASSESSED'}:
+            return value
+    for value in values:
+        if value and value not in missing:
+            return value
+    return 'UNRESOLVED'
+
+
+def _taxonomic_concordance(row: dict) -> tuple[bool, str]:
+    """Diagnostic classifier concordance; it is not an authority over the catalogue."""
+    if _assignment_status(row) != 'CONFIDENT':
+        return False, f'primary classifier assignment is {_assignment_status(row)}'
+    primary_species = _species(row.get('taxonomy'))
+    if not primary_species:
+        return False, 'primary classifier assignment has no species rank'
+    alt_tax_keys = sorted(key for key in row if key.startswith('alt_tax_'))
+    for tax_key in alt_tax_keys:
+        suffix = tax_key[len('alt_tax_'):]
+        status = str(row.get(f'alt_assignment_status_{suffix}') or 'UNRESOLVED').upper()
+        if status != 'CONFIDENT':
+            return False, f'{suffix} classifier assignment is {status}'
+        alt_species = _species(row.get(tax_key))
+        if not alt_species:
+            return False, f'{suffix} confident classifier assignment has no species rank'
+        if normalise_taxon_name(alt_species) != normalise_taxon_name(primary_species):
+            return False, f'{suffix} species {alt_species} conflicts with primary {primary_species}'
+    return True, 'configured classifier assignments are confident and species-concordant'
+
+
+def _classifier_database_concordance_status(row: dict) -> str:
+    """Summarise cross-database classifier evidence without involving the catalogue."""
+    if _assignment_status(row) != 'CONFIDENT':
+        return 'NOT_CONFIDENT'
+    concordant, reason = _taxonomic_concordance(row)
+    if concordant:
+        return 'CONCORDANT'
+    if 'no species rank' in reason:
+        return 'NOT_COMPARABLE_AT_SPECIES_RANK'
+    if 'assignment is' in reason:
+        return 'NOT_CONFIDENT_ALT_DATABASE'
+    return 'DISCORDANT'
+
+
+def _partner_taxon_lineage(row: dict) -> dict[str, str]:
+    """Return rank/name pairs derived only from the partner catalogue value.
+
+    A ranked lineage is preserved as supplied. For free-text catalogue values,
+    conservative inference supports binomial species names and single-token
+    genus names, plus unambiguous common higher-rank suffixes. No classifier
+    result is used to fill missing catalogue ranks.
+    """
+    raw = str(
+        row.get('partner_taxon') or row.get('partner_taxon_raw')
+        or row.get('expected_taxon') or ''
+    ).strip()
+    if raw in {'', 'NA', 'None', 'unclassified'}:
+        return {}
+    parsed = parse_taxon_string(raw)
+    if parsed:
+        return parsed
+    domain = domain_designation(raw)
+    if domain:
+        return {'d': domain}
+    name = ' '.join(raw.split())
+    rank = infer_taxon_rank(name, row.get('partner_taxon_rank'))
+    if rank == 's' and len(name.split()) >= 2:
+        parts = name.split()
+        # The first two tokens are the binomial; strain/subspecies text is
+        # retained in the original partner_taxon field, not promoted to rank.
+        name = ' '.join(parts[:2])
+    return {rank: name}
+
+
+
+
+def _gtdb_lineage_key(lineage: dict, target_rank: str | None = None) -> str:
+    """Stable composite GTDB taxon key at *target_rank* and broader ranks.
+
+    The database stores GTDB taxonomy strings rather than separate GTDB taxon
+    IDs. The lineage prefix through the requested rank disambiguates homonyms
+    without splitting a genus into separate groups for each assigned species.
+    """
+    ranks = RANKS
+    if target_rank:
+        rank_codes = [rank for rank, _rank_name in RANKS]
+        if target_rank in rank_codes:
+            ranks = RANKS[rank_codes.index(target_rank):]
+    return '|'.join(
+        f'{rank}:{normalise_taxon_name(lineage.get(rank, ""))}'
+        for rank, _rank_name in ranks if lineage.get(rank)
+    )
+
+
+def _pangenome_lineage(row: dict) -> dict[str, str]:
+    """Return GTDB-derived lineage only; never substitute partner or marker taxonomy."""
+    raw = str(row.get('gtdb_taxonomy') or row.get('gtdbtk_taxonomy') or '').strip()
+    if not raw or raw.casefold() in {'na', 'none', 'unresolved', 'unclassified'}:
+        return {}
+    status = str(row.get('gtdb_assignment_status') or row.get('gtdb_taxonomy_assignment_status') or '').strip().upper()
+    if status in {'FAIL', 'FAILED', 'UNRESOLVED', 'LOW_SIMILARITY', 'NOT_ASSESSED', 'NOT_CONFIDENT'}:
+        return {}
+    return parse_taxon_string(raw)
+
+
+def _pangenome_lineage_source(row: dict) -> str:
+    """Report whether a usable authoritative GTDB lineage is present."""
+    return 'GTDB' if _pangenome_lineage(row) else 'UNRESOLVED'
+
+
+def _partner_rank_taxon(row: dict) -> tuple[str, str, str]:
+    lineage = _pangenome_lineage(row)
+    for rank, rank_name in RANKS:
+        value = str(lineage.get(rank) or '').strip()
+        if value and value.lower() not in {'na', 'none', 'unclassified', 'uncultured'}:
+            return rank, rank_name, value
+    return '', '', ''
+
+
+def _rank_value(row: dict, rank: str) -> str:
+    """Read a rank for diagnostic matching; GTDB is preferred, marker taxonomy is secondary evidence."""
+    lineage = _pangenome_lineage(row)
+    if not lineage and row.get('taxonomy'):
+        lineage = parse_taxon_string(str(row.get('taxonomy') or ''))
+    if rank in lineage:
+        return str(lineage[rank]).strip()
+    if rank == 'g' and lineage.get('s'):
+        return str(lineage['s']).strip().split()[0]
+    return ''
+
+
+def _group_for_row(row: dict) -> tuple[str, str, str]:
+    """Group candidates by their most specific available GTDB rank and tree context."""
+    figure = str(row.get('local_neighbourhood_figure') or '').strip()
+    tree_context = figure if figure not in {'', 'NA', 'None', 'no_tree_context'} else 'no_tree_context'
+    rank, rank_name, taxon = _partner_rank_taxon(row)
+    if rank and taxon:
+        lineage = _pangenome_lineage(row)
+        # Include the lineage through this rank to avoid merging homonymous taxa.
+        lineage_key = _gtdb_lineage_key(lineage, rank)
+        return (
+            f'gtdb:{rank}:{lineage_key}|clade:{tree_context}',
+            f'GTDB {rank_name} + local tree clade',
+            taxon,
+        )
+    status = _assignment_status(row)
+    return (
+        f'unresolved:{tree_context}:{status}',
+        f'GTDB taxonomy unresolved; classifier status {status}',
+        'UNASSIGNED [GTDB_TAXONOMY_UNRESOLVED]',
+    )
 
 
 def _stable_set_id(group_key: str, prefix: str = 'BMSET') -> str:
@@ -335,7 +472,6 @@ def _evidence_tuple(row: dict) -> tuple:
     project = _float(row.get('project_nearest_identity'), 100.0)
     reference = _float(row.get('reference_nearest_identity'), 100.0)
     isolation = _float(row.get('phylo_isolation'), 0.0)
-    confidence = _float(row.get('classification_confidence'), 0.0)
     diversity_rank = DIVERSITY_STRENGTH.get(str(row.get('diversity_metadata_strength') or '').strip().lower(), 0)
     diversity_score = _float(row.get('diversity_metadata_score'), 0.0)
     mwl = MWL_STRENGTH.get(str(row.get('mwl_matched_rank') or '').lower(), 0)
@@ -351,7 +487,6 @@ def _evidence_tuple(row: dict) -> tuple:
         float(diversity_score),
         mwl,
         float(mwl_score),
-        float(confidence),
         str(row.get('id') or ''),
     )
 
@@ -388,6 +523,69 @@ def _distance(left: str, right: str, distances: Dict[tuple[str, str], float]) ->
     return distances.get(tuple(sorted((left, right))))
 
 
+def _tree_reference_rows(db, tree_path, assessment_rows: List[dict]) -> list[dict]:
+    """Load GTDB taxonomy for non-candidate reference leaves in the tree."""
+    if db is None or not tree_path or not Path(tree_path).exists():
+        return []
+    try:
+        _root, _parents, leaves = _parse_tree(tree_path)
+        with db.connect() as conn:
+            records = conn.execute(
+                'SELECT sequence_id, gtdb_taxonomy, genome_qc_pass FROM genome_records '
+                'WHERE sequence_id IS NOT NULL'
+            ).fetchall()
+        assessed_ids = {str(row.get('id')) for row in assessment_rows}
+        result = []
+        for sid, taxonomy, qc_pass in records:
+            sid = str(sid or '')
+            if (not sid or sid in assessed_ids or sid not in leaves or not taxonomy
+                    or str(qc_pass).strip().casefold() not in {'1', 'true', 'yes', 'pass', 'passed'}):
+                continue
+            result.append({
+                'id': sid, 'gtdb_taxonomy': str(taxonomy),
+                'gtdb_assignment_status': 'CONFIDENT',
+                '_tree_taxonomy_source': 'GTDB_REFERENCE_GENOME',
+            })
+        return result
+    except Exception:
+        return []
+
+
+def _tree_taxon_clade_agrees(tree_path, members: List[dict], all_rows: List[dict], rank: str, taxon: str) -> tuple[bool, str]:
+    """Check MRCA exclusivity against other catalogue taxa and confident baseline assignments at the same rank."""
+    if not tree_path or not Path(tree_path).exists():
+        return False, 'current phylogenetic tree is unavailable'
+    try:
+        _root, parents, leaves = _parse_tree(tree_path)
+        member_leaf_ids = [_tree_leaf(row) for row in members]
+        missing_leaf_ids = sorted({leaf_id for leaf_id in member_leaf_ids if not leaf_id or leaf_id not in leaves})
+        if missing_leaf_ids:
+            preview = ';'.join(missing_leaf_ids[:10])
+            suffix = '…' if len(missing_leaf_ids) > 10 else ''
+            return False, f'{len(missing_leaf_ids)} candidate member(s) are absent from the tree: {preview}{suffix}'
+        target_leaf_ids = set(member_leaf_ids)
+        if not target_leaf_ids:
+            return False, 'candidate GTDB taxon has no resolvable tree leaves'
+        mrca = _mrca([leaves[leaf_id] for leaf_id in sorted(target_leaf_ids)], parents)
+        descendant_ids = {node.name.strip() for node in _leaf_nodes(mrca) if node.name}
+        conflicting = set()
+        for row in all_rows:
+            leaf_id = _tree_leaf(row)
+            if leaf_id not in descendant_ids or leaf_id in target_leaf_ids:
+                continue
+            other_lineage = _pangenome_lineage(row)
+            other = str(other_lineage.get(rank) or '').strip()
+            if not other and rank == 'g' and other_lineage.get('s'):
+                other = str(other_lineage['s']).split()[0]
+            if other and normalise_taxon_name(other) != normalise_taxon_name(taxon):
+                conflicting.add(other)
+        if conflicting:
+            return False, f'tree MRCA also contains other assigned GTDB {rank} taxa: ' + ';'.join(sorted(conflicting))
+        return True, f'tree MRCA contains no conflicting assigned {rank} taxa at this rank'
+    except Exception as exc:
+        return False, f'tree clade concordance could not be assessed: {exc}'
+
+
 def _farthest_first(rows: List[dict], anchors: List[str], distances: Dict[tuple[str, str], float]) -> List[tuple[dict, Optional[float]]]:
     remaining = list(rows)
     chosen: List[tuple[dict, Optional[float]]] = []
@@ -409,38 +607,179 @@ def _farthest_first(rows: List[dict], anchors: List[str], distances: Dict[tuple[
     return chosen
 
 
-def _committed_ids_by_species(db) -> Dict[str, List[str]]:
+def _committed_ids_by_rank(db) -> dict[tuple[str, str], list[str]]:
+    """Index committed genomes exclusively by their stored GTDB taxonomy."""
     if db is None:
         return {}
     try:
-        roles = db.get_dataset_roles()
         with db.connect() as conn:
-            rows = conn.execute(
-                "SELECT s.id, s.dataset, t.taxonomy, COALESCE(m.selected_for_wgs, 0), "
-                "COALESCE(m.selected_for_sequencing, 0) "
-                "FROM sequences s LEFT JOIN taxonomy t ON s.id = t.id "
-                "LEFT JOIN sequencing_metadata m ON s.id = m.id ORDER BY t.rowid"
+            tables = {str(row[0]) for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            if 'genome_records' not in tables:
+                return {}
+            records = conn.execute(
+                "SELECT sequence_id, genome_qc_pass, gtdb_taxonomy FROM genome_records "
+                "WHERE sequence_id IS NOT NULL"
             ).fetchall()
     except Exception:
         return {}
-    records = {}
-    for sid, dataset, taxonomy, available, selected in rows:
-        entry = records.setdefault(str(sid), {'dataset': str(dataset or ''), 'taxonomy': '', 'available': False, 'selected': False})
-        if taxonomy:
-            entry['taxonomy'] = str(taxonomy)
-        entry['available'] = entry['available'] or bool(available)
-        entry['selected'] = entry['selected'] or bool(selected)
-    result: Dict[str, List[str]] = defaultdict(list)
-    for sid, entry in records.items():
-        role = roles.get(entry['dataset'], {})
-        committed = (
-            (role.get('role') == 'baseline' and role.get('genomes_available'))
-            or entry['available'] or entry['selected']
-        )
-        species = _species(entry['taxonomy'])
-        if committed and species:
-            result[normalise_taxon_name(species)].append(sid)
-    return {key: sorted(set(values)) for key, values in result.items()}
+    indexed = defaultdict(set)
+    for sid, qc_pass, taxonomy in records:
+        sid = str(sid or '').strip()
+        if not sid or str(qc_pass).strip().casefold() not in {'1', 'true', 'yes', 'pass', 'passed'}:
+            continue
+        lineage = parse_taxon_string(str(taxonomy or ''))
+        for rank, _rank_name in RANKS:
+            value = str(lineage.get(rank) or '').strip()
+            if not value and rank == 'g' and lineage.get('s'):
+                value = str(lineage['s']).split()[0]
+            if value:
+                indexed[(rank, normalise_taxon_name(value), _gtdb_lineage_key(lineage, rank))].add(sid)
+    return {key: sorted(values) for key, values in indexed.items()}
+
+
+def write_pangenome_hierarchy_tsv(
+    assessment_rows: List[dict], output_path: str | Path, *, tree_path=None,
+    db=None, pangenome_target: int = DEFAULT_PANGENOME_TARGET,
+) -> str:
+    """Write independent pangenome assessments at every GTDB-supported rank."""
+    target = max(1, int(pangenome_target or DEFAULT_PANGENOME_TARGET))
+    grouped = defaultdict(list)
+    rank_names = dict(RANKS)
+    pangenome_rows = list(assessment_rows)
+    # Genome-only isolates have no marker sequence/tree leaf, but their genome
+    # taxonomy and QC are valid inputs to genome representation counts.
+    if db is not None:
+        try:
+            with db.connect() as conn:
+                genome_rows = conn.execute(
+                    "SELECT gr.sequence_id, s.dataset, gr.genome_id, gr.genome_status, "
+                    "gr.genome_qc_pass, gr.completeness, gr.contamination, gr.gtdb_taxonomy "
+                    "FROM genome_records gr LEFT JOIN sequences s ON s.id=gr.sequence_id"
+                ).fetchall()
+            assessment_ids = {str(row.get('id') or row.get('sequence_id') or '') for row in pangenome_rows}
+            for sid, dataset, genome_id, status, qc_pass, completeness, contamination, taxonomy in genome_rows:
+                sid = str(sid or '')
+                qc_passed = str(qc_pass).strip().casefold() in {'1', 'true', 'yes', 'pass', 'passed'}
+                if not sid or sid in assessment_ids or not taxonomy or not qc_passed:
+                    continue
+                pangenome_rows.append({
+                    'id': sid, 'dataset': str(dataset or ''),
+                    'taxonomy': str(taxonomy or ''),
+                    'gtdb_taxonomy': str(taxonomy or ''),
+                    'gtdb_assignment_status': 'CONFIDENT',
+                    'classification_assignment_status': 'PROVISIONAL',
+                    'already_sequenced': 'true', 'selected_for_genome_sequencing': 'false',
+                    'local_neighbourhood_figure': 'no_tree_context',
+                    'genome_id': str(genome_id or ''), 'genome_qc_pass': qc_pass,
+                    'genome_completeness': completeness, 'genome_contamination': contamination,
+                    'evidence_source': 'genome_only',
+                })
+        except Exception as exc:
+            logger.warning('[PANGENOME] Could not load genome-only records: %s', exc)
+    for row in pangenome_rows:
+        lineage = _pangenome_lineage(row)
+        lineage_source = _pangenome_lineage_source(row)
+        figure = str(row.get('local_neighbourhood_figure') or '').strip()
+        context = figure if figure not in {'', 'NA', 'None', 'no_tree_context'} else 'no_tree_context'
+        for rank, rank_name in RANKS:
+            value = str(lineage.get(rank) or '').strip()
+            if not value and rank == 'g' and lineage.get('s'):
+                value = str(lineage['s']).split()[0]
+            if value and value.lower() not in {'na','none','unclassified','uncultured'}:
+                lineage_key = _gtdb_lineage_key(lineage, rank)
+                grouped[(rank, normalise_taxon_name(value), context, lineage_source, lineage_key)].append(row)
+    committed = _committed_ids_by_rank(db)
+    tree_context_rows = _tree_reference_rows(db, tree_path, pangenome_rows)
+    all_tree_rows = list(pangenome_rows) + tree_context_rows
+    output = []
+    for (rank, _normalised, context, lineage_source, _lineage_key), members in sorted(grouped.items()):
+        taxon = str(_pangenome_lineage(members[0]).get(rank) or '').strip()
+        member_leaf_ids = [_tree_leaf(row) for row in members]
+        try:
+            tree_leaves = _parse_tree(tree_path)[2] if tree_path and Path(tree_path).exists() else {}
+        except Exception:
+            tree_leaves = {}
+        missing_tree_leaves = sorted({leaf for leaf in member_leaf_ids if leaf in {'', 'NA', 'None'} or leaf not in tree_leaves})
+        leaves_ok = context != 'no_tree_context' and bool(tree_leaves) and not missing_tree_leaves
+        tree_ok = False
+        tree_reason = 'tree/local-clade context unavailable'
+        if leaves_ok:
+            # The generic checker also verifies all members are represented
+            # and excludes competing GTDB assignments at this rank.
+            tree_ok, tree_reason = _tree_taxon_clade_agrees(
+                tree_path, members, all_tree_rows, rank, taxon,
+            )
+        committed_ids = committed.get((rank, _normalised, _lineage_key), [])
+        # Pangenome targets are defined at GTDB rank/taxon, not at the
+        # individual local-tree-clade level.  Candidate-set reporting already
+        # counts committed isolates across every clade for this taxon; use the
+        # same universe here so hierarchy rows cannot report a different gap
+        # merely because a committed isolate belongs to another neighbourhood.
+        current_committed = set()
+        for candidate in pangenome_rows:
+            candidate_lineage = _pangenome_lineage(candidate)
+            candidate_value = str(candidate_lineage.get(rank) or '').strip()
+            if not candidate_value and rank == 'g' and candidate_lineage.get('s'):
+                candidate_value = str(candidate_lineage['s']).split()[0]
+            if (
+                candidate_value
+                and normalise_taxon_name(candidate_value) == _normalised
+                and _gtdb_lineage_key(candidate_lineage, rank) == _lineage_key
+                and _committed(candidate)
+            ):
+                candidate_id = str(candidate.get('id') or candidate.get('sequence_id') or '').strip()
+                if candidate_id:
+                    current_committed.add(candidate_id)
+        all_committed = sorted(set(committed_ids) | current_committed)
+        # Formal targets/gaps require a usable GTDB lineage and validated tree context.
+        eligible = bool(taxon and lineage_source == 'GTDB' and leaves_ok and tree_ok)
+        if lineage_source != 'GTDB':
+            tree_reason = f'{lineage_source.lower().replace("_", " ")} lineage is exploratory only; usable GTDB lineage is not supplied'
+        elif missing_tree_leaves:
+            tree_reason = f'{len(missing_tree_leaves)} member(s) are absent from the phylogenetic tree'
+        count = len(all_committed)
+        disagreements = []
+        unresolved = []
+        for row in members:
+            classifier_value = str(parse_taxon_string(str(row.get('taxonomy') or '')).get(rank) or '').strip()
+            if not classifier_value:
+                unresolved.append(str(row.get('id')))
+            elif normalise_taxon_name(classifier_value) != _normalised:
+                disagreements.append(str(row.get('id')))
+        output.append({
+            'PangenomeRank': rank_names.get(rank, rank).upper(),
+            'PangenomeTaxon': taxon or 'NA',
+            'TaxonomyProvenance': lineage_source,
+            'LocalTreeContext': context,
+            'CandidateCount': len(members),
+            'CommittedGenomeCount': count,
+            'CommittedGenomeIDs': ';'.join(all_committed) or 'None',
+            'PangenomeTarget': target if eligible else 'NA',
+            'PangenomeGap': max(0, target-count) if eligible else 'NA',
+            'PangenomeEligible': 'Yes' if eligible else 'No',
+            'EligibilityReason': tree_reason if eligible else f'GTDB rank/taxon or reference tree context unresolved; {tree_reason}',
+            'ClassifierMarkerGTDBDisagreementCount': len(disagreements),
+            'ClassifierMarkerGTDBDisagreementIDs': ';'.join(sorted(disagreements)) or 'None',
+            'ClassifierUnresolvedCount': len(unresolved),
+            'ClassifierUnresolvedIDs': ';'.join(sorted(unresolved)) or 'None',
+            'CandidateIDs': ';'.join(sorted(str(row.get('id')) for row in members)),
+        })
+    fields = [
+        'PangenomeRank','PangenomeTaxon','TaxonomyProvenance','LocalTreeContext','CandidateCount',
+        'CommittedGenomeCount','CommittedGenomeIDs','PangenomeTarget','PangenomeGap',
+        'PangenomeEligible','EligibilityReason','ClassifierMarkerGTDBDisagreementCount',
+        'ClassifierMarkerGTDBDisagreementIDs','ClassifierUnresolvedCount',
+        'ClassifierUnresolvedIDs','CandidateIDs',
+    ]
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', lineterminator='\n')
+        writer.writeheader()
+        writer.writerows(output)
+    return str(path)
 
 
 def build_sequencing_sets(
@@ -456,7 +795,7 @@ def build_sequencing_sets(
     baseline_extension_min_identity: float = DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY,
     baseline_extension_min_query_coverage: float = DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE,
 ) -> str:
-    """Assign rolling nine-member diversity panels within species or local clades."""
+    """Assign rolling candidate panels using GTDB rank and local tree context."""
     target = max(1, int(pangenome_target or DEFAULT_PANGENOME_TARGET))
     set_size = max(target, int(candidate_set_size or DEFAULT_CANDIDATE_SET_SIZE))
     redundancy_identity = float(baseline_redundancy_identity)
@@ -478,44 +817,121 @@ def build_sequencing_sets(
         grouped[key].append(row)
         group_metadata[key] = (basis, taxon)
 
-    committed_by_species = _committed_ids_by_species(db)
+    committed_by_rank = _committed_ids_by_rank(db)
+    tree_context_rows = _tree_reference_rows(db, tree_path, assessment_rows)
+    all_tree_rows = list(assessment_rows) + tree_context_rows
     leaf_ids = [_tree_leaf(row) for row in assessment_rows]
-    leaf_ids.extend(
-        sid for committed_ids in committed_by_species.values() for sid in committed_ids
-    )
+    leaf_ids.extend(sid for committed_ids in committed_by_rank.values() for sid in committed_ids)
     distances = {}
+    tree_leaf_ids = set()
     if tree_path and Path(tree_path).exists():
         try:
             distances = pairwise_leaf_distances(tree_path, leaf_ids)
+            tree_leaf_ids = {
+                left for (left, right) in distances if left == right
+            }
         except Exception:
             distances = {}
+            tree_leaf_ids = set()
     output_rows = []
     for group_key in sorted(grouped):
         members = grouped[group_key]
         basis, taxon = group_metadata[group_key]
-        species = _species(members[0].get('taxonomy'))
-        species_key = normalise_taxon_name(species) if species else ''
-        committed_ids = committed_by_species.get(species_key, []) if species_key else [
-            str(row.get('id')) for row in members if _committed(row)
+        rank, rank_name, partner_taxon = _partner_rank_taxon(members[0])
+        gtdb_taxon_present = bool(rank and partner_taxon)
+        member_taxa_agree = all(
+            _partner_rank_taxon(row)[0] == rank
+            and normalise_taxon_name(_partner_rank_taxon(row)[2]) == normalise_taxon_name(partner_taxon)
+            for row in members
+        ) if gtdb_taxon_present else False
+        classifier_disagreements = [
+            str(row.get('id')) for row in members
+            if partner_taxon
+            and parse_taxon_string(str(row.get('taxonomy') or '')).get(rank)
+            and normalise_taxon_name(parse_taxon_string(str(row.get('taxonomy') or '')).get(rank))
+                != normalise_taxon_name(partner_taxon)
         ]
-        hungate_count = max((_int(row.get('hungate_genome_count_same_species')) for row in members), default=0)
-        secondary_count = max((_int(row.get('secondary_baseline_genome_count_same_species')) for row in members), default=0)
-        prior_baseline_count = max((_int(row.get('genome_available_count_same_species')) for row in members), default=0)
-        if hungate_count + secondary_count == 0 and prior_baseline_count:
-            hungate_count = prior_baseline_count
-        baseline_count = hungate_count + secondary_count
-        selected_count = max((_int(row.get('genome_selected_count_same_species')) for row in members), default=0)
-        pending_count = max((_int(row.get('genome_pending_count_same_species')) for row in members), default=0)
-        committed_count = max(baseline_count + selected_count + pending_count, len(committed_ids))
-        gap = max(0, target - committed_count)
+        concordance_reason = (
+            f'{len(classifier_disagreements)} marker-classifier/GTDB disagreement(s); GTDB retained as pangenome authority'
+            if classifier_disagreements else 'usable GTDB taxon is available'
+        )
+        tree_context_consistent = bool(tree_path and Path(tree_path).exists()) and all(
+            str(row.get('local_neighbourhood_figure') or '').strip()
+            not in {'', 'NA', 'None', 'no_tree_context'}
+            and _tree_leaf(row) in tree_leaf_ids
+            for row in members
+        )
+        tree_clade_agrees, tree_clade_reason = (
+            _tree_taxon_clade_agrees(tree_path, members, all_tree_rows, rank, partner_taxon)
+            if tree_context_consistent and gtdb_taxon_present else (False, 'GTDB taxon or resolved local tree context is unavailable')
+        )
+        pangenome_eligible = gtdb_taxon_present and member_taxa_agree and tree_context_consistent and tree_clade_agrees
+        group_lineage_key = _gtdb_lineage_key(_pangenome_lineage(members[0]), rank)
+        taxon_key = (rank, normalise_taxon_name(partner_taxon), group_lineage_key) if pangenome_eligible else ('', '', '')
+        # Count all current committed candidates at this GTDB rank before
+        # treating the remaining committed IDs as reference genomes.
+        current_committed_for_taxon = set()
+        if pangenome_eligible:
+            for assessment_row in assessment_rows:
+                candidate_rank, _candidate_rank_name, candidate_taxon = _partner_rank_taxon(assessment_row)
+                if (
+                    _committed(assessment_row) and candidate_rank == rank
+                    and normalise_taxon_name(candidate_taxon) == normalise_taxon_name(partner_taxon)
+                    and _gtdb_lineage_key(_pangenome_lineage(assessment_row), rank) == group_lineage_key
+                ): 
+                    current_committed_for_taxon.add(str(assessment_row.get('id')))
+        committed_ids = (
+            sorted(set(committed_by_rank.get(taxon_key, [])) | current_committed_for_taxon)
+            if pangenome_eligible else sorted(str(row.get('id')) for row in members if _committed(row))
+        )
+        # Counts are drawn from the rank-matched committed index. This avoids
+        # reusing species-only novelty metrics for genus/family groups.
+        committed_count = len(committed_ids) if pangenome_eligible else len([row for row in members if _committed(row)])
+        baseline_count = max(0, len(set(committed_ids) - current_committed_for_taxon)) if pangenome_eligible else 0
+        # Keep source-specific baseline counts separate from the generic
+        # rank-matched total; the rank index combines all registered baselines.
+        hungate_count = 0
+        secondary_count = 0
+        selected_count = len([row for row in members if _selected(row)]) if pangenome_eligible else 0
+        pending_count = selected_count
+        gap = max(0, target - committed_count) if pangenome_eligible else target
+        reported_target = target if pangenome_eligible else 'NA'
+        reported_gap = gap if pangenome_eligible else 'NA'
+        for member in members:
+            member['pangenome_eligible'] = 'Yes' if pangenome_eligible else 'No'
+            member['pangenome_target'] = reported_target
+            member['pangenome_gap'] = reported_gap
+            member['pangenome_rank'] = rank_name.upper() if rank_name else 'UNASSIGNED'
+            member['pangenome_committed_count'] = committed_count
+            member['pangenome_committed_ids'] = ';'.join(committed_ids) or 'None'
+            member['pangenome_baseline_count'] = baseline_count
+            member['pangenome_taxon'] = partner_taxon or 'NA'
+            classifier_rank_value = str(parse_taxon_string(str(member.get('taxonomy') or '')).get(rank) or '') if rank else ''
+            member['classifier_gtdb_disagreement'] = (
+                'UNRESOLVED' if not classifier_rank_value else
+                'Yes' if normalise_taxon_name(classifier_rank_value) != normalise_taxon_name(partner_taxon) else 'No'
+            )
+            member['classifier_database_concordance_status'] = _classifier_database_concordance_status(member)
+            member['pangenome_taxonomy_provenance'] = 'GTDB' if gtdb_taxon_present else 'UNRESOLVED'
+            if not gtdb_taxon_present:
+                member['pangenome_eligibility_status'] = 'NOT_ELIGIBLE_NO_USABLE_GTDB_TAXON'
+            elif not member_taxa_agree:
+                member['pangenome_eligibility_status'] = 'NOT_ELIGIBLE_MIXED_GTDB_TAXA'
+            elif not tree_context_consistent:
+                member['pangenome_eligibility_status'] = 'NOT_ELIGIBLE_TREE_LEAF_OR_CONTEXT_MISSING'
+            elif not tree_clade_agrees:
+                member['pangenome_eligibility_status'] = 'NOT_ELIGIBLE_TREE_CLADE_CONFLICT_OR_UNRESOLVED'
+            else:
+                member['pangenome_eligibility_status'] = 'ELIGIBLE_GTDB_TAXON_TREE_CONCORDANT'
+            member['pangenome_eligibility_reason'] = (
+                f'GTDB {rank_name} assignment and rank-matched local tree context available; {concordance_reason}'
+                if pangenome_eligible else
+                f'{concordance_reason}; {tree_clade_reason}'
+            )
         novel_clade = _novel_looking(members)
-        if species and hungate_count > 0:
-            group_type = 'HUNGATE_BASELINE_EXTENSION'
-            basis = 'Hungate-anchored pangenome extension: exact species + close full-length marker'
-            set_prefix = 'BMEXT'
-        elif species and secondary_count > 0:
-            group_type = 'SECONDARY_BASELINE_EXTENSION'
-            basis = 'secondary cultured-project baseline extension: exact species + close full-length marker'
+        if pangenome_eligible and rank == 's' and baseline_count > 0:
+            group_type = 'BASELINE_PANGENOME_EXTENSION'
+            basis = 'GTDB species group with rank-matched cultured-baseline context'
             set_prefix = 'BMEXT'
         else:
             group_type = 'CANDIDATE_ONLY_GROUP'
@@ -524,11 +940,14 @@ def build_sequencing_sets(
         set_id = _stable_set_id(group_key, set_prefix)
 
         def same_species_hits(hit_key: str, tax_key: str) -> set[str]:
+            if not rank or not partner_taxon:
+                return set()
+            target_value = _rank_value({'gtdb_taxonomy': members[0].get('gtdb_taxonomy')}, rank)
             return {
                 str(row.get(hit_key)) for row in members
                 if str(row.get(hit_key) or '') not in {'', 'NA', 'None'}
-                and _species(row.get(tax_key))
-                and normalise_taxon_name(_species(row.get(tax_key))) == species_key
+                and _rank_value({'taxonomy': row.get(tax_key)}, rank)
+                and normalise_taxon_name(_rank_value({'taxonomy': row.get(tax_key)}, rank)) == normalise_taxon_name(target_value)
             }
 
         hungate_anchor_ids = sorted(same_species_hits('hungate_nearest_hit', 'hungate_nearest_hit_taxonomy'))
@@ -576,9 +995,21 @@ def build_sequencing_sets(
             extension_status = row.get('baseline_extension_status', 'NOT_APPLICABLE_CANDIDATE_GROUP')
             extension_reason = 'not a baseline-pangenome extension group'
             if is_baseline_extension:
-                extension_eligible, extension_status, extension_reason = baseline_extension_evidence(
-                    row, extension_identity, extension_coverage,
-                )
+                classifier_species = _species(row.get('taxonomy'))
+                if rank == 's' and (
+                    not classifier_species
+                    or normalise_taxon_name(classifier_species) != normalise_taxon_name(partner_taxon)
+                ):
+                    # A marker-classifier disagreement is diagnostic only. It
+                    # must not move the isolate out of its catalogue-defined
+                    # species pangenome group or force boundary review.
+                    extension_eligible = True
+                    extension_status = 'CATALOGUE_TAXON_RETAINED_CLASSIFIER_DISCORDANT'
+                    extension_reason = 'GTDB species grouping retained despite marker-classifier discordance/unresolved species'
+                else:
+                    extension_eligible, extension_status, extension_reason = baseline_extension_evidence(
+                        row, extension_identity, extension_coverage,
+                    )
                 row['baseline_extension_status'] = extension_status
 
             redundant, identity, coverage = baseline_redundancy_evidence(
@@ -603,7 +1034,7 @@ def build_sequencing_sets(
                     )
                 elif retained_for_gap:
                     row['baseline_redundancy_status'] = 'RETAINED_FOR_PANGENOME_GAP_PENDING_REVIEW'
-                    row['sequencing_set_reason'] += '; same-species pangenome gap remains'
+                    row['sequencing_set_reason'] += '; GTDB-rank pangenome gap remains'
                 else:
                     row['baseline_redundancy_status'] = 'NOT_EVALUATED_EVIDENCE'
                     row['baseline_extension_status'] = 'NOT_EVALUATED_EVIDENCE'
@@ -664,8 +1095,19 @@ def build_sequencing_sets(
                 'SelectedPendingGenomes': pending_count,
                 'CommittedGenomeCount': committed_count,
                 'CommittedGenomeIDs': ';'.join(committed_ids) or 'None',
-                'PangenomeTarget': target,
-                'PangenomeGap': gap,
+                'PangenomeTarget': reported_target,
+                'PangenomeGap': reported_gap,
+                'PangenomeEligible': 'Yes' if pangenome_eligible else 'No',
+                'PangenomeEligibilityReason': (
+                    f'GTDB {rank_name} assignment and rank-matched tree context available; {concordance_reason}'
+                    if pangenome_eligible else f'{concordance_reason}; {tree_clade_reason}'
+                ),
+                'PangenomeRank': rank_name.upper() if rank_name else 'UNASSIGNED',
+                'PangenomeTaxon': partner_taxon or 'NA',
+                'PartnerTaxon': row.get('partner_taxon', 'NA'),
+                'ClassifierGTDBDisagreement': row.get('classifier_gtdb_disagreement', 'NA'),
+                'TaxonomyAssignmentStatus': _assignment_status(row),
+                'ClassifierDatabaseConcordanceStatus': row.get('classifier_database_concordance_status', 'NOT_ASSESSED'),
                 'DiversityPanelSize': set_size,
                 'EligibleCandidateCount': len(eligible),
                 'RankedCandidateCount': ranked_count,
@@ -715,7 +1157,10 @@ def build_sequencing_sets(
         'NovelLookingClade', 'HungateBaselineGenomes', 'SecondaryBaselineGenomes',
         'CulturedProjectBaselineGenomes', 'BaselineGenomes',
         'SequencedPartnerGenomes', 'SelectedPendingGenomes', 'CommittedGenomeCount', 'CommittedGenomeIDs',
-        'PangenomeTarget', 'PangenomeGap', 'DiversityPanelSize', 'EligibleCandidateCount',
+        'PangenomeTarget', 'PangenomeGap', 'PangenomeEligible', 'PangenomeEligibilityReason',
+        'PangenomeRank', 'PangenomeTaxon', 'PartnerTaxon', 'ClassifierGTDBDisagreement',
+        'TaxonomyAssignmentStatus', 'ClassifierDatabaseConcordanceStatus',
+        'DiversityPanelSize', 'EligibleCandidateCount',
         'RankedCandidateCount', 'BaselineRedundantCount', 'UnfilledPanelRanks',
         'CandidateID', 'PartnerID', 'SetRole', 'SetRank', 'EvidenceQuality',
         'BaselineEvidenceClass', 'HungateNearestIdentity', 'HungateNearestQueryCoverage',

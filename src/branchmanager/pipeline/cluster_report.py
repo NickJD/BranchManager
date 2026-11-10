@@ -629,7 +629,10 @@ def write_clusters_csv(
     # Build fieldnames dynamically
     base_fields = [
         'ClusterID', 'ID', 'IsRepresentative', 'BackupRank', 'PrimaryID', 'BackupRationale',
-        'Taxonomy', 'ClassificationHit', 'ClassificationIdentity', 'ClassificationConfidence',
+        'Taxonomy', 'ClassificationHit', 'ClassificationIdentity', 'SourceClassifierConfidence',
+        'AssignmentStatus', 'AssignmentEvidenceLevel', 'AlignmentEvidenceStatus',
+        'EvidenceTier', 'TaxonomySupportPct', 'TaxonomyCandidateCount', 'EvidenceInterpretation',
+        'QueryCoverage', 'TargetCoverage', 'AlignmentLength',
         'NearestHit', 'NearestIdentity',
         'MatchesGE99', 'MatchesGE97', 'MatchesGE95',
         'NoveltyScore', 'Crowding', 'SequencingPriority',
@@ -645,7 +648,12 @@ def write_clusters_csv(
             f'Taxonomy_{safe}',
             f'ClassificationHit_{safe}',
             f'Identity_{safe}',
-            f'Confidence_{safe}',
+            f'SourceClassifierConfidence_{safe}',
+            f'QueryCoverage_{safe}', f'TargetCoverage_{safe}', f'AlignmentLength_{safe}',
+            f'AssignmentStatus_{safe}', f'TaxonomySupportPct_{safe}',
+            f'TaxonomyCandidateCount_{safe}', f'EvidenceTier_{safe}',
+            f'AlignmentEvidenceStatus_{safe}', f'AssignmentEvidenceLevel_{safe}',
+            f'EvidenceInterpretation_{safe}',
         ]
     fieldnames = base_fields + alt_fields
 
@@ -709,7 +717,23 @@ def write_clusters_csv(
                 flat_alt[f'Taxonomy_{safe}'] = row.get(f'alt_tax_{safe}', 'NA')
                 flat_alt[f'ClassificationHit_{safe}'] = row.get(f'alt_class_hit_{safe}', 'NA')
                 flat_alt[f'Identity_{safe}'] = row.get(f'alt_ident_{safe}', 'NA')
-                flat_alt[f'Confidence_{safe}'] = row.get(f'alt_conf_{safe}', 'NA')
+                flat_alt[f'SourceClassifierConfidence_{safe}'] = row.get(f'alt_conf_{safe}', 'NA')
+                for field in (
+                    'query_coverage', 'target_coverage', 'alignment_length',
+                    'assignment_status', 'taxonomy_support_pct', 'taxonomy_candidate_count',
+                    'evidence_tier', 'alignment_evidence_status',
+                    'assignment_evidence_level', 'evidence_interpretation',
+                ):
+                    header = {
+                        'query_coverage': 'QueryCoverage', 'target_coverage': 'TargetCoverage',
+                        'alignment_length': 'AlignmentLength', 'assignment_status': 'AssignmentStatus',
+                        'taxonomy_support_pct': 'TaxonomySupportPct',
+                        'taxonomy_candidate_count': 'TaxonomyCandidateCount', 'evidence_tier': 'EvidenceTier',
+                        'alignment_evidence_status': 'AlignmentEvidenceStatus',
+                        'assignment_evidence_level': 'AssignmentEvidenceLevel',
+                        'evidence_interpretation': 'EvidenceInterpretation',
+                    }[field]
+                    flat_alt[f'{header}_{safe}'] = row.get(f'alt_{field}_{safe}', 'NA')
 
             output_rows.append({
                 'ClusterID': rep_id,
@@ -721,7 +745,17 @@ def write_clusters_csv(
                 'Taxonomy': row.get('taxonomy', 'NA'),
                 'ClassificationHit': row.get('classification_hit', row.get('best_hit', 'NA')),
                 'ClassificationIdentity': row.get('classification_identity', 'NA'),
-                'ClassificationConfidence': row.get('classification_confidence', 'NA'),
+                'SourceClassifierConfidence': row.get('classification_confidence', 'NA'),
+                'AssignmentStatus': row.get('classification_assignment_status', 'NA'),
+                'AssignmentEvidenceLevel': row.get('classification_assignment_evidence_level', 'NA'),
+                'AlignmentEvidenceStatus': row.get('classification_alignment_evidence_status', 'NA'),
+                'EvidenceTier': row.get('classification_evidence_tier', 'NA'),
+                'TaxonomySupportPct': row.get('classification_taxonomy_support_pct', 'NA'),
+                'TaxonomyCandidateCount': row.get('classification_taxonomy_candidate_count', 'NA'),
+                'EvidenceInterpretation': row.get('classification_evidence_interpretation', 'NA'),
+                'QueryCoverage': row.get('classification_query_coverage', 'NA'),
+                'TargetCoverage': row.get('classification_target_coverage', 'NA'),
+                'AlignmentLength': row.get('classification_alignment_length', 'NA'),
                 'NearestHit': row.get('nearest_hit', 'NA'),
                 'NearestIdentity': row.get('nearest_identity', 'NA'),
                 'MatchesGE99': row.get('matches_ge_99', 'NA'),

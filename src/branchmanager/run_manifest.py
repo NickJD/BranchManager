@@ -108,6 +108,17 @@ def external_tool_versions() -> dict:
     }
 
 
+def _policy_versions() -> dict:
+    from branchmanager.marker_evidence import MARKER_EVIDENCE_POLICY_VERSION
+    versions = {'marker_evidence_policy_version': MARKER_EVIDENCE_POLICY_VERSION}
+    try:
+        from branchmanager.pipeline.paper_trail import PAPER_TRAIL_QC_POLICY_VERSION
+        versions['qc_policy_version'] = PAPER_TRAIL_QC_POLICY_VERSION
+    except Exception:
+        versions['qc_policy_version'] = 'unavailable'
+    return versions
+
+
 def git_revision(start: str | Path) -> str:
     try:
         result = subprocess.run(
@@ -152,6 +163,8 @@ class RunManifest:
                 'cwd': os.getcwd(),
             },
             'external_tools': external_tool_versions(),
+            'policies': _policy_versions(),
+            'reference_identity': {},
             'inputs': [],
             'stages': [],
             'outputs': [],
@@ -179,6 +192,11 @@ class RunManifest:
         self.data['inputs'].append(record)
         self.write()
         return record
+
+    def set_reference_identity(self, **values: object) -> None:
+        """Record reference identity such as gtdb_release, gtdb_summary_sha256, reference_sha256."""
+        self.data.setdefault('reference_identity', {}).update({k: v for k, v in values.items() if v not in (None, '')})
+        self.write()
 
     def add_stage(self, name: str, status: str, *, detail: str = '') -> None:
         self.data['stages'].append({

@@ -12,14 +12,13 @@ a consistent safe ID to both the manifest and the output filename.
 
 import argparse
 import csv
-import gzip
-import hashlib
 import os
 import re
 import shutil
-import sys
 import unicodedata
 from pathlib import Path
+
+from branchmanager.utils.io import write_tsv, sha256sum, sha256sum_gzip
 
 
 AB1_SUFFIXES = ('.ab1', '.abi', '.ab1.gz', '.abi.gz')
@@ -228,10 +227,7 @@ def _build_safe_id_map(ids):
 
 
 def _write_tsv(path, rows, fieldnames):
-    with open(path, 'w', newline='', encoding='utf-8') as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter='\t')
-        writer.writeheader()
-        writer.writerows(rows)
+    write_tsv(path, list(fieldnames), rows)
 
 
 def _write_id_map(path, id_map):
@@ -241,20 +237,11 @@ def _write_id_map(path, id_map):
 
 
 def _sha256_file(path):
-    digest = hashlib.sha256()
-    with open(path, 'rb') as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return sha256sum(path)
 
 
 def _sha256_trace_source(path):
-    digest = hashlib.sha256()
-    opener = gzip.open if str(path).lower().endswith('.gz') else open
-    with opener(path, 'rb') as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return sha256sum_gzip(path)
 
 
 def _copy_as_ab1(source, destination):

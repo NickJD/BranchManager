@@ -1,4 +1,4 @@
-import gzip
+from .io import open_text as _open_text
 
 
 _RC_TABLE = str.maketrans({
@@ -11,18 +11,8 @@ _RC_TABLE = str.maketrans({
 })
 
 
-def _open_maybe_gzip(path, mode="rt"):
-    """Open a file path, transparently handling .gz compressed files.
-
-    mode should be text mode ('rt' or 'wt') when reading/writing strings.
-    """
-    if str(path).endswith('.gz'):
-        return gzip.open(path, mode)
-    return open(path, mode)
-
-
 def read_fasta(path):
-    with _open_maybe_gzip(path, 'rt') as f:
+    with _open_text(path, 'rt') as f:
         header = None
         seq = []
 
@@ -47,9 +37,7 @@ def write_fasta(records, path):
     if p.parent and not p.parent.exists():
         p.parent.mkdir(parents=True, exist_ok=True)
 
-    # choose gzip writer if path endswith .gz
-    mode = 'wt'
-    with _open_maybe_gzip(path, mode) as f:
+    with _open_text(path, 'wt') as f:
         for h, s in records:
             f.write(f">{h}\n{s}\n")
 

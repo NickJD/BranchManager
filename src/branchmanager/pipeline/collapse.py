@@ -92,6 +92,7 @@ def collapse_fasta_within_taxa(
                                         cluster_id = parts[1]
                                         member_map.setdefault(cluster_id, []).append(seq_label)
                     except Exception:
+                        logger.debug('Failed to parse vsearch UC file; skipping member mapping')
                         member_map = {}
                     for h, seq in cent_recs:
                         count = 1
@@ -136,7 +137,7 @@ def collapse_fasta_within_taxa(
                 try:
                     tmp_path.unlink()
                 except Exception:
-                    pass
+                    logger.debug('Failed to clean up temporary file %s', tmp_path)
 
     collapsed_path = outdir_p / collapsed_fasta_name
     map_path = outdir_p / map_name

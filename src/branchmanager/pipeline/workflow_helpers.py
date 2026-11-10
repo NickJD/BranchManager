@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from branchmanager.pipeline.evidence_policy import evidence_quality as _shared_evidence_quality
 import gzip
+import json
 import os
 import csv
 from pathlib import Path
@@ -11,10 +13,11 @@ from branchmanager.taxonomy import (
     normalise_taxon_name,
     parse_reference_header_taxonomy,
     parse_taxon_string,
+    domain_designation,
+    infer_taxon_rank,
     taxonomy_matches_kingdom,
 )
 from branchmanager.utils.fasta import read_fasta
-from branchmanager.pipeline.selection_sets import SELECTION_BLOCKING_PLACEMENT_FLAGS
 
 
 ClassificationRow = Dict[str, object]
@@ -35,7 +38,7 @@ def _assignment_source_is_fasta(assignments_path: str, source_fasta_path: Option
         if source_fasta_path and os.path.samefile(assignments_path, source_fasta_path):
             return True
     except Exception:
-        pass
+        pass  # samefile may fail on different mounts or symlinks
 
     try:
         if str(assignments_path).endswith('.gz'):
@@ -49,6 +52,7 @@ def _assignment_source_is_fasta(assignments_path: str, source_fasta_path: Option
                     continue
                 return stripped.startswith('>')
     except Exception:
+        logger.debug('Could not read file %s to check if it is a FASTA', assignments_path)
         return False
     return False
 
@@ -65,7 +69,7 @@ def build_orig_to_short_map(alias_entries, db) -> Dict[str, str]:
             if cid:
                 mapping[cid] = short
         except Exception:
-            pass
+            logger.debug('Could not resolve canonical ID for alias %r', orig)
     return mapping
 
 
@@ -75,6 +79,7 @@ def resolve_short_id(qid: str, orig_to_short: Dict[str, str], db) -> Optional[st
     try:
         cid = db._canonical_from_header(qid)
     except Exception:
+        logger.debug('Could not resolve canonical ID for %r', qid)
         cid = None
     if isinstance(cid, str) and cid in orig_to_short:
         return orig_to_short[cid]
@@ -84,13 +89,19 @@ def resolve_short_id(qid: str, orig_to_short: Dict[str, str], db) -> Optional[st
             if isinstance(key, str) and key.lower() == lk:
                 return value
     except Exception:
-        pass
+        logger.debug('Case-insensitive ID lookup failed for %r', qid)
     return None
 
 
 def iter_classification_rows(classification_tsv: str) -> Iterator[ClassificationRow]:
     with open(classification_tsv) as handle:
-        next(handle, None)
+        header = next(handle, None)
+        header_fields = header.rstrip('\n').split('\t') if header else []
+        source_confidence_index = next(
+            (i for i, name in enumerate(header_fields)
+             if 'sourceclassifierconfidence' in name.lower().replace('_', '')),
+            None,
+        )
         for line in handle:
             parts = line.rstrip('\n').split('\t')
             if len(parts) < 1 or not parts[0]:
@@ -100,7 +111,13 @@ def iter_classification_rows(classification_tsv: str) -> Iterator[Classification
             except Exception:
                 identity = None
             try:
-                confidence = float(parts[4]) if len(parts) > 4 and parts[4] not in ('', 'NA') else None
+                confidence = (
+                    float(parts[source_confidence_index])
+                    if source_confidence_index is not None
+                    and len(parts) > source_confidence_index
+                    and parts[source_confidence_index] not in ('', 'NA')
+                    else None
+                )
             except Exception:
                 confidence = None
             yield {
@@ -116,6 +133,15 @@ def iter_classification_rows(classification_tsv: str) -> Iterator[Classification
                 'target_length': _optional_numeric(parts, 9, integer=True),
                 'mismatches': _optional_numeric(parts, 10, integer=True),
                 'gaps': _optional_numeric(parts, 11, integer=True),
+                'assignment_status': parts[12] if len(parts) > 12 else None,
+                'taxonomy_support_pct': _optional_numeric(parts, 13),
+                'taxonomy_lead_pct': _optional_numeric(parts, 14),
+                'assigned_rank': parts[15] if len(parts) > 15 else None,
+                'evidence_tier': parts[16] if len(parts) > 16 else None,
+                'taxonomy_candidate_count': _optional_numeric(parts, 17, integer=True),
+                'alignment_evidence_status': parts[18] if len(parts) > 18 else None,
+                'assignment_evidence_level': parts[19] if len(parts) > 19 else None,
+                'evidence_interpretation': parts[20] if len(parts) > 20 else None,
             }
 
 
@@ -252,6 +278,35 @@ def merge_combined_taxonomy_rows(base_rows, classification_tsv: str, orig_to_sho
                 row['tax'] if row['tax'] is not None else 'NA',
                 row['confidence'] if row['confidence'] is not None else 'NA',
             )
+    # The combined tree/iTOL taxonomy is partner-catalogue-led for partner
+    # isolates. Classifier taxonomy remains available in the assessment tables
+    # and database evidence; it must never overwrite the catalogue identity.
+    try:
+        with db.connect() as conn:
+            metadata_rows = conn.execute(
+                'SELECT id, project_metadata_json FROM sequencing_metadata'
+            ).fetchall()
+        for sid, metadata_json in metadata_rows:
+            metadata = json.loads(metadata_json) if metadata_json else {}
+            raw = str(metadata.get('partner_taxon_raw') or metadata.get('expected_taxon') or '').strip()
+            if not raw or str(sid) not in merged:
+                continue
+            parsed = parse_taxon_string(raw)
+            if not parsed and domain_designation(raw):
+                parsed = {'d': domain_designation(raw)}
+            if not parsed:
+                clean = ' '.join(raw.split())
+                rank = infer_taxon_rank(clean, metadata.get('partner_taxon_rank'))
+                if rank == 's' and len(clean.split()) >= 2:
+                    genus, species = clean.split()[:2]
+                    parsed = {'g': genus, 's': f'{genus} {species}'}
+                else:
+                    parsed = {rank: clean}
+            lineage = ';'.join(f'{rank}__{value}' for rank, value in parsed.items())
+            if lineage:
+                merged[str(sid)] = (lineage, 'PARTNER_CATALOGUE_GOLD_STANDARD')
+    except Exception:
+        pass
     return [(iid, merged[iid][0], merged[iid][1]) for iid in order]
 
 
@@ -299,8 +354,8 @@ def build_placement_warning_rows(classification_tsv: str, novelty_tsv: Optional[
         flags = []
         best = row.get('best')
         identity = row.get('identity')
-        confidence = row.get('confidence')
         query_coverage = row.get('query_coverage')
+        target_coverage = row.get('target_coverage')
         tax = row.get('tax')
         nov = novelty_by_qid.get(qid, {})
         nearest_identity = nov.get('nearest_identity')
@@ -309,10 +364,10 @@ def build_placement_warning_rows(classification_tsv: str, novelty_tsv: Optional[
             flags.append('NO_REFERENCE_HIT')
         if isinstance(identity, (int, float)) and float(identity) < 95.0:
             flags.append('LOW_CLASSIFICATION_IDENTITY')
-        if isinstance(confidence, (int, float)) and float(confidence) < 0.8:
-            flags.append('LOW_CONFIDENCE')
         if isinstance(query_coverage, (int, float)) and float(query_coverage) < 90.0:
             flags.append('LOW_QUERY_COVERAGE')
+        if isinstance(target_coverage, (int, float)) and float(target_coverage) < 90.0:
+            flags.append('LOW_REFERENCE_COVERAGE')
         if isinstance(nearest_identity, (int, float)) and float(nearest_identity) < 97.0:
             flags.append('LOW_NEAREST_IDENTITY')
             if tax not in (None, '', 'NA'):
@@ -326,7 +381,7 @@ def build_placement_warning_rows(classification_tsv: str, novelty_tsv: Optional[
                 'query_id': qid,
                 'taxonomy': tax if tax is not None else 'NA',
                 'classification_identity': identity if identity is not None else 'NA',
-                'classification_confidence': confidence if confidence is not None else 'NA',
+                'classification_confidence': row.get('confidence') if row.get('confidence') is not None else 'NA',
                 'nearest_identity': nearest_identity if nearest_identity is not None else 'NA',
                 'nearest_hit': nov.get('nearest_hit', 'NA') if nov else 'NA',
                 'flags': ';'.join(flags),
@@ -337,7 +392,7 @@ def build_placement_warning_rows(classification_tsv: str, novelty_tsv: Optional[
 def write_placement_warning_tsv(path: str | Path, warning_rows):
     p = Path(path)
     with open(p, 'w') as fh:
-        fh.write('ID\tQueryID\tTaxonomy\tClassificationIdentity\tClassificationConfidence\tNearestIdentity\tNearestHit\tFlags\n')
+        fh.write('ID\tQueryID\tTaxonomy\tClassificationIdentity\tSourceClassifierConfidence\tNearestIdentity\tNearestHit\tFlags\n')
         for row in warning_rows:
             fh.write(
                 f"{row['id']}\t{row['query_id']}\t{row['taxonomy']}\t{row['classification_identity']}\t"
@@ -378,6 +433,7 @@ def build_sequence_assessment_rows(
     tree_ids: Optional[set] = None,
     alt_taxonomies: Optional[Dict[str, Dict[str, tuple]]] = None,
     alt_ref_dbs: Optional[List[str]] = None,
+    alt_classification_evidence: Optional[Dict[str, Dict[str, dict]]] = None,
 ):
     """Build per-sequence assessment rows.
 
@@ -431,8 +487,6 @@ def build_sequence_assessment_rows(
                 entry = db_classification.setdefault(str(sid), {'qid': str(sid)})
                 if taxonomy not in (None, ''):
                     entry['tax'] = taxonomy
-                if confidence is not None:
-                    entry['confidence'] = confidence
             for sid, nearest, identity in distance_rows:
                 entry = db_classification.setdefault(str(sid), {'qid': str(sid)})
                 if nearest not in (None, ''):
@@ -452,8 +506,17 @@ def build_sequence_assessment_rows(
                         'target_length', 'mismatches', 'gaps',
                     )
                 })
+                for key in (
+                    'source_classifier_confidence', 'assignment_status',
+                    'taxonomy_support_pct', 'taxonomy_candidate_count', 'evidence_tier',
+                    'alignment_evidence_status', 'assignment_evidence_level',
+                    'evidence_interpretation',
+                ):
+                    target_key = 'confidence' if key == 'source_classifier_confidence' else key
+                    if class_by_id[sid].get(target_key) in (None, ''):
+                        class_by_id[sid][target_key] = evidence.get(key)
         except Exception:
-            pass
+            logger.debug('Could not read evidence TSV %s', evidence_tsv)
 
     novelty_by_id = {}
     try:
@@ -501,12 +564,14 @@ def build_sequence_assessment_rows(
                     'hungate_nearest_alignment_length': pool_val('Hungate', 'NearestAlignmentLength', available=hungate_available),
                     'hungate_novelty_score': pool_val('Hungate', 'NoveltyScore', available=hungate_available),
                     'hungate_density_source': pool_val('Hungate', 'DensitySource', available=hungate_available),
+                    'hungate_density_count_method': pool_val('Hungate', 'DensityCountMethod', available=hungate_available),
                     'secondary_baseline_nearest_identity': pool_val('SecondaryBaseline', 'NearestIdentity', available=secondary_available),
                     'secondary_baseline_nearest_hit': pool_val('SecondaryBaseline', 'NearestHit', available=secondary_available),
                     'secondary_baseline_nearest_query_coverage': pool_val('SecondaryBaseline', 'NearestQueryCoverage', available=secondary_available),
                     'secondary_baseline_nearest_alignment_length': pool_val('SecondaryBaseline', 'NearestAlignmentLength', available=secondary_available),
                     'secondary_baseline_novelty_score': pool_val('SecondaryBaseline', 'NoveltyScore', available=secondary_available),
                     'secondary_baseline_density_source': pool_val('SecondaryBaseline', 'DensitySource', available=secondary_available),
+                    'secondary_baseline_density_count_method': pool_val('SecondaryBaseline', 'DensityCountMethod', available=secondary_available),
                     'cultured_project_nearest_identity': pool_val(
                         'CulturedProject', 'NearestIdentity', available=cultured_available,
                         fallback_prefix=('CulturedRumen', 'Baseline'),
@@ -555,6 +620,7 @@ def build_sequence_assessment_rows(
                     'crowding': pool_val('CulturedProject', 'Crowding', available=cultured_available, fallback_prefix=('CulturedRumen', 'Baseline')),
                     'sequencing_priority': pool_val('CulturedProject', 'SequencingPriority', available=cultured_available, fallback_prefix=('CulturedRumen', 'Baseline')),
                     'density_source': pool_val('CulturedProject', 'DensitySource', available=cultured_available, fallback_prefix=('CulturedRumen', 'Baseline')),
+                    'density_count_method': pool_val('CulturedProject', 'DensityCountMethod', available=cultured_available, fallback_prefix=('CulturedRumen', 'Baseline')),
                     'project_nearest_identity': val('ProjectNearestIdentity'),
                     'project_nearest_hit': val('ProjectNearestHit'),
                     'project_nearest_query_coverage': val('ProjectNearestQueryCoverage'),
@@ -567,6 +633,7 @@ def build_sequence_assessment_rows(
                     'project_crowding': val('ProjectCrowding'),
                     'project_sequencing_priority': val('ProjectSequencingPriority'),
                     'project_density_source': val('ProjectDensitySource'),
+                    'project_density_count_method': val('ProjectDensityCountMethod'),
                     'reference_nearest_identity': val('ReferenceNearestIdentity'),
                     'reference_nearest_hit': val('ReferenceNearestHit'),
                     'reference_nearest_query_coverage': val('ReferenceNearestQueryCoverage'),
@@ -579,8 +646,9 @@ def build_sequence_assessment_rows(
                     'reference_crowding': val('ReferenceCrowding'),
                     'reference_sequencing_priority': val('ReferenceSequencingPriority'),
                     'reference_density_source': val('ReferenceDensitySource'),
+                    'reference_density_count_method': val('ReferenceDensityCountMethod'),
                     'partner_id': val('PartnerID'),
-                    'selected_for_genome_sequencing': val('SelectedForGenomeSequencing'),
+                    'selected_for_genome_sequencing': val('AlreadySelectedForGenomeSequencing', 'SelectedForGenomeSequencing'),
                     'already_sequenced': val('GenomeAlreadySequenced'),
                     'nearest_genome_hit': val('NearestGenomeHit'),
                     'nearest_genome_identity': val('NearestGenomeIdentity'),
@@ -611,8 +679,9 @@ def build_sequence_assessment_rows(
                     'genome_pending_count_same_species': val(
                         'SelectedPendingGenomeCountSameAssessmentSpecies',
                     ),
-                    'pangenome_target': val('PangenomeTarget', default='9'),
+                    'pangenome_target': val('PangenomeTarget', default='NA'),
                     'pangenome_gap': val('PangenomeGap'),
+                    'pangenome_eligibility_status': val('PangenomeEligibilityStatus', default='DEFERRED_TO_TREE_VALIDATED_SELECTION_SETS'),
                     'genome_sequencing_metadata_source': val('GenomeSequencingMetadataSource'),
                     'closest_project_isolate': val('ClosestProjectIsolate', default='None'),
                     'closest_project_isolate_identity': val('ClosestProjectIsolateIdentity', default='0.00'),
@@ -659,6 +728,66 @@ def build_sequence_assessment_rows(
 
     warnings_by_id = {row['id']: row for row in placement_warning_rows}
 
+    # Partner-catalogue taxonomy is the project-level gold standard. Keep it
+    # alongside (never in place of) the sequence-derived classifier lineage.
+    partner_metadata_by_id = {}
+    try:
+        partner_metadata_by_id = db.get_sequencing_metadata_for_ids(run_id_set)
+    except Exception:
+        logger.warning('Could not load partner-catalogue taxonomy metadata for assessment rows')
+
+    # GTDB genome taxonomy is a separate, authoritative evidence channel for
+    # pangenome grouping. Do not infer it from the marker classifier taxonomy.
+    gtdb_genome_by_id = {}
+    try:
+        if run_id_set:
+            placeholders = ','.join('?' for _ in run_id_set)
+            with db.connect() as conn:
+                gtdb_rows = conn.execute(
+                    f"SELECT sequence_id, gtdb_taxonomy, genome_qc_pass FROM genome_records "
+                    f"WHERE sequence_id IN ({placeholders})",
+                    tuple(sorted(run_id_set)),
+                ).fetchall()
+            for sid, taxonomy, qc_pass in gtdb_rows:
+                if taxonomy:
+                    gtdb_genome_by_id[str(sid)] = {
+                        'taxonomy': str(taxonomy),
+                        'qc_pass': qc_pass,
+                    }
+    except Exception:
+        logger.warning('Could not load GTDB genome taxonomy for assessment rows')
+
+    # If the configured primary classifier itself is GTDB, its stored taxonomy
+    # is valid GTDB evidence. Never promote SILVA/other classifier assignments.
+    try:
+        classification_evidence = db.get_classification_evidence(run_id_set) if run_id_set else {}
+        taxonomy_by_id = {}
+        if run_id_set:
+            placeholders = ','.join('?' for _ in run_id_set)
+            with db.connect() as conn:
+                taxonomy_by_id = {
+                    str(sid): str(taxonomy or '')
+                    for sid, taxonomy in conn.execute(
+                        f"SELECT id, taxonomy FROM taxonomy WHERE id IN ({placeholders})",
+                        tuple(sorted(run_id_set)),
+                    ).fetchall()
+                }
+        for (sid, ref_db), evidence in classification_evidence.items():
+            ref_label = ''.join(char for char in str(ref_db or '').casefold() if char.isalnum())
+            if not (ref_label == 'gtdb' or ref_label.startswith('gtdbtk') or ref_label.startswith('gtdbr')):
+                continue
+            if str(sid) in gtdb_genome_by_id:
+                continue
+            taxonomy = taxonomy_by_id.get(str(sid), '')
+            if taxonomy:
+                gtdb_genome_by_id[str(sid)] = {
+                    'taxonomy': taxonomy,
+                    'qc_pass': '',
+                    'assignment_status': str(evidence.get('assignment_status') or 'UNRESOLVED'),
+                }
+    except Exception:
+        logger.debug('Could not load GTDB classifier evidence for assessment rows')
+
     # Normalise cluster dicts
     _m2r: Dict[str, str] = member_to_rep or {}
     _r2m: Dict[str, List[str]] = rep_to_members or {}
@@ -669,6 +798,18 @@ def build_sequence_assessment_rows(
         c = class_by_id.get(iid, {})
         n = novelty_by_id.get(iid, {})
         w = warnings_by_id.get(iid, {})
+        partner_meta = partner_metadata_by_id.get(str(iid), {})
+        partner_project_meta = partner_meta.get('project_metadata') or {}
+        partner_taxon = str(
+            partner_project_meta.get('partner_taxon_raw')
+            or partner_project_meta.get('expected_taxon')
+            or ''
+        ).strip()
+        partner_taxon_rank = str(
+            partner_project_meta.get('partner_taxon_rank')
+            or partner_project_meta.get('taxonomic_rank')
+            or ''
+        ).strip()
 
         if _m2r or _r2m:
             if iid in _r2m:
@@ -741,11 +882,41 @@ def build_sequence_assessment_rows(
 
         assessment_rows.append({
             'id': iid,
+            # Immutable partner-catalogue identity; classifier evidence is
+            # deliberately kept in separate fields below.
+            'partner_taxon': partner_taxon or 'NA',
+            'partner_taxon_rank': partner_taxon_rank or 'NA',
+            'partner_taxonomy_source': partner_project_meta.get('partner_taxonomy_source_file', 'PARTNER_METADATA') if partner_taxon else 'NOT_PROVIDED',
+            'partner_pathway_domain': domain_designation(partner_taxon) or 'NOT_SPECIFIED',
+            'partner_taxon_raw': partner_taxon or 'NA',
+            'partner_id': partner_meta.get('partner_id', n.get('partner_id', 'NA')),
+            'gtdb_taxonomy': gtdb_genome_by_id.get(str(iid), {}).get('taxonomy', ''),
+            'gtdb_assignment_status': (
+                'CONFIDENT' if gtdb_genome_by_id.get(str(iid), {}).get('taxonomy')
+                and str(gtdb_genome_by_id.get(str(iid), {}).get('qc_pass', '')).strip().casefold()
+                    in {'1', 'true', 'yes', 'pass', 'passed'}
+                else str(gtdb_genome_by_id.get(str(iid), {}).get('assignment_status') or 'PROVISIONAL')
+                if gtdb_genome_by_id.get(str(iid), {}).get('taxonomy')
+                else 'UNRESOLVED'
+            ),
             # ClassificationHit = best vsearch hit in the REFERENCE DB (GTDB/SILVA) → drives Taxonomy
             'taxonomy': _tax if _tax is not None else 'NA',
+            'taxonomy_assignment_label': (
+                f"{_tax} [{str(c.get('assignment_status') or 'UNRESOLVED').upper()}]"
+                if _tax not in (None, '', 'NA') else 'UNRESOLVED'
+            ),
             'classification_hit': _best if _best is not None else 'NA',
             'classification_identity': _ident if _ident is not None else 'NA',
             'classification_confidence': _conf if _conf is not None else 'NA',
+            'classification_assignment_status': c.get('assignment_status', 'NA'),
+            'classification_taxonomy_support_pct': c.get('taxonomy_support_pct', 'NA'),
+            'classification_taxonomy_lead_pct': c.get('taxonomy_lead_pct', 'NA'),
+            'classification_assigned_rank': c.get('assigned_rank', 'NA'),
+            'classification_evidence_tier': c.get('evidence_tier', 'NA'),
+            'classification_taxonomy_candidate_count': c.get('taxonomy_candidate_count', 'NA'),
+            'classification_alignment_evidence_status': c.get('alignment_evidence_status', 'NA'),
+            'classification_assignment_evidence_level': c.get('assignment_evidence_level', 'NA'),
+            'classification_evidence_interpretation': c.get('evidence_interpretation', 'NA'),
             'classification_query_coverage': c.get('query_coverage', 'NA'),
             'classification_target_coverage': c.get('target_coverage', 'NA'),
             'classification_alignment_length': c.get('alignment_length', 'NA'),
@@ -855,7 +1026,10 @@ def build_sequence_assessment_rows(
             'phylo_isolation': 'NA',
             'investigation_score': 'NA',
             # Alt-db taxonomy (keys: 'alt_tax_<refdb>', 'alt_class_hit_<refdb>', etc.)
-            **_build_alt_tax_cols(iid, alt_taxonomies or {}, alt_ref_dbs or []),
+            **_build_alt_tax_cols(
+                iid, alt_taxonomies or {}, alt_ref_dbs or [],
+                alt_classification_evidence or {},
+            ),
         })
     try:
         maldi_rows = db.get_maldi_identifications()
@@ -909,27 +1083,31 @@ def _build_alt_tax_cols(
     seq_id: str,
     alt_taxonomies: Dict[str, Dict[str, tuple]],
     alt_ref_dbs: List[str],
+    alt_classification_evidence: Optional[Dict[str, Dict[str, dict]]] = None,
 ) -> dict:
-    """Return a flat dict of alt-db taxonomy columns for one sequence.
-
-    Keys use the prefix ``alt_`` so ``write_sequence_assessment_tsv`` can
-    auto-discover them:
-      alt_tax_<safe>       — taxonomy string from that reference DB
-      alt_class_hit_<safe> — best vsearch hit (accession) in that reference DB
-      alt_ident_<safe>     — vsearch identity to that hit
-      alt_conf_<safe>      — classification confidence score
-    """
+    """Return per-database taxonomy and alignment evidence columns."""
     import re as _re
     cols: dict = {}
     per_seq = alt_taxonomies.get(seq_id, {})
+    evidence_by_db = (alt_classification_evidence or {}).get(seq_id, {})
     for ref_db in alt_ref_dbs:
         safe = _re.sub(r'[^A-Za-z0-9]+', '_', ref_db).strip('_')
         entry = per_seq.get(ref_db, (None, None, None, None))
         tax, conf, hit, ident = entry if len(entry) == 4 else (None, None, None, None)
+        evidence = evidence_by_db.get(ref_db, {})
         cols[f'alt_tax_{safe}'] = tax if tax is not None else 'NA'
         cols[f'alt_class_hit_{safe}'] = hit if hit is not None else 'NA'
         cols[f'alt_ident_{safe}'] = f"{float(ident):.2f}" if ident is not None else 'NA'
-        cols[f'alt_conf_{safe}'] = f"{float(conf):.4f}" if conf is not None else 'NA'
+        source_confidence = evidence.get('source_classifier_confidence')
+        cols[f'alt_conf_{safe}'] = f"{float(source_confidence):.4f}" if source_confidence is not None else 'NA'
+        for field in (
+            'query_coverage', 'target_coverage', 'alignment_length',
+            'assignment_status', 'taxonomy_support_pct', 'taxonomy_candidate_count',
+            'evidence_tier', 'alignment_evidence_status',
+            'assignment_evidence_level', 'evidence_interpretation',
+        ):
+            value = evidence.get(field)
+            cols[f'alt_{field}_{safe}'] = value if value not in (None, '') else 'NA'
     return cols
 
 
@@ -957,9 +1135,27 @@ def write_sequence_assessment_tsv(path: str | Path, rows, assessment_db_name: st
         ('ProductionType', 'production_type'), ('SampleLocation', 'sample_location'),
         ('RuminantDiet', 'ruminant_diet'), ('MALDIInstrument', 'maldi_instrument'),
         ('MALDIDatabase', 'maldi_library'), ('MALDITaxonRaw', 'maldi_taxon_raw'),
-        (f'{label}Taxonomy', 'taxonomy'), (f'{label}ClassificationHit', 'classification_hit'),
+        (f'{label}Taxonomy', 'taxonomy'),
+        ('PartnerTaxon', 'partner_taxon'), ('PartnerTaxonRank', 'partner_taxon_rank'),
+        ('PartnerTaxonomySource', 'partner_taxonomy_source'),
+        ('PartnerPathwayDomain', 'partner_pathway_domain'),
+        ('GTDBGenomeTaxonomy', 'gtdb_taxonomy'), ('GTDBGenomeAssignmentStatus', 'gtdb_assignment_status'),
+        ('PangenomeRank', 'pangenome_rank'), ('PangenomeTaxon', 'pangenome_taxon'),
+        ('ClassifierGTDBDisagreement', 'classifier_gtdb_disagreement'),
+        ('ClassifierDatabaseConcordanceStatus', 'classifier_database_concordance_status'),
+        (f'{label}TaxonomyAssignmentLabel', 'taxonomy_assignment_label'),
+        (f'{label}ClassificationHit', 'classification_hit'),
         (f'{label}ClassificationIdentity', 'classification_identity'),
-        (f'{label}ClassificationConfidence', 'classification_confidence'),
+        (f'{label}SourceClassifierConfidence', 'classification_confidence'),
+        (f'{label}AssignmentStatus', 'classification_assignment_status'),
+        (f'{label}TaxonomySupportPct', 'classification_taxonomy_support_pct'),
+        (f'{label}TaxonomyLeadPct', 'classification_taxonomy_lead_pct'),
+        (f'{label}AssignedRank', 'classification_assigned_rank'),
+        (f'{label}EvidenceTier', 'classification_evidence_tier'),
+        (f'{label}TaxonomyCandidateCount', 'classification_taxonomy_candidate_count'),
+        (f'{label}AlignmentEvidenceStatus', 'classification_alignment_evidence_status'),
+        (f'{label}AssignmentEvidenceLevel', 'classification_assignment_evidence_level'),
+        (f'{label}EvidenceInterpretation', 'classification_evidence_interpretation'),
         (f'{label}QueryCoverage', 'classification_query_coverage'),
         (f'{label}TargetCoverage', 'classification_target_coverage'),
         (f'{label}AlignmentLength', 'classification_alignment_length'),
@@ -975,6 +1171,7 @@ def write_sequence_assessment_tsv(path: str | Path, rows, assessment_db_name: st
         ('HungateNearestQueryCoverage', 'hungate_nearest_query_coverage'),
         ('HungateNearestAlignmentLength', 'hungate_nearest_alignment_length'),
         ('HungateNoveltyScore', 'hungate_novelty_score'), ('HungateSource', 'hungate_density_source'),
+        ('HungateDensityCountMethod', 'hungate_density_count_method'),
         ('SecondaryBaselineNearestHit', 'secondary_baseline_nearest_hit'),
         ('SecondaryBaselineNearestHitDataset', 'secondary_baseline_nearest_hit_dataset'),
         ('SecondaryBaselineNearestHitTaxonomy', 'secondary_baseline_nearest_hit_taxonomy'),
@@ -983,6 +1180,7 @@ def write_sequence_assessment_tsv(path: str | Path, rows, assessment_db_name: st
         ('SecondaryBaselineNearestAlignmentLength', 'secondary_baseline_nearest_alignment_length'),
         ('SecondaryBaselineNoveltyScore', 'secondary_baseline_novelty_score'),
         ('SecondaryBaselineSource', 'secondary_baseline_density_source'),
+        ('SecondaryBaselineDensityCountMethod', 'secondary_baseline_density_count_method'),
         ('CulturedProjectNearestHit', 'cultured_project_nearest_hit'),
         ('CulturedProjectNearestHitDataset', 'cultured_project_nearest_hit_dataset'),
         ('CulturedProjectNearestHitTaxonomy', 'cultured_project_nearest_hit_taxonomy'),
@@ -991,6 +1189,7 @@ def write_sequence_assessment_tsv(path: str | Path, rows, assessment_db_name: st
         ('CulturedProjectNearestAlignmentLength', 'cultured_project_nearest_alignment_length'),
         ('CulturedProjectNoveltyScore', 'cultured_project_novelty_score'),
         ('CulturedProjectSource', 'cultured_project_density_source'),
+        ('CulturedProjectDensityCountMethod', 'density_count_method'),
         ('BaselineNearestHit', 'nearest_hit'), ('BaselineNearestHitDataset', 'nearest_hit_dataset'),
         ('BaselineNearestHitTaxonomy', 'nearest_hit_taxonomy'),
         ('BaselineTaxonomyAgreementRank', 'baseline_taxonomy_agreement_rank'),
@@ -1002,6 +1201,7 @@ def write_sequence_assessment_tsv(path: str | Path, rows, assessment_db_name: st
         ('BaselineMatchesGE95', 'matches_ge_95'), ('BaselineNoveltyScore', 'novelty_score'),
         ('BaselineCrowding', 'crowding'), ('BaselinePriority', 'sequencing_priority'),
         ('BaselineSource', 'density_source'),
+        ('BaselineDensityCountMethod', 'density_count_method'),
         ('ProjectNearestHit', 'project_nearest_hit'),
         ('ProjectNearestHitDataset', 'project_nearest_hit_dataset'),
         ('ProjectNearestHitTaxonomy', 'project_nearest_hit_taxonomy'),
@@ -1012,6 +1212,7 @@ def write_sequence_assessment_tsv(path: str | Path, rows, assessment_db_name: st
         ('ProjectMatchesGE95', 'project_matches_ge_95'), ('ProjectNoveltyScore', 'project_novelty_score'),
         ('ProjectCrowding', 'project_crowding'), ('ProjectPriority', 'project_sequencing_priority'),
         ('ProjectSource', 'project_density_source'),
+        ('ProjectDensityCountMethod', 'project_density_count_method'),
         (f'{label}ReferenceNearestHit', 'reference_nearest_hit'),
         (f'{label}ReferenceNearestHitTaxonomy', 'reference_nearest_hit_taxonomy'),
         (f'{label}ReferenceNearestIdentity', 'reference_nearest_identity'),
@@ -1024,7 +1225,8 @@ def write_sequence_assessment_tsv(path: str | Path, rows, assessment_db_name: st
         (f'{label}ReferenceNoveltyScore', 'reference_novelty_score'),
         (f'{label}ReferenceCrowding', 'reference_crowding'),
         (f'{label}ReferenceSource', 'reference_density_source'),
-        ('SelectedForGenomeSequencing', 'selected_for_genome_sequencing'),
+        (f'{label}ReferenceDensityCountMethod', 'reference_density_count_method'),
+        ('AlreadySelectedForGenomeSequencing', 'selected_for_genome_sequencing'),
         ('GenomeAlreadySequenced', 'already_sequenced'),
         ('NearestGenomeHit', 'nearest_genome_hit'), ('NearestGenomeIdentity', 'nearest_genome_identity'),
         ('ClosestProjectIsolate', 'closest_project_isolate'),
@@ -1043,6 +1245,11 @@ def write_sequence_assessment_tsv(path: str | Path, rows, assessment_db_name: st
         ('SelectedPendingGenomesSameAssessmentSpecies', 'genome_pending_count_same_species'),
         ('CommittedGenomesSameAssessmentSpecies', 'genome_committed_count_same_species'),
         ('PangenomeTarget', 'pangenome_target'), ('PangenomeGap', 'pangenome_gap'),
+        ('PangenomeEligibilityStatus', 'pangenome_eligibility_status'),
+        ('PangenomeEligibilityReason', 'pangenome_eligibility_reason'),
+        ('PangenomeCommittedGenomeCount', 'pangenome_committed_count'),
+        ('PangenomeBaselineGenomeCount', 'pangenome_baseline_count'),
+        ('PangenomeCommittedGenomeIDs', 'pangenome_committed_ids'),
         ('GenomeCollectionSource', 'genome_sequencing_metadata_source'),
         ('MarkerQCClass', 'marker_qc_class'),
         ('MarkerQCRecommendation', 'marker_qc_recommendation'),
@@ -1086,7 +1293,17 @@ def write_sequence_assessment_tsv(path: str | Path, rows, assessment_db_name: st
             (f'Taxonomy_{safe}', f'alt_tax_{safe}'),
             (f'ClassificationHit_{safe}', f'alt_class_hit_{safe}'),
             (f'Identity_{safe}', f'alt_ident_{safe}'),
-            (f'Confidence_{safe}', f'alt_conf_{safe}'),
+            (f'SourceClassifierConfidence_{safe}', f'alt_conf_{safe}'),
+            (f'QueryCoverage_{safe}', f'alt_query_coverage_{safe}'),
+            (f'TargetCoverage_{safe}', f'alt_target_coverage_{safe}'),
+            (f'AlignmentLength_{safe}', f'alt_alignment_length_{safe}'),
+            (f'AssignmentStatus_{safe}', f'alt_assignment_status_{safe}'),
+            (f'TaxonomySupportPct_{safe}', f'alt_taxonomy_support_pct_{safe}'),
+            (f'TaxonomyCandidateCount_{safe}', f'alt_taxonomy_candidate_count_{safe}'),
+            (f'EvidenceTier_{safe}', f'alt_evidence_tier_{safe}'),
+            (f'AlignmentEvidenceStatus_{safe}', f'alt_alignment_evidence_status_{safe}'),
+            (f'AssignmentEvidenceLevel_{safe}', f'alt_assignment_evidence_level_{safe}'),
+            (f'EvidenceInterpretation_{safe}', f'alt_evidence_interpretation_{safe}'),
         ])
 
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -1160,13 +1377,16 @@ def _genome_coverage(row: dict) -> str:
         return 'CURRENT ISOLATE ALREADY SEQUENCED'
     if str(row.get('selected_for_genome_sequencing') or '').lower() == 'true':
         return 'CURRENT ISOLATE SELECTED - GENOME PENDING'
-    committed = _as_int(row.get('genome_committed_count_same_species'))
+    committed = _as_int(row.get('pangenome_committed_count'))
     target = _as_int(row.get('pangenome_target'), 9)
     gap = _as_int(row.get('pangenome_gap'))
+    rank = str(row.get('pangenome_rank') or 'catalogue-rank').lower()
+    taxon = str(row.get('pangenome_taxon') or '').strip()
+    group_label = f'{rank} {taxon}'.strip()
     if committed is not None and gap is not None:
         if gap <= 0:
-            return f'TARGET MET - {committed}/{target} assessment-species genomes'
-        return f'PANGENOME GAP - {committed}/{target} assessment-species genomes committed; {gap} required'
+            return f'TARGET MET - {committed}/{target} {group_label} genomes'
+        return f'PANGENOME GAP - {committed}/{target} {group_label} genomes committed; {gap} required'
     identity = _as_float(row.get('nearest_genome_identity'))
     if identity is None or identity <= 0:
         return 'NOT REPRESENTED'
@@ -1199,36 +1419,7 @@ def _species_context(row: dict) -> str:
 
 
 def _evidence_quality(row: dict) -> str:
-    flags = {
-        flag.strip().upper()
-        for flag in str(row.get('placement_flags') or '').split(';')
-        if flag.strip()
-    }
-    classification_identity = _as_float(row.get('classification_identity'))
-    classification_confidence = _as_float(row.get('classification_confidence'))
-    query_coverage = _as_float(row.get('classification_query_coverage'))
-    taxonomy = str(row.get('taxonomy') or '').strip().lower()
-    marker_flag = str(row.get('marker_qc_flag') or '').upper()
-    if marker_flag in {'MARKER_QC_FAILED', 'MARKER_QC_REVIEW_REQUIRED', 'MARKER_QC_UNVERIFIED'}:
-        return 'LOW'
-    # MARKER_QC_REVIEW_APPROVED: manual approval has addressed QC concerns; fall through to
-    # standard identity/coverage checks so clean assemblies can still reach HIGH.
-    severe = bool(flags & SELECTION_BLOCKING_PLACEMENT_FLAGS)
-    if severe or (classification_identity is not None and classification_identity < 90.0):
-        return 'LOW'
-    if query_coverage is not None and query_coverage < 80.0:
-        return 'LOW'
-    if classification_identity is None and taxonomy in ('', 'na', 'none'):
-        return 'LOW'
-    moderate = bool(flags & {'LOW_CLASSIFICATION', 'LOW_CONFIDENCE', 'DISAGREEMENT', 'CONFLICT'})
-    if (
-        moderate
-        or (classification_identity is not None and classification_identity < 95.0)
-        or (classification_confidence is not None and classification_confidence < 0.8)
-        or (query_coverage is not None and query_coverage < 90.0)
-    ):
-        return 'MODERATE'
-    return 'HIGH'
+    return _shared_evidence_quality(row)
 
 
 def build_selection_decision(row: dict) -> dict:
@@ -1303,7 +1494,7 @@ def build_selection_decision(row: dict) -> dict:
         status = str(row.get('baseline_extension_status') or 'extension criteria not met')
         caution.append(f'not admitted to the baseline-pangenome extension ({status})')
     if target_met:
-        caution.append('assessment-species pangenome target already met')
+        caution.append('GTDB-rank pangenome target already met')
     elif pangenome_gap is not None:
         positive.append(f'{pangenome_gap} genome(s) still required for pangenome target')
     if project_coverage.startswith('DENSE'):
@@ -1327,6 +1518,11 @@ def build_selection_decision(row: dict) -> dict:
         decision = 'PRIORITISE - SET PRIMARY'
     elif set_role == 'BACKUP':
         decision = 'RESERVE - SET BACKUP'
+    elif set_role == 'DIVERSITY_CANDIDATE' and evidence_quality == 'HIGH' and (strong_mwl or len(positive) >= 2):
+        # Meeting the numerical pangenome target should not suppress a strong
+        # strain-diversity candidate. The set role describes why it was ranked;
+        # the recommendation must still reflect independent biological evidence.
+        decision = 'STRONG CANDIDATE - STRAIN DIVERSITY'
     elif set_role == 'DIVERSITY_CANDIDATE':
         decision = 'SECONDARY - STRAIN DIVERSITY'
     elif target_met:
@@ -1400,7 +1596,8 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
         'MALDIInstrument',
         'MALDIDatabase',
         'MALDITaxonRaw',
-        'SelectedForGenomeSequencing',
+        'AlreadySelectedForGenomeSequencing',
+        'RecommendedForGenomeSequencing',
         'GenomeAlreadySequenced',
         'Recommendation',
         'SequencingSetID',
@@ -1412,7 +1609,18 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
         'MarkerQC',
         'MarkerReview',
         f'{label}Taxonomy',
+        f'{label}TaxonomyAssignmentLabel',
+        f'{label}AssignmentStatus',
+        'PartnerTaxon', 'PartnerTaxonRank', 'PartnerTaxonomySource',
+        'PartnerPathwayDomain', 'GTDBGenomeTaxonomy', 'GTDBGenomeAssignmentStatus',
+        'ClassifierDatabaseConcordanceStatus',
         f'{label}ClassificationIdentity',
+        f'{label}AssignmentEvidenceLevel',
+        f'{label}AlignmentEvidenceStatus',
+        f'{label}EvidenceTier',
+        f'{label}TaxonomySupportPct',
+        f'{label}TaxonomyCandidateCount',
+        f'{label}EvidenceInterpretation',
         f'{label}QueryCoverage',
         'CulturedGap',
         'BaselineEvidenceClass',
@@ -1438,6 +1646,7 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
         'ProjectNearestQueryCoverage',
         'ProjectCloseNeighboursGE97',
         'ProjectNoveltyScore',
+        'ProjectDensityCountMethod',
         'ClosestProjectIsolate',
         'ProjectIsolateOnlyMatch',
         f'{label}ReferenceContext',
@@ -1451,11 +1660,6 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
         'DiversityMetadataScore',
         'DiversityMetadataInformativeFields',
         'DiversityMetadataReason',
-        'DiversityMetadataPresent',
-        'DiversityMetadataStrength',
-        'DiversityMetadataScore',
-        'DiversityMetadataInformativeFields',
-        'DiversityMetadataReason',
         'HungateGenomesSameSpecies',
         'SecondaryBaselineGenomesSameSpecies',
         'CulturedProjectGenomesSameSpecies',
@@ -1463,8 +1667,17 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
         'SequencedPartnerGenomesSameSpecies',
         'SelectedPendingGenomesSameSpecies',
         'CommittedGenomesSameSpecies',
+        'PangenomeCommittedGenomeCount',
+        'PangenomeBaselineGenomeCount',
+        'PangenomeRank',
+        'PangenomeTaxon',
+        'ClassifierGTDBDisagreement',
         'PangenomeTarget',
         'PangenomeGap',
+        'PangenomeEligible',
+        'PangenomeEligibilityReason',
+        'PangenomeEligibilityStatus',
+        'TaxonomyAssignmentStatus',
         'GenomeCoverage',
         'SpeciesContext',
         'LocalTreeFigure',
@@ -1508,6 +1721,7 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
                 row.get('maldi_library', 'NA'),
                 row.get('maldi_taxon_raw', 'NA'),
                 row.get('selected_for_genome_sequencing', 'NA'),
+                'True' if str(row.get('sequencing_set_role') or '').upper() in {'PRIMARY', 'BACKUP', 'DIVERSITY_CANDIDATE'} else 'False',
                 row.get('already_sequenced', 'NA'),
                 support['decision'],
                 row.get('sequencing_set_id', 'NA'),
@@ -1519,7 +1733,19 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
                 row.get('marker_qc_class', 'QUALITY_UNVERIFIED'),
                 _marker_review_display(row),
                 row.get('taxonomy', 'NA'),
+                row.get('taxonomy_assignment_label', row.get('taxonomy', 'NA')),
+                row.get('classification_assignment_status', 'UNRESOLVED'),
+                row.get('partner_taxon', 'NA'),
+                row.get('partner_taxon_rank', 'NA'),
+                row.get('partner_taxonomy_source', 'NOT_PROVIDED'),
+                row.get('classifier_database_concordance_status', 'NOT_ASSESSED'),
                 row.get('classification_identity', 'NA'),
+                row.get('classification_assignment_evidence_level', 'NA'),
+                row.get('classification_alignment_evidence_status', 'NA'),
+                row.get('classification_evidence_tier', 'NA'),
+                row.get('classification_taxonomy_support_pct', 'NA'),
+                row.get('classification_taxonomy_candidate_count', 'NA'),
+                row.get('classification_evidence_interpretation', 'NA'),
                 row.get('classification_query_coverage', 'NA'),
                 support['cultured_gap'],
                 row.get('baseline_evidence_class', 'NA'),
@@ -1545,6 +1771,7 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
                 row.get('project_nearest_query_coverage', 'NA'),
                 row.get('project_matches_ge_97', 'NA'),
                 row.get('project_novelty_score', 'NA'),
+                row.get('project_density_count_method', 'NA'),
                 row.get('closest_project_isolate', 'NA'),
                 row.get('project_isolate_only_match', 'NA'),
                 support['reference_context'],
@@ -1558,11 +1785,6 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
                 row.get('diversity_metadata_score', '0.00'),
                 row.get('diversity_metadata_informative_fields', '0'),
                 row.get('diversity_metadata_reason', 'NA'),
-                row.get('diversity_metadata_present', 'No'),
-                row.get('diversity_metadata_strength', 'NA'),
-                row.get('diversity_metadata_score', '0.00'),
-                row.get('diversity_metadata_informative_fields', '0'),
-                row.get('diversity_metadata_reason', 'NA'),
                 row.get('hungate_genome_count_same_species', 'NA'),
                 row.get('secondary_baseline_genome_count_same_species', 'NA'),
                 row.get('cultured_project_genome_count_same_species', row.get('genome_available_count_same_species', 'NA')),
@@ -1570,8 +1792,17 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
                 row.get('genome_selected_count_same_species', 'NA'),
                 row.get('genome_pending_count_same_species', 'NA'),
                 row.get('genome_committed_count_same_species', 'NA'),
+                row.get('pangenome_committed_count', 'NA'),
+                row.get('pangenome_baseline_count', 'NA'),
+                row.get('pangenome_rank', 'NA'),
+                row.get('pangenome_taxon', 'NA'),
+                row.get('classifier_gtdb_disagreement', 'NA'),
                 row.get('pangenome_target', 'NA'),
                 row.get('pangenome_gap', 'NA'),
+                row.get('pangenome_eligible', 'NA'),
+                row.get('pangenome_eligibility_reason', 'NA'),
+                row.get('pangenome_eligibility_status', 'NA'),
+                row.get('classification_assignment_status', 'UNRESOLVED'),
                 support['genome_coverage'],
                 support['species_context'] or 'NA',
                 row.get('local_neighbourhood_figure', 'NA'),

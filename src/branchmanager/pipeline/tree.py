@@ -354,7 +354,7 @@ def _new_sequences_only(
             if not is_ref_anchor(h):
                 base_ids_norm.add(_norm_id(h))
     except Exception:
-        pass
+        logger.debug('Could not read base alignment %s; treating all user sequences as new', base_aln)
 
     new_records = []
     for h, s in read_fasta(user_fasta):
@@ -517,7 +517,7 @@ def _orient_tree_input_fasta(
             if tmp_matches.exists():
                 tmp_matches.unlink()
         except Exception:
-            pass
+            logger.debug('Failed to clean up temporary matches file %s', tmp_matches)
 
     flipped = 0
     oriented_records = []
@@ -823,7 +823,7 @@ def _seed_backbone_from_previous_review(previous_review: Optional[str], outdir: 
         try:
             shutil.copyfile(previous_tree, outdir / 'current_tree.nwk')
         except Exception:
-            pass
+            logger.debug('Could not copy previous tree file %s', previous_tree)
     previous_orientation = p / 'tree_orientation_summary.tsv'
     if not previous_orientation.exists():
         previous_orientation = p / 'tree' / 'tree_orientation_summary.tsv'
@@ -831,7 +831,7 @@ def _seed_backbone_from_previous_review(previous_review: Optional[str], outdir: 
         try:
             shutil.copyfile(previous_orientation, outdir / 'tree_orientation_summary.tsv')
         except Exception:
-            pass
+            logger.debug('Could not copy previous orientation summary %s', previous_orientation)
     logger.info('[TREE] Seeded backbone alignment from previous review %s', p)
     return True
 
@@ -1076,7 +1076,7 @@ def initialise_or_update_tree(
             if orientation_summary.exists():
                 orientation_summary.unlink()
         except Exception:
-            pass
+            logger.debug('Failed to remove old orientation summary %s', orientation_summary)
 
         combined_fasta = build_combined_fasta(
             user_fasta=user_fasta,

@@ -35,6 +35,8 @@ CONFIDENCE_COLUMNS = {
     'conf',
     'score',
     'probability',
+    'sourceclassifierconfidence',
+    'source_classifier_confidence',
 }
 
 

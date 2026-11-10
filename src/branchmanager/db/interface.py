@@ -92,6 +92,10 @@ class Database:
                 sequence_id, ref_db, row.get('best_hit'), row.get('identity'),
                 row.get('query_coverage'), row.get('target_coverage'), row.get('alignment_length'),
                 row.get('query_length'), row.get('target_length'), row.get('mismatches'), row.get('gaps'),
+                row.get('source_classifier_confidence'), row.get('assignment_status'), row.get('taxonomy_support_pct'),
+                row.get('taxonomy_candidate_count'), row.get('evidence_tier'),
+                row.get('alignment_evidence_status'), row.get('assignment_evidence_level'),
+                row.get('evidence_interpretation'),
             ))
         if not prepared:
             return 0
@@ -99,13 +103,20 @@ class Database:
             conn.executemany(
                 'INSERT INTO classification_evidence '
                 '(sequence_id, ref_db, best_hit, identity, query_coverage, target_coverage, '
-                'alignment_length, query_length, target_length, mismatches, gaps) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(sequence_id, ref_db) '
+                'alignment_length, query_length, target_length, mismatches, gaps, source_classifier_confidence, assignment_status, '
+                'taxonomy_support_pct, taxonomy_candidate_count, evidence_tier, alignment_evidence_status, '
+                'assignment_evidence_level, evidence_interpretation) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(sequence_id, ref_db) '
                 'DO UPDATE SET best_hit=excluded.best_hit, identity=excluded.identity, '
                 'query_coverage=excluded.query_coverage, target_coverage=excluded.target_coverage, '
                 'alignment_length=excluded.alignment_length, query_length=excluded.query_length, '
                 'target_length=excluded.target_length, mismatches=excluded.mismatches, '
-                'gaps=excluded.gaps, updated_at=CURRENT_TIMESTAMP',
+                'gaps=excluded.gaps, source_classifier_confidence=excluded.source_classifier_confidence, '
+                'assignment_status=excluded.assignment_status, '
+                'taxonomy_support_pct=excluded.taxonomy_support_pct, taxonomy_candidate_count=excluded.taxonomy_candidate_count, '
+                'evidence_tier=excluded.evidence_tier, alignment_evidence_status=excluded.alignment_evidence_status, '
+                'assignment_evidence_level=excluded.assignment_evidence_level, evidence_interpretation=excluded.evidence_interpretation, '
+                'updated_at=CURRENT_TIMESTAMP',
                 prepared,
             )
         return len(prepared)
@@ -121,13 +132,18 @@ class Database:
             params.append(str(ref_db))
         query = (
             'SELECT sequence_id, ref_db, best_hit, identity, query_coverage, target_coverage, '
-            'alignment_length, query_length, target_length, mismatches, gaps '
+            'alignment_length, query_length, target_length, mismatches, gaps, source_classifier_confidence, assignment_status, '
+            'taxonomy_support_pct, taxonomy_candidate_count, evidence_tier, alignment_evidence_status, '
+            'assignment_evidence_level, evidence_interpretation '
             'FROM classification_evidence' + (' WHERE ' + ' AND '.join(clauses) if clauses else '')
         )
         with self.connect() as conn:
             rows = conn.execute(query, tuple(params)).fetchall()
         keys = ('sequence_id', 'ref_db', 'best_hit', 'identity', 'query_coverage', 'target_coverage',
-                'alignment_length', 'query_length', 'target_length', 'mismatches', 'gaps')
+                'alignment_length', 'query_length', 'target_length', 'mismatches', 'gaps',
+                "source_classifier_confidence", "assignment_status", "taxonomy_support_pct", "taxonomy_candidate_count",
+                'evidence_tier', 'alignment_evidence_status', 'assignment_evidence_level',
+                'evidence_interpretation')
         return {(str(row[0]), str(row[1])): dict(zip(keys, row)) for row in rows}
 
     def upsert_sequence_provenance(self, rows):
@@ -151,6 +167,10 @@ class Database:
                 str(row.get('manual_review_status') or 'NOT_REVIEWED'),
                 str(row.get('chimera_call') or 'NOT_RUN'),
                 row.get('chimera_score'),
+                str(row.get('review_decision') or ''),
+                str(row.get('reviewer') or ''),
+                str(row.get('review_notes') or ''),
+                str(row.get('marker_source_type') or ''),
             ))
         if not prepared:
             return 0
@@ -159,8 +179,9 @@ class Database:
                 "INSERT INTO sequence_provenance "
                 "(sequence_id, source_manifest, source_sequence_file, source_sequence_sha256, "
                 "source_read_ids, source_used_read_ids, source_read_files, source_read_checksums_json, marker_qc_class, marker_qc_recommendation, "
-                "marker_qc_reasons, manual_review_status, chimera_call, chimera_score) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "marker_qc_reasons, manual_review_status, chimera_call, chimera_score, "
+                "review_decision, reviewer, review_notes, marker_source_type) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(sequence_id) DO UPDATE SET source_manifest=excluded.source_manifest, "
                 "source_sequence_file=excluded.source_sequence_file, "
                 "source_sequence_sha256=excluded.source_sequence_sha256, "
@@ -170,8 +191,14 @@ class Database:
                 "marker_qc_class=excluded.marker_qc_class, "
                 "marker_qc_recommendation=excluded.marker_qc_recommendation, "
                 "marker_qc_reasons=excluded.marker_qc_reasons, "
-                "manual_review_status=excluded.manual_review_status, "
+                "manual_review_status=CASE WHEN excluded.review_decision='' AND "
+                "(sequence_provenance.review_decision!='' OR sequence_provenance.manual_review_status='REJECTED') "
+                "THEN sequence_provenance.manual_review_status ELSE excluded.manual_review_status END, "
                 "chimera_call=excluded.chimera_call, chimera_score=excluded.chimera_score, "
+                "review_decision=COALESCE(NULLIF(excluded.review_decision,''), sequence_provenance.review_decision), "
+                "reviewer=CASE WHEN excluded.review_decision='' THEN sequence_provenance.reviewer ELSE excluded.reviewer END, "
+                "review_notes=CASE WHEN excluded.review_decision='' THEN sequence_provenance.review_notes ELSE excluded.review_notes END, "
+                "marker_source_type=excluded.marker_source_type, "
                 "updated_at=CURRENT_TIMESTAMP",
                 prepared,
             )
@@ -183,6 +210,7 @@ class Database:
             "source_read_ids, source_used_read_ids, source_read_files, source_read_checksums_json, "
             "marker_qc_class, marker_qc_recommendation, "
             "marker_qc_reasons, manual_review_status, chimera_call, chimera_score, "
+            "review_decision, reviewer, review_notes, marker_source_type, "
             "updated_at FROM sequence_provenance"
         )
         params = ()
@@ -196,7 +224,8 @@ class Database:
             'sequence_id', 'source_manifest', 'source_sequence_file', 'source_sequence_sha256',
             'source_read_ids', 'source_used_read_ids', 'source_read_files', 'source_read_checksums_json',
             'marker_qc_class', 'marker_qc_recommendation', 'marker_qc_reasons',
-            'manual_review_status', 'chimera_call', 'chimera_score', 'updated_at',
+            'manual_review_status', 'chimera_call', 'chimera_score',
+            'review_decision', 'reviewer', 'review_notes', 'marker_source_type', 'updated_at',
         )
         return {str(row[0]): dict(zip(keys, row)) for row in rows}
 
@@ -253,10 +282,17 @@ class Database:
             sequence_id = str(row.get('sequence_id') or row.get('isolate_id') or '').strip()
             if not genome_id or not sequence_id:
                 continue
+            qc_value = row.get('genome_qc_pass')
+            if qc_value is None or str(qc_value).strip().lower() in {'', 'unknown', 'na', 'n/a', 'none'}:
+                qc_value = None
+            elif isinstance(qc_value, str):
+                qc_value = int(qc_value.strip().lower() in {'1', 'true', 'yes', 'pass', 'passed'})
+            else:
+                qc_value = int(bool(qc_value))
             prepared.append((
                 genome_id, sequence_id, str(row.get('accession') or ''),
                 str(row.get('genome_status') or 'SEQUENCED').upper(),
-                int(bool(row.get('genome_qc_pass'))), row.get('completeness'), row.get('contamination'),
+                qc_value, row.get('completeness'), row.get('contamination'),
                 str(row.get('gtdb_taxonomy') or ''), str(row.get('ani_cluster') or ''),
                 str(row.get('genome_path') or ''), str(row.get('genome_sha256') or ''),
                 str(row.get('notes') or ''), str(row.get('source_file') or ''),
@@ -474,6 +510,19 @@ class Database:
                 columns = {row[1] for row in cur.execute(f'PRAGMA table_info({table})')}
                 if column not in columns:
                     cur.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+            classification_columns = {row[1] for row in cur.execute('PRAGMA table_info(classification_evidence)')}
+            for column, definition in (
+                ('source_classifier_confidence', 'REAL'),
+                ('assignment_status', 'TEXT'),
+                ('taxonomy_support_pct', 'REAL'),
+                ('taxonomy_candidate_count', 'INTEGER'),
+                ('evidence_tier', 'TEXT'),
+                ('alignment_evidence_status', 'TEXT'),
+                ('assignment_evidence_level', 'TEXT'),
+                ('evidence_interpretation', 'TEXT'),
+            ):
+                if column not in classification_columns:
+                    cur.execute(f'ALTER TABLE classification_evidence ADD COLUMN {column} {definition}')
             cur.execute("UPDATE distances SET dataset = 'gg2' WHERE dataset IS NULL")
             cur.execute(
                 "UPDATE dataset_roles SET baseline_tier = CASE "
@@ -527,6 +576,10 @@ class Database:
                 ('chimera_score', 'REAL'),
                 ('source_read_checksums_json', 'TEXT'),
                 ('source_used_read_ids', 'TEXT'),
+                ('review_decision', "TEXT DEFAULT ''"),
+                ('reviewer', "TEXT DEFAULT ''"),
+                ('review_notes', "TEXT DEFAULT ''"),
+                ('marker_source_type', "TEXT DEFAULT ''"),
             ):
                 if column not in provenance_columns:
                     cur.execute(f'ALTER TABLE sequence_provenance ADD COLUMN {column} {definition}')
@@ -550,6 +603,15 @@ class Database:
                 'INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)',
                 (4,),
             )
+            conn.commit()
+
+        # Schema v5: additive evidence registry, review history and genome-16S tables.
+        from branchmanager.marker_evidence import ensure_marker_evidence_schema
+        ensure_marker_evidence_schema(self)
+        with self.connect() as conn:
+            conn.execute('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)', (5,))
+            # Schema v6: append-only provenance for assembly, GTDB-Tk and CheckM2 evidence.
+            conn.execute('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)', (6,))
             conn.commit()
 
 

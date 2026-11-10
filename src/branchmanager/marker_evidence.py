@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import csv
 import hashlib
-import json
 import logging
 import sqlite3
 from datetime import datetime, timezone
@@ -35,6 +34,10 @@ SOURCE_TYPES = {
 }
 EVIDENCE_TIERS = {"HIGH", "MODERATE", "LOW"}
 MANUAL_STATES = {"NOT_REQUIRED", "PENDING", "APPROVED", "REJECTED", "NOT_REVIEWED"}
+MARKER_EVIDENCE_POLICY_VERSION = "1.0"
+REVIEW_DECISIONS = ("APPROVE", "APPROVE_FAIL_QC", "APPROVE_UNVERIFIED", "REJECT", "RESEQUENCE")
+APPROVAL_DECISIONS = {"APPROVE", "APPROVE_FAIL_QC", "APPROVE_UNVERIFIED"}
+WARNING_QC_CLASSES = {"PASS_WITH_WARNINGS"}
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS marker_evidence (
@@ -63,8 +66,24 @@ CREATE TABLE IF NOT EXISTS marker_evidence (
     source_sha256 TEXT NOT NULL DEFAULT '',
     active_for_selection INTEGER NOT NULL DEFAULT 0,
     eligible_primary INTEGER NOT NULL DEFAULT 0,
+    qc_detail TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS marker_review_decisions (
+    decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sequence_id TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    reviewer TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    reviewed_at TEXT NOT NULL DEFAULT '',
+    qc_class TEXT NOT NULL DEFAULT '',
+    sequence_sha256 TEXT NOT NULL DEFAULT '',
+    review_type TEXT NOT NULL DEFAULT '',
+    source_file TEXT NOT NULL DEFAULT '',
+    dedupe_key TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_marker_review_sequence ON marker_review_decisions(sequence_id);
 CREATE INDEX IF NOT EXISTS idx_marker_evidence_sequence ON marker_evidence(sequence_id);
 CREATE INDEX IF NOT EXISTS idx_marker_evidence_pool ON marker_evidence(eligible_primary, active_for_selection, evidence_tier);
 CREATE INDEX IF NOT EXISTS idx_marker_evidence_source ON marker_evidence(source_type, evidence_tier);
@@ -88,10 +107,9 @@ def ensure_marker_evidence_schema(db_or_connection) -> None:
     def apply(conn):
         conn.executescript(SCHEMA_SQL)
         columns = _table_columns(conn, 'marker_evidence')
-        if 'genome_16s_concordance' not in columns:
-            conn.execute(
-                "ALTER TABLE marker_evidence ADD COLUMN genome_16s_concordance TEXT NOT NULL DEFAULT ''"
-            )
+        for column in ('genome_16s_concordance', 'qc_detail'):
+            if column not in columns:
+                conn.execute(f"ALTER TABLE marker_evidence ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
     if hasattr(db_or_connection, "connect"):
         with db_or_connection.connect() as conn:
             apply(conn)
@@ -115,18 +133,21 @@ def _registry_has_rows(conn: sqlite3.Connection) -> bool:
 
 def _derive_legacy_tier(role: str, provenance: dict) -> tuple[str, str, str, int]:
     """Conservative one-time mapping for pre-registry project sequences."""
-    if role == "baseline":
-        return "LEGACY_BASELINE", "HIGH", "CURATED_BASELINE", 1
     qc = str(provenance.get("marker_qc_class") or "QUALITY_UNVERIFIED").upper()
     review = str(provenance.get("manual_review_status") or "NOT_REVIEWED").upper()
     decision = str(provenance.get("review_decision") or "").upper()
+    source = "LEGACY_BASELINE" if role == "baseline" else "LEGACY_UNKNOWN"
+    if review == "REJECTED" or decision in {"REJECT", "RESEQUENCE"}:
+        return source, "LOW", qc if role != "baseline" else "CURATED_BASELINE", 0
+    if role == "baseline":
+        return source, "HIGH", "CURATED_BASELINE", 1
     if qc == "PASS_HIGH_CONFIDENCE":
         return "LEGACY_UNKNOWN", "HIGH", qc, 1
-    if qc == "PASS_WITH_WARNINGS" and review == "APPROVED":
+    if qc == "PASS_WITH_WARNINGS" and review == "APPROVED" and decision == "APPROVE":
         return "LEGACY_UNKNOWN", "MODERATE", qc, 1
     if review == "APPROVED" and decision == "APPROVE_FAIL_QC":
         return "LEGACY_UNKNOWN", "MODERATE", qc, 1
-    if review == "APPROVED" and decision in {"APPROVE_UNVERIFIED", "APPROVE"}:
+    if review == "APPROVED" and decision == "APPROVE_UNVERIFIED":
         return "LEGACY_UNKNOWN", "MODERATE", qc, 1
     return "LEGACY_UNKNOWN", "LOW", qc, 0
 
@@ -188,8 +209,9 @@ def backfill_legacy_marker_evidence(db, *, force: bool = False) -> dict[str, int
                 counts["partner_low"] += 1
             digest = sha256_text(sequence)
             existing = conn.execute(
-                "SELECT evidence_id FROM marker_evidence WHERE sequence_id=? AND sequence_sha256=? AND source_type=?",
-                (str(sequence_id), digest, source),
+                "SELECT evidence_id FROM marker_evidence WHERE sequence_id=? AND sequence_sha256=? "
+                "AND source_type != 'GENOME_BARRNAP'",
+                (str(sequence_id), digest),
             ).fetchone()
             if existing:
                 counts["skipped"] += 1
@@ -200,7 +222,11 @@ def backfill_legacy_marker_evidence(db, *, force: bool = False) -> dict[str, int
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (str(sequence_id), str(dataset or ""), str(sequence).upper(), digest, source, tier,
                  qc_class, str(provenance_map.get(str(sequence_id), {}).get("manual_review_status") or "NOT_REVIEWED"),
-                 1, int(eligible), now),
+                 int(not (
+                     str(provenance_map.get(str(sequence_id), {}).get("manual_review_status") or "").upper() == "REJECTED"
+                     or str(provenance_map.get(str(sequence_id), {}).get("review_decision") or "").upper()
+                     in {"REJECT", "RESEQUENCE"}
+                 )), int(eligible), now),
             )
         conn.execute(
             "INSERT INTO marker_evidence_meta(key,value) VALUES('legacy_backfill_v1','complete') "
@@ -210,22 +236,77 @@ def backfill_legacy_marker_evidence(db, *, force: bool = False) -> dict[str, int
 
 
 def _tier_for_marker(source_type: str, qc_class: str, manual_status: str, review_decision: str) -> tuple[str, int]:
+    """Return (evidence tier, eligible-for-primary-pool) for one marker observation.
+
+    The technical QC class is never altered; manual approval can only raise a
+    non-passing marker to MODERATE. Genome-derived markers are never primary.
+    """
     source = source_type.upper()
     qc = qc_class.upper()
     review = manual_status.upper()
     decision = review_decision.upper()
     if source == "GENOME_BARRNAP":
-        # Genome-predicted 16S is supplementary context, never a HIGH Sanger-equivalent marker.
         return ("LOW", 0) if qc in {"FAIL_QC", "GENOME_DERIVED_FAIL"} else ("MODERATE", 0)
+    if review == "REJECTED" or decision in {"REJECT", "RESEQUENCE"}:
+        return "LOW", 0
     if qc == "PASS_HIGH_CONFIDENCE":
         return "HIGH", 1
-    if qc == "PASS_WITH_WARNINGS" and review == "APPROVED":
-        return "MODERATE", 1
-    if review == "APPROVED" and decision == "APPROVE_FAIL_QC":
-        return "MODERATE", 1
-    if review == "APPROVED" and decision in {"APPROVE_UNVERIFIED", "APPROVE"}:
+    if review == "APPROVED":
+        if qc == "FAIL_QC" and decision != "APPROVE_FAIL_QC":
+            return "LOW", 0
         return "MODERATE", 1
     return "LOW", 0
+
+
+def validate_review_decision(
+    decision: str, qc_class: str, *, reviewer: str = "", notes: str = "", has_consensus: bool = True,
+) -> str:
+    """Validate one explicit manual-review decision; return an error message or ''."""
+    decision = str(decision or "").strip().upper()
+    qc = str(qc_class or "").strip().upper()
+    if decision not in REVIEW_DECISIONS:
+        return f"decision must be one of {', '.join(REVIEW_DECISIONS)}; got {decision!r}"
+    if decision in APPROVAL_DECISIONS:
+        if not str(reviewer or "").strip():
+            return "reviewer is required for an approval"
+        if not str(notes or "").strip():
+            return "explanatory notes are required for an approval"
+        if not has_consensus:
+            return "no usable consensus sequence exists; a failed record without a consensus cannot be approved"
+    if decision == "APPROVE" and qc == "FAIL_QC":
+        return "APPROVE cannot be used for FAIL_QC; use APPROVE_FAIL_QC for a recoverable failed consensus"
+    if decision == "APPROVE" and qc not in WARNING_QC_CLASSES | {"PASS_HIGH_CONFIDENCE"}:
+        return f"APPROVE is for warning-level sequences; qc_class is {qc or 'unknown'}"
+    if decision == "APPROVE_FAIL_QC" and qc != "FAIL_QC":
+        return f"APPROVE_FAIL_QC requires qc_class FAIL_QC; qc_class is {qc or 'unknown'}"
+    if decision == "APPROVE_UNVERIFIED" and qc != "QUALITY_UNVERIFIED":
+        return f"APPROVE_UNVERIFIED requires qc_class QUALITY_UNVERIFIED; qc_class is {qc or 'unknown'}"
+    return ""
+
+
+def record_review_decisions(db, rows: Iterable[dict], *, source_file: str = "") -> int:
+    """Append review decisions to the immutable history; identical decisions are ignored."""
+    ensure_marker_evidence_schema(db)
+    added = 0
+    with db.connect() as conn:
+        for row in rows:
+            decision = str(row.get("review_decision") or row.get("decision") or "").upper()
+            sid = str(row.get("sequence_id") or "")
+            if not sid or decision not in REVIEW_DECISIONS:
+                continue
+            reviewer = str(row.get("reviewer") or "")
+            notes = str(row.get("review_notes") or row.get("notes") or "")
+            digest = str(row.get("sequence_sha256") or "")
+            key = hashlib.sha256("\x1f".join((sid, decision, reviewer, notes, digest)).encode()).hexdigest()
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO marker_review_decisions (sequence_id,decision,reviewer,notes,reviewed_at,"
+                "qc_class,sequence_sha256,review_type,source_file,dedupe_key,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (sid, decision, reviewer, notes, str(row.get("reviewed_at") or ""),
+                 str(row.get("marker_qc_class") or row.get("qc_class") or ""), digest,
+                 str(row.get("review_type") or ""), str(source_file or row.get("source_file") or ""), key, _now()),
+            )
+            added += cur.rowcount
+    return added
 
 
 def upsert_active_marker_evidence(
@@ -259,24 +340,74 @@ def upsert_active_marker_evidence(
             decision = str(p.get("review_decision") or p.get("decision") or "").upper()
             tier, eligible = _tier_for_marker(record_source_type, qc, manual, decision)
             digest = sha256_text(sequence)
-            conn.execute(
-                "UPDATE marker_evidence SET active_for_selection=0 WHERE sequence_id=? AND active_for_selection=1",
-                (sequence_id,),
-            )
-            conn.execute(
-                "INSERT INTO marker_evidence (sequence_id,dataset,sequence,sequence_sha256,source_type,"
-                "evidence_tier,qc_class,manual_review_status,review_decision,reviewer,review_notes,"
-                "source_file,active_for_selection,eligible_primary,created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (sequence_id, str(dataset or ""), sequence, digest, record_source_type, tier, qc, manual,
-                 decision, str(p.get("reviewer") or ""), str(p.get("review_notes") or p.get("marker_qc_reasons") or ""),
-                 str(source_file or p.get("source_sequence_file") or ""), 1, int(eligible), now),
-            )
+            reviewer = str(p.get("reviewer") or "")
+            notes = str(p.get("review_notes") or p.get("marker_qc_reasons") or "")
+            src = str(source_file or p.get("source_sequence_file") or "")
+            active = 0 if manual == "REJECTED" else 1
+            existing = conn.execute(
+                "SELECT evidence_id,manual_review_status,review_decision,reviewer,review_notes,"
+                "active_for_selection,eligible_primary,qc_class FROM marker_evidence "
+                "WHERE sequence_id=? AND sequence_sha256=? AND source_type=?",
+                (sequence_id, digest, record_source_type),
+            ).fetchone()
+            if decision:
+                error = validate_review_decision(
+                    decision, qc, reviewer=reviewer, notes=notes, has_consensus=bool(sequence),
+                )
+                if error:
+                    raise ValueError(f"Manual review decision for {sequence_id}: {error}")
+                manual = "APPROVED" if decision in APPROVAL_DECISIONS else "REJECTED"
+                tier, eligible = _tier_for_marker(record_source_type, qc, manual, decision)
+            elif manual == "APPROVED":
+                # Status without an explicit, validated v1 decision is not evidence approval.
+                manual, decision, reviewer, notes = "NOT_REVIEWED", "", "", ""
+                tier, eligible = _tier_for_marker(record_source_type, qc, manual, decision)
+            if existing and not decision:
+                # Re-imports may refresh technical provenance, but review state is changed only
+                # by an explicit, validated decision. In particular, a rejection stays inactive.
+                manual = str(existing[1] or "NOT_REVIEWED").upper()
+                decision = str(existing[2] or "").upper()
+                reviewer = str(existing[3] or "")
+                notes = str(existing[4] or "")
+                active = int(existing[5])
+                if manual == "APPROVED" and decision not in APPROVAL_DECISIONS:
+                    # A stored status-only approval was never validated; demote it.
+                    manual, decision, reviewer, notes = "NOT_REVIEWED", "", "", ""
+                tier, eligible = _tier_for_marker(record_source_type, qc, manual, decision)
+            else:
+                active = 0 if manual == "REJECTED" else 1
+            if active:
+                conn.execute(
+                    "UPDATE marker_evidence SET active_for_selection=0 WHERE sequence_id=? "
+                    "AND active_for_selection=1 AND sequence_sha256!=?",
+                    (sequence_id, digest),
+                )
+            if existing:
+                # Identical input is updated in place without losing an existing review decision.
+                conn.execute(
+                    "UPDATE marker_evidence SET dataset=?,evidence_tier=?,qc_class=?,manual_review_status=?,"
+                    "review_decision=?,reviewer=?,review_notes=?,active_for_selection=?,eligible_primary=? "
+                    "WHERE evidence_id=?",
+                    (str(dataset or ""), tier, qc, manual, decision, reviewer, notes, active,
+                     int(eligible and active), existing[0]),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO marker_evidence (sequence_id,dataset,sequence,sequence_sha256,source_type,"
+                    "evidence_tier,qc_class,manual_review_status,review_decision,reviewer,review_notes,"
+                    "source_file,active_for_selection,eligible_primary,created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (sequence_id, str(dataset or ""), sequence, digest, record_source_type, tier, qc, manual,
+                     decision, reviewer, notes, src, active, int(eligible and active), now),
+                )
             inserted.append({
                 "sequence_id": sequence_id, "source_type": record_source_type, "evidence_tier": tier,
-                "qc_class": qc, "manual_review_status": manual, "eligible_primary": bool(eligible),
-                "sequence_sha256": digest,
+                "qc_class": qc, "manual_review_status": manual, "eligible_primary": bool(eligible and active),
+                "sequence_sha256": digest, "review_decision": decision, "reviewer": reviewer,
+                "review_notes": notes, "reviewed_at": str(p.get("reviewed_at") or ""),
+                "marker_qc_class": qc,
             })
+    record_review_decisions(db, [r for r in inserted if r["review_decision"]], source_file=str(source_file or ""))
     return inserted
 
 
@@ -323,9 +454,9 @@ def register_supplemental_marker_fasta(
             sid = str(meta.get("sequence_id") or meta.get("SequenceID") or meta.get("id") or "").strip()
             if not sid:
                 raise ValueError(f"Supplemental marker mapping for FASTA ID {fasta_id!r} has no sequence_id")
-            if sid in seen:
-                raise ValueError(f"Multiple supplemental FASTA records map to the same isolate ID {sid!r}")
-            seen.add(sid)
+            if fasta_id in seen:
+                raise ValueError(f"Duplicate supplemental FASTA ID {fasta_id!r}")
+            seen.add(fasta_id)
             if sid not in existing_ids:
                 raise ValueError(f"Supplemental marker isolate {sid!r} is not present in this project database")
             source = str(meta.get("source_type") or default_source_type).upper()
@@ -341,29 +472,32 @@ def register_supplemental_marker_fasta(
             qc = str(meta.get("qc_class") or ("GENOME_DERIVED" if source == "GENOME_BARRNAP" else "QUALITY_UNVERIFIED")).upper()
             eligible = int(source != "GENOME_BARRNAP" and tier in {"HIGH", "MODERATE"})
             digest = sha256_text(sequence)
+            genome_id = str(meta.get("genome_id") or fasta_id)
             previous = conn.execute(
-                "SELECT evidence_id FROM marker_evidence WHERE sequence_id=? AND sequence_sha256=? AND source_type=?",
-                (sid, digest, source),
+                "SELECT evidence_id FROM marker_evidence WHERE sequence_id=? AND sequence_sha256=? "
+                "AND source_type=? AND genome_id=?",
+                (sid, digest, source, genome_id),
             ).fetchone()
             if previous:
-                results.append({"sequence_id": sid, "result": "ALREADY_PRESENT", "evidence_id": previous[0]})
+                results.append({"sequence_id": sid, "genome_id": genome_id,
+                                "result": "ALREADY_PRESENT", "evidence_id": previous[0]})
                 continue
             conn.execute(
                 "INSERT INTO marker_evidence (sequence_id,dataset,sequence,sequence_sha256,source_type,"
                 "evidence_tier,qc_class,manual_review_status,review_decision,taxonomy_source,taxonomy,"
                 "taxonomy_rank,taxonomy_identity,query_coverage,target_coverage,genome_id,genome_taxonomy,"
-                "genome_16s_concordance,source_file,source_sha256,active_for_selection,eligible_primary,created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "genome_16s_concordance,source_file,source_sha256,active_for_selection,eligible_primary,created_at,qc_detail) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (sid, str(meta.get("dataset") or ""), str(sequence).upper(), digest, source, tier, qc,
                  "NOT_REQUIRED", "", str(meta.get("taxonomy_source") or "VSEARCH_16S_GTDB"),
                  str(meta.get("taxonomy") or ""), str(meta.get("taxonomy_rank") or ""),
                  _maybe_float(meta.get("taxonomy_identity")), _maybe_float(meta.get("query_coverage")),
-                 _maybe_float(meta.get("target_coverage")), str(meta.get("genome_id") or fasta_id),
+                 _maybe_float(meta.get("target_coverage")), genome_id,
                  str(meta.get("genome_taxonomy") or ""), str(meta.get("genome_16s_concordance") or ""),
                  str(meta.get("source_file") or fasta_path), str(meta.get("source_sha256") or ""),
-                 0, eligible, _now()),
+                 0, eligible, _now(), str(meta.get("qc_detail") or "")),
             )
-            results.append({"sequence_id": sid, "result": "IMPORTED", "source_type": source,
+            results.append({"sequence_id": sid, "genome_id": genome_id, "result": "IMPORTED", "source_type": source,
                             "evidence_tier": tier, "sequence_sha256": digest})
     return results
 
@@ -510,3 +644,151 @@ def get_active_marker_evidence(db, sequence_ids: Iterable[str]) -> dict[str, dic
                     'marker_review_notes': row[7], 'marker_sequence_sha256': row[8],
                 })
     return output
+
+
+def sync_registry_with_sequences(db) -> int:
+    """Conservatively register active ``sequences`` rows that have no registry observation.
+
+    Direct writers (replacement, initial-marker attachment, legacy imports) update
+    ``sequences`` only. Any sequence whose exact residues are not yet registered for
+    that isolate is added with the legacy conservative tier policy, so the registry is
+    always the single source of pool eligibility. Observations already in the registry
+    (including rejected ones) are never re-activated.
+    """
+    ensure_marker_evidence_schema(db)
+    with db.connect() as conn:
+        try:
+            # Records registered before their dataset was declared a curated baseline.
+            conn.execute(
+                "UPDATE marker_evidence SET source_type='LEGACY_BASELINE', evidence_tier='HIGH', "
+                "qc_class='CURATED_BASELINE', eligible_primary=1 WHERE source_type='LEGACY_UNKNOWN' "
+                "AND manual_review_status='NOT_REVIEWED' AND active_for_selection=1 AND dataset IN "
+                "(SELECT dataset FROM dataset_roles WHERE role='baseline')"
+            )
+        except sqlite3.Error:
+            pass
+        rows = conn.execute(
+            "SELECT s.id, s.sequence, COALESCE(s.dataset,'') FROM sequences s "
+            "WHERE s.sequence IS NOT NULL AND s.sequence != '' AND NOT EXISTS ("
+            "SELECT 1 FROM marker_evidence e WHERE e.sequence_id=s.id AND e.sequence=upper(s.sequence))"
+        ).fetchall()
+        if not rows:
+            return 0
+        try:
+            role_map = {str(d or ""): str(r or "") for d, r in conn.execute("SELECT dataset, role FROM dataset_roles")}
+        except sqlite3.Error:
+            role_map = {}
+        provenance = {}
+        cols = _table_columns(conn, "sequence_provenance")
+        if "sequence_id" in cols:
+            wanted = [c for c in ("marker_qc_class", "manual_review_status", "review_decision") if c in cols]
+            for values in conn.execute("SELECT sequence_id," + ",".join(wanted) + " FROM sequence_provenance"):
+                provenance[str(values[0])] = dict(zip(wanted, values[1:]))
+        now = _now()
+        for sid, sequence, dataset in rows:
+            source, tier, qc, eligible = _derive_legacy_tier(role_map.get(str(dataset), ""), provenance.get(str(sid), {}))
+            manual = str(provenance.get(str(sid), {}).get("manual_review_status") or "NOT_REVIEWED")
+            conn.execute(
+                "UPDATE marker_evidence SET active_for_selection=0 WHERE sequence_id=? AND source_type!='GENOME_BARRNAP'",
+                (str(sid),),
+            )
+            conn.execute(
+                "INSERT INTO marker_evidence (sequence_id,dataset,sequence,sequence_sha256,source_type,"
+                "evidence_tier,qc_class,manual_review_status,active_for_selection,eligible_primary,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,1,?,?)",
+                (str(sid), str(dataset), str(sequence).upper(), sha256_text(sequence), source, tier, qc,
+                 manual, int(eligible), now),
+            )
+    return len(rows)
+
+
+def apply_marker_review_decisions(db, decisions_path: str | Path, *, dry_run: bool = False) -> list[dict]:
+    """Validate and persist manual-review decisions for markers already in the database.
+
+    All rows are validated first; if any row is invalid nothing is written. The
+    original QC class is retained; decisions are appended to ``marker_review_decisions``.
+    """
+    ensure_marker_evidence_schema(db)
+    with open(decisions_path, newline="", encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    results, plan = [], []
+    with db.connect() as conn:
+        for line, row in enumerate(rows, start=2):
+            sid = str(row.get("sequence_id") or "").strip()
+            decision = str(row.get("decision") or "").strip().upper()
+            if not sid or not decision:
+                results.append({"line": line, "sequence_id": sid, "result": "NOT_REVIEWED", "detail": "no decision"})
+                continue
+            ev = conn.execute(
+                "SELECT evidence_id,qc_class,sequence,sequence_sha256 FROM marker_evidence WHERE sequence_id=? "
+                "AND source_type!='GENOME_BARRNAP' ORDER BY active_for_selection DESC, evidence_id DESC LIMIT 1",
+                (sid,),
+            ).fetchone()
+            if not ev:
+                results.append({"line": line, "sequence_id": sid, "result": "ERROR", "detail": "no marker evidence record"})
+                continue
+            reviewer = str(row.get("reviewer") or "").strip()
+            notes = str(row.get("notes") or "").strip()
+            error = validate_review_decision(decision, ev[1], reviewer=reviewer, notes=notes,
+                                             has_consensus=bool(str(ev[2] or "").strip()))
+            if error:
+                results.append({"line": line, "sequence_id": sid, "result": "ERROR", "detail": error})
+                continue
+            plan.append((line, sid, decision, reviewer, notes, str(row.get("reviewed_at") or ""), ev))
+            results.append({"line": line, "sequence_id": sid, "result": "VALID", "detail": decision})
+    if dry_run or any(r["result"] == "ERROR" for r in results):
+        return results
+    with db.connect() as conn:
+        for line, sid, decision, reviewer, notes, reviewed_at, ev in plan:
+            status = "APPROVED" if decision in APPROVAL_DECISIONS else "REJECTED"
+            tier, eligible = _tier_for_marker("SANGER_AB1", ev[1], status, decision)
+            conn.execute(
+                "UPDATE marker_evidence SET manual_review_status=?,review_decision=?,reviewer=?,review_notes=?,"
+                "evidence_tier=?,eligible_primary=?,active_for_selection=? WHERE evidence_id=?",
+                (status, decision, reviewer, notes, tier, eligible, 0 if status == "REJECTED" else 1, ev[0]),
+            )
+            if "review_decision" in _table_columns(conn, "sequence_provenance"):
+                conn.execute(
+                    "UPDATE sequence_provenance SET manual_review_status=?,review_decision=?,reviewer=?,"
+                    "review_notes=? WHERE sequence_id=?",
+                    (status, decision, reviewer, notes, sid),
+                )
+    record_review_decisions(db, [
+        {"sequence_id": sid, "decision": d, "reviewer": rv, "notes": n, "reviewed_at": at,
+         "qc_class": ev[1], "sequence_sha256": ev[3]}
+        for _l, sid, d, rv, n, at, ev in plan
+    ], source_file=str(decisions_path))
+    for r in results:
+        if r["result"] == "VALID":
+            r["result"] = "APPLIED"
+    return results
+
+
+def marker_evidence_migration_report(db) -> dict:
+    """Summarise how existing records were classified (read-only)."""
+    ensure_marker_evidence_schema(db)
+    with db.connect() as conn:
+        one = lambda q: conn.execute(q).fetchone()[0]
+        report = {
+            "isolates": one("SELECT COUNT(*) FROM sequences"),
+            "isolates_with_marker_sequence": one("SELECT COUNT(*) FROM sequences WHERE sequence IS NOT NULL AND sequence!=''"),
+            "evidence_records": one("SELECT COUNT(*) FROM marker_evidence"),
+            "active_evidence_records": one("SELECT COUNT(*) FROM marker_evidence WHERE active_for_selection=1"),
+            "classified_HIGH": one("SELECT COUNT(*) FROM marker_evidence WHERE active_for_selection=1 AND evidence_tier='HIGH'"),
+            "classified_MODERATE": one("SELECT COUNT(*) FROM marker_evidence WHERE active_for_selection=1 AND evidence_tier='MODERATE'"),
+            "classified_LOW": one("SELECT COUNT(*) FROM marker_evidence WHERE active_for_selection=1 AND evidence_tier='LOW'"),
+            "unknown_provenance": one("SELECT COUNT(*) FROM marker_evidence WHERE source_type='LEGACY_UNKNOWN'"),
+            "rejected": one("SELECT COUNT(*) FROM marker_evidence WHERE manual_review_status='REJECTED'"),
+            "ambiguous_unreviewed": one(
+                "SELECT COUNT(*) FROM marker_evidence WHERE evidence_tier='LOW' AND manual_review_status IN ('NOT_REVIEWED','PENDING')"),
+            "unregistered_sequences": one(
+                "SELECT COUNT(*) FROM sequences s WHERE s.sequence IS NOT NULL AND s.sequence!='' AND NOT EXISTS "
+                "(SELECT 1 FROM marker_evidence e WHERE e.sequence_id=s.id AND e.sequence=upper(s.sequence))"),
+            "review_decisions_recorded": one("SELECT COUNT(*) FROM marker_review_decisions"),
+            "policy_version": MARKER_EVIDENCE_POLICY_VERSION,
+        }
+        report["by_source"] = {
+            str(k): v for k, v in conn.execute(
+                "SELECT source_type, COUNT(*) FROM marker_evidence GROUP BY source_type").fetchall()
+        }
+    return report

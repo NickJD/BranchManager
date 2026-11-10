@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import csv
-import gzip
 import re
 import warnings
 from pathlib import Path
 from typing import Iterable
+
+from branchmanager.taxonomy import domain_designation
+from branchmanager.utils.io import open_text
+from branchmanager.utils.text import normalise_column, normalise_for_matching
 
 
 ID_COLUMNS = {
@@ -33,6 +36,13 @@ SELECTION_COLUMNS = {
     'genomesequencingselected', 'genome_sequencing_selected',
     'genome sequencing selected',
 }
+TAXON_RANK_COLUMNS = {'taxon_rank', 'taxonomic_rank', 'taxon rank', 'taxonomic rank', 'organism_rank'}
+TAXON_COLUMNS = {
+    'taxon', 'taxon (bacteria)', 'taxon bacteria', 'bacterial_taxon', 'bacterial taxon',
+    'expected_taxon', 'expected taxon', 'organism', 'organism_name',
+    'organism name', 'scientific_name', 'scientific name', 'taxon_name',
+    'taxon name', 'expected_taxon_name',
+}
 ADDITION_METHOD_COLUMNS = {
     'addition_method', 'isolate_addition_method', 'identification_method',
     'taxonomic_identification_method', 'submission_method',
@@ -54,19 +64,30 @@ _ADDITION_METHOD_ALIASES = {
 }
 
 
-def _normalise_column(name: object) -> str:
-    return str(name or '').strip().lower().replace('-', '_')
 
+def merge_partner_project_metadata(existing: dict | None, incoming: dict | None) -> tuple[dict, bool]:
+    """Merge partner metadata without allowing non-catalogue imports to replace the November gold standard.
 
-def _normalise_for_matching(name: object) -> str:
-    return _normalise_column(name).replace('_', '').replace(' ', '')
-
-
-def _open_text(path: str | Path):
-    if str(path).endswith('.gz'):
-        return gzip.open(path, 'rt', newline='')
-    return open(path, 'rt', newline='')
-
+    Returns the merged metadata and whether the resulting taxon is protected by
+    ``Partner_Isolate_Catalogue_November.csv``. Re-importing that same named
+    catalogue is the explicit route for updating its stored values.
+    """
+    merged = dict(existing or {})
+    incoming_values = dict(incoming or {})
+    existing_is_gold = (
+        Path(str(merged.get('partner_taxonomy_source_file') or '')).name.casefold()
+        == 'partner_isolate_catalogue_november.csv'
+    )
+    incoming_is_gold = (
+        Path(str(incoming_values.get('partner_taxonomy_source_file') or '')).name.casefold()
+        == 'partner_isolate_catalogue_november.csv'
+    )
+    if existing_is_gold and not incoming_is_gold:
+        for key in ('partner_taxon_raw', 'expected_taxon', 'partner_taxon_rank', 'partner_taxonomy_source_file'):
+            incoming_values.pop(key, None)
+    merged.update(incoming_values)
+    protected = existing_is_gold or incoming_is_gold
+    return merged, protected
 
 def _parse_boolean(value: object, *, field: str) -> bool:
     if value is None:
@@ -85,14 +106,14 @@ def _parse_boolean(value: object, *, field: str) -> bool:
 
 def _find_column(fieldnames: Iterable[str], candidates: set[str]) -> str | None:
     fields = list(fieldnames or [])
-    exact = {_normalise_column(c): c for c in candidates}
-    compact = {_normalise_for_matching(c): c for c in candidates}
+    exact = {normalise_column(c): c for c in candidates}
+    compact = {normalise_for_matching(c): c for c in candidates}
     for field in fields:
-        norm = _normalise_column(field)
+        norm = normalise_column(field)
         if norm in exact:
             return field
     for field in fields:
-        norm = _normalise_for_matching(field)
+        norm = normalise_for_matching(field)
         if norm in compact:
             return field
     return None
@@ -101,14 +122,14 @@ def _find_column(fieldnames: Iterable[str], candidates: set[str]) -> str | None:
 def _rows_from_delimited(path: str | Path) -> list[dict]:
     suffixes = ''.join(Path(str(path).removesuffix('.gz')).suffixes).lower()
     delimiter = '\t' if suffixes.endswith('.tsv') or suffixes.endswith('.txt') else ','
-    with _open_text(path) as handle:
+    with open_text(path) as handle:
         sample = handle.read(4096)
         handle.seek(0)
         try:
             dialect = csv.Sniffer().sniff(sample, delimiters=',\t;')
             delimiter = dialect.delimiter
         except Exception:
-            pass
+            logging.getLogger(__name__).debug('Could not sniff CSV delimiter for %r; using default', path)
         reader = csv.DictReader(handle, delimiter=delimiter)
         return [row for row in reader if any(v not in (None, '') for v in row.values())]
 
@@ -180,7 +201,7 @@ def load_partner_workbook_rows(
             source_id = clean(get(values, 'record_id'))
             # The template has instructional rows between its internal header
             # and its first isolate. Rumen Gateway IDs use the stable PREFIX_NNNN form.
-            if not re.fullmatch(r'[A-Za-z][A-Za-z0-9.-]*_\d+', source_id):
+            if not re.fullmatch(r'[A-Za-z][A-Za-z0-9._-]*_\d+', source_id):
                 continue
             if source_id in seen_ids:
                 raise ValueError(
@@ -268,7 +289,11 @@ def load_partner_sequencing_metadata(path: str | Path, sheet_name: str | None = 
 
     Returns rows with normalised keys:
       source_id, partner_id, selected_for_sequencing, genome_available,
-      selected_for_wgs (stored alias for genome_available)
+      selected_for_wgs, expected_taxon, and expected_domain. The optional
+      ``taxon``/``expected_taxon`` column is the partner's declared identity.
+      Generic domain labels (for example ``bacterial``) populate
+      ``expected_domain`` rather than ``expected_taxon``; otherwise the domain
+      defaults to Bacteria for this isolate-ledger workflow.
     """
     p = Path(path)
     lower = str(p).lower()
@@ -286,6 +311,8 @@ def load_partner_sequencing_metadata(path: str | Path, sheet_name: str | None = 
     selection_col = _find_column(fieldnames, SELECTION_COLUMNS)
     partner_col = _find_column(fieldnames, PARTNER_ID_COLUMNS)
     addition_method_col = _find_column(fieldnames, ADDITION_METHOD_COLUMNS)
+    taxon_col = _find_column(fieldnames, TAXON_COLUMNS)
+    taxon_rank_col = _find_column(fieldnames, TAXON_RANK_COLUMNS)
 
     if not id_col:
         raise ValueError(
@@ -317,7 +344,15 @@ def load_partner_sequencing_metadata(path: str | Path, sheet_name: str | None = 
             field='selected_for_genome_sequencing',
         )
         raw_addition_method = str(raw.get(addition_method_col) or '').strip() if addition_method_col else ''
-        addition_method_key = _normalise_column(raw_addition_method).replace(' ', '_').replace('/', '_')
+        raw_expected_taxon = str(raw.get(taxon_col) or '').strip() if taxon_col else ''
+        raw_taxon_rank = str(raw.get(taxon_rank_col) or '').strip() if taxon_rank_col else ''
+        # A domain label in the free-text taxon column is a broad domain
+        # expectation, not a genus/species-level partner identification.
+        # Keep it as expected_domain and leave expected_taxon empty.
+        taxon_domain = domain_designation(raw_expected_taxon)
+        expected_domain = taxon_domain or 'Bacteria'
+        expected_taxon = '' if taxon_domain else raw_expected_taxon
+        addition_method_key = normalise_column(raw_addition_method).replace(' ', '_').replace('/', '_')
         addition_method = _ADDITION_METHOD_ALIASES.get(addition_method_key) if addition_method_key else None
         if addition_method_key and addition_method is None:
             raise ValueError(
@@ -347,13 +382,128 @@ def load_partner_sequencing_metadata(path: str | Path, sheet_name: str | None = 
             # field; it does not mean current selection for sequencing.
             'selected_for_wgs': genome_available,
             'addition_method': addition_method,
+            'expected_taxon': expected_taxon,
+            'expected_domain': expected_domain,
             'raw_selected_value': '' if raw_genome is None else str(raw_genome),
             'raw_commitment_value': '' if raw_selection is None else str(raw_selection),
             'project_metadata': {
-                str(key): str(value or '').strip()
-                for key, value in raw.items()
-                if key not in {id_col, partner_col, genome_col, selection_col, addition_method_col}
-                and value not in (None, '')
+                **{
+                    str(key): str(value or '').strip()
+                    for key, value in raw.items()
+                    if key not in {id_col, partner_col, genome_col, selection_col, addition_method_col, taxon_col}
+                    and value not in (None, '')
+                },
+                **({'expected_taxon': expected_taxon} if expected_taxon else {}),
+                **({'partner_taxon_raw': raw_expected_taxon} if raw_expected_taxon else {}),
+                **({'partner_taxonomy_source_file': p.name} if raw_expected_taxon else {}),
+                **({'partner_taxon_rank': raw_taxon_rank} if raw_taxon_rank else {}),
+                'expected_domain': expected_domain,
             },
         })
     return rows
+
+
+def load_genome_only_partner_workbook_rows(
+    path: str | Path,
+    *,
+    sheet_name: str = 'Bulk Upload Template',
+) -> list[dict]:
+    """Read genome-only isolate registrations from a Rumen Gateway workbook.
+
+    The template has five header/instruction rows. ``record_id`` is a numeric
+    partner-local ordinal, not a BranchManager isolate ID, so it is combined
+    with the partner acronym to create the stable ``PARTNER_0001`` identifier.
+    Marker/16S sequence columns are deliberately ignored.
+    """
+    try:
+        from openpyxl import load_workbook
+    except Exception as exc:
+        raise RuntimeError('Reading partner workbooks requires openpyxl') from exc
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message='Data Validation extension is not supported and will be removed', category=UserWarning)
+        workbook = load_workbook(path, read_only=True, data_only=True, keep_vba=False)
+    try:
+        if sheet_name not in workbook.sheetnames:
+            raise ValueError(
+                f"Partner workbook does not contain sheet {sheet_name!r}; "
+                f"available sheets: {', '.join(workbook.sheetnames)}"
+            )
+        sheet = workbook[sheet_name]
+        rows = iter(sheet.iter_rows(values_only=True))
+        header = next(rows, None)
+        if not header:
+            return []
+        headers = [str(value or '').strip().lower() for value in header]
+        if 'record_id' not in headers or 'partner_id' not in headers:
+            raise ValueError(
+                f"Sheet {sheet_name!r} must contain record_id and partner_id in its first row"
+            )
+        indices = {name: i for i, name in enumerate(headers) if name}
+
+        def value(row, key):
+            index = indices.get(key)
+            return row[index] if index is not None and index < len(row) else None
+
+        def clean(item):
+            return str(item).strip() if item is not None else ''
+
+        result = []
+        seen = {}
+        for row_number, row in enumerate(rows, start=2):
+            raw_record_id = clean(value(row, 'record_id'))
+            if not raw_record_id:
+                continue
+            # The workbook's descriptive rows contain instructional text in
+            # record_id. Only accept the numeric ordinal or canonical ID forms.
+            if not re.fullmatch(r'\d+(?:\.0+)?', raw_record_id) and not re.fullmatch(
+                r'[A-Za-z][A-Za-z0-9._-]*_\d+', raw_record_id
+            ):
+                continue
+            partner_raw = clean(value(row, 'partner_id'))
+            match = re.search(r'\(([A-Za-z0-9_-]+)\)\s*$', partner_raw)
+            if not match:
+                raise ValueError(
+                    f'Cannot determine partner acronym from partner_id {partner_raw!r} '
+                    f'on workbook row {row_number}'
+                )
+            partner_id = match.group(1).upper().replace('-', '_')
+            if re.fullmatch(r'\d+(?:\.0+)?', raw_record_id):
+                ordinal = int(float(raw_record_id))
+                if ordinal < 1:
+                    raise ValueError(f'record_id must be positive on workbook row {row_number}')
+                source_id = f'{partner_id}_{ordinal:04d}'
+            elif re.fullmatch(r'[A-Za-z][A-Za-z0-9._-]*_\d+', raw_record_id):
+                source_id = raw_record_id
+            else:
+                raise ValueError(
+                    f'Unrecognised record_id {raw_record_id!r} on workbook row {row_number}; '
+                    'expected a positive integer or PARTNER_0001 identifier'
+                )
+            if source_id in seen:
+                raise ValueError(
+                    f'Duplicate generated isolate ID {source_id!r} on workbook rows '
+                    f'{seen[source_id]} and {row_number}'
+                )
+            seen[source_id] = row_number
+
+            # Retain descriptive workbook metadata, but explicitly exclude all
+            # sequence-bearing columns so no marker sequence is imported.
+            metadata = {}
+            for key, item in zip(headers, row):
+                if not key or item is None or not clean(item):
+                    continue
+                if 'sequence' in key or '16s' in key or key in {'record_id', 'partner_id'}:
+                    continue
+                metadata[key] = clean(item)
+            result.append({
+                'source_row': row_number,
+                'source_id': source_id,
+                'partner_id': partner_id,
+                'partner_raw': partner_raw,
+                'partner_culture_id': clean(value(row, 'partner_culture_id')),
+                'project_metadata': metadata,
+            })
+        return result
+    finally:
+        workbook.close()

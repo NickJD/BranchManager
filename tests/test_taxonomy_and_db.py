@@ -105,6 +105,14 @@ def _write_minimal_ab1(path: Path, sequence: str, qualities):
     path.write_bytes(b'ABIF' + struct.pack('>H', 1) + root + directory + payload)
 
 
+
+def _mark_markers_qc_passed(db, ids):
+    db.upsert_sequence_provenance([
+        {'sequence_id': sid, 'marker_qc_class': 'PASS_HIGH_CONFIDENCE', 'manual_review_status': 'NOT_REQUIRED'}
+        for sid in ids
+    ])
+
+
 class TaxonomyUtilsTests(unittest.TestCase):
     def test_parse_taxon_string_supports_rank_prefixes(self):
         parsed = parse_taxon_string('d__Bacteria; p__Firmicutes; g__Bacillus')
@@ -712,7 +720,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
             outdir = tmp / 'out'
             db_path = tmp / 'test.sqlite'
 
-            def fake_run_classification(input_path, out_path, ref_fasta=None, taxa_tsv=None, threads=None):
+            def fake_run_classification(input_path, out_path, ref_fasta=None, taxa_tsv=None, threads=None, **_kwargs):
                 headers = [h for h, _ in read_fasta(input_path)]
                 class_path = Path(out_path) / 'taxonomy.tsv'
                 class_path.write_text(
@@ -944,7 +952,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
             db.upsert_dataset_role('Prior_01', 'candidate')
             metrics_query_ids = []
 
-            def fake_run_classification(input_path, out_path, ref_fasta=None, taxa_tsv=None, threads=None):
+            def fake_run_classification(input_path, out_path, ref_fasta=None, taxa_tsv=None, threads=None, **_kwargs):
                 headers = [h for h, _ in read_fasta(input_path)]
                 class_path = Path(out_path) / 'taxonomy.tsv'
                 class_path.write_text(
@@ -1036,7 +1044,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
             outdir = tmp / 'out'
             db_path = tmp / 'test.sqlite'
 
-            def fake_run_classification(input_path, out_path, ref_fasta=None, taxa_tsv=None, threads=None):
+            def fake_run_classification(input_path, out_path, ref_fasta=None, taxa_tsv=None, threads=None, **_kwargs):
                 class_path = Path(out_path) / 'taxonomy.tsv'
                 with open(class_path, 'w') as handle:
                     handle.write('ID\tBestHit\tIdentity\tTaxon\tConfidence\n')
@@ -1127,7 +1135,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
             db = Database(str(db_path))
             db.initialise()
 
-            def fake_run_classification(input_path, out_path, ref_fasta=None, taxa_tsv=None, threads=None):
+            def fake_run_classification(input_path, out_path, ref_fasta=None, taxa_tsv=None, threads=None, **_kwargs):
                 class_path = Path(out_path) / 'taxonomy.tsv'
                 class_path.write_text(
                     'ID\tBestHit\tIdentity\tTaxon\tConfidence\n'
@@ -1267,7 +1275,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
             previous_review.mkdir()
             db_path = tmp / 'test.sqlite'
 
-            def fake_run_classification(input_path, out_path, ref_fasta=None, taxa_tsv=None, threads=None):
+            def fake_run_classification(input_path, out_path, ref_fasta=None, taxa_tsv=None, threads=None, **_kwargs):
                 headers = [h for h, _ in read_fasta(input_path)]
                 class_path = Path(out_path) / 'taxonomy.tsv'
                 class_path.write_text(
@@ -1348,7 +1356,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
                 dataset='Batch1',
             )
 
-            def fake_run_classification(input_path, out_path, ref_fasta=None, taxa_tsv=None, threads=None):
+            def fake_run_classification(input_path, out_path, ref_fasta=None, taxa_tsv=None, threads=None, **_kwargs):
                 headers = [h for h, _ in read_fasta(input_path)]
                 class_path = Path(out_path) / 'taxonomy.tsv'
                 class_path.write_text(
@@ -3011,6 +3019,8 @@ class OutputHelperTests(unittest.TestCase):
                     'UPDATE sequences SET dataset = ? WHERE id = ?',
                     ('PartnerB', 'PartnerHit'),
                 )
+            db.upsert_dataset_role('Hungate', 'baseline')
+            _mark_markers_qc_passed(db, ['PartnerHit'])
 
             def fake_run_cmd(cmd):
                 parts = cmd.split()
@@ -3105,6 +3115,7 @@ class OutputHelperTests(unittest.TestCase):
             db.insert_sequences([('CandidateHit', 'ACGT')], dataset='CandidateDataset')
             db.insert_sequences([('SelectedPartner', 'TGCA')], dataset='SelectedPartnerDataset')
             db.insert_sequences([('UnselectedOther', 'AAAA')], dataset='OtherDataset')
+            _mark_markers_qc_passed(db, ['CandidateHit', 'SelectedPartner', 'UnselectedOther'])
             db.upsert_dataset_role('CandidateDataset', 'candidate')
             db.upsert_sequencing_metadata([
                 {
@@ -3148,6 +3159,7 @@ class OutputHelperTests(unittest.TestCase):
             db.initialise()
             db.insert_sequences([('Q1', 'ACGT')], dataset='CurrentBatch')
             db.insert_sequences([('SelectedPrev', 'ACGT')], dataset='OlderBatch')
+            _mark_markers_qc_passed(db, ['Q1', 'SelectedPrev'])
             db.upsert_sequencing_metadata([
                 {
                     'id': 'Q1',

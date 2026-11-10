@@ -7,9 +7,10 @@ requiring on-the-fly classification at each run.
 
 Output files written to *outdir*
 ---------------------------------
-  {dataset}_classification.tsv   Full vsearch matches (ID, BestHit, Identity,
-                                  Taxon, Confidence).  Human readable.
-  {dataset}_taxonomy.tsv         Condensed (ID, Taxon, Confidence).  Passable
+  {dataset}_classification.tsv   Full VSEARCH matches with identity, query and
+                                  reference coverage, alignment length, taxonomy,
+                                  source-provided confidence, and interpretation.
+  {dataset}_taxonomy.tsv         Condensed (ID, Taxon, SourceClassifierConfidence); no identity-derived confidence.  Passable
                                   directly to ``branchmanager filing-cabinet --taxa-assignments``.
   {dataset}_taxonomic_disagreement.tsv
                                   High-quality candidate hits that resolve to
@@ -33,6 +34,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from branchmanager.taxonomy_io import iter_taxonomy_assignment_rows
+from branchmanager.utils.reference import ensure_uncompressed_reference
 
 logger = logging.getLogger(__name__)
 
@@ -117,33 +119,9 @@ def resolve_dataset_meta(name: str) -> dict:
     return meta
 
 
-# ID normalisation helpers  (mirrors logic in pipeline/classify.py)
-
-def _norm_id(x: str) -> str:
-    x = x.split()[0]
-    if "|" in x:
-        x = x.split("|")[-1]
-    if "#" in x:
-        x = x.split("#")[0]
-    if ":" in x:
-        x = x.split(":")[0]
-    x = x.strip().strip("()[]{}")
-    x = re.sub(r"[^0-9A-Za-z]+", "_", x).strip("_")
-    return x
-
-
-def _canon_id(x: Optional[str]) -> Optional[str]:
-    if x is None:
-        return x
-    y = str(x).split()[0]
-    if "#" in y:
-        y = y.split("#")[0]
-    y = re.sub(r":\d+-\d+\(.*\)$", "", y)
-    y = re.sub(r":\d+-\d+$", "", y)
-    if "|" in y:
-        y = y.split("|")[-1]
-    y = re.sub(r"[^0-9A-Za-z]+", "_", y).strip("_")
-    return y
+# Re-export consolidated ID normalisation helpers for backward compatibility
+from branchmanager.utils.text import norm_id as _norm_id
+from branchmanager.utils.text import canon_id as _canon_id
 
 
 # Core classification logic
@@ -223,12 +201,8 @@ def _run_vsearch_pass(
     threads: int,
     dataset_name: str,
     round_label: str,
-) -> Dict[str, Tuple[str, float]]:
-    """Run one vsearch --usearch_global pass and return best hit per query.
-
-    Returns ``{qid: (sid, pct_identity)}`` containing only the highest-identity
-    hit for each query that appears in *matches_path*.
-    """
+) -> Dict[str, Tuple[str, float, float, float, int, int, int, str]]:
+    """Run one VSEARCH pass and retain identity plus both alignment coverages."""
     import shlex
     import subprocess
 
@@ -238,7 +212,8 @@ def _run_vsearch_pass(
         "--db", ref_fasta,
         "--id", str(min_identity),
         "--strand", "both",
-        "--blast6out", matches_path,
+        "--userout", matches_path,
+        "--userfields", "query+target+id+alnlen+mism+gaps+qlo+qhi+tlo+thi+ql+tl+qcov+tcov",
         "--maxaccepts", str(int(max_hits)),
         "--maxhits",    str(int(max_hits)),
         "--maxrejects", str(int(max_rejects)),
@@ -264,7 +239,7 @@ def _run_vsearch_pass(
             f"Command: {' '.join(shlex.quote(a) for a in cmd_list)}"
         )
 
-    best: Dict[str, Tuple[str, float]] = {}
+    best: Dict[str, Tuple[str, float, float, float, int, int, int, str]] = {}
     try:
         with open(matches_path) as fh:
             for line in fh:
@@ -272,21 +247,25 @@ def _run_vsearch_pass(
                 if not line:
                     continue
                 parts = line.split("\t")
-                if len(parts) < 3:
+                if len(parts) < 14:
                     continue
                 qid, sid = parts[0], parts[1]
                 try:
                     pct = float(parts[2])
-                except ValueError:
-                    pct = 0.0
-                if qid not in best or pct > best[qid][1]:
-                    best[qid] = (sid, pct)
+                    alnlen = int(float(parts[3]))
+                    qlen, tlen = int(float(parts[10])), int(float(parts[11]))
+                    qcov, tcov = float(parts[12]), float(parts[13])
+                except (ValueError, IndexError):
+                    continue
+                hit = (sid, pct, qcov, tcov, alnlen, qlen, tlen, round_label)
+                if qid not in best or (pct, qcov, alnlen) > (best[qid][1], best[qid][2], best[qid][4]):
+                    best[qid] = hit
     except FileNotFoundError:
         pass
     return best
 
 
-CandidateHit = Tuple[str, float, str]  # subject ID, percent identity, round label
+CandidateHit = Tuple[str, float, float, float, int, int, int, str]  # subject, identity, qcov, tcov, alnlen, qlen, tlen, round
 
 
 def _load_candidate_hits(matches_path: str, round_label: str) -> Dict[str, List[CandidateHit]]:
@@ -299,14 +278,16 @@ def _load_candidate_hits(matches_path: str, round_label: str) -> Dict[str, List[
                 if not line:
                     continue
                 parts = line.split("\t")
-                if len(parts) < 3:
+                if len(parts) < 14:
                     continue
                 qid, sid = parts[0], parts[1]
                 try:
-                    pct = float(parts[2])
-                except ValueError:
-                    pct = 0.0
-                hits_by_query.setdefault(qid, []).append((sid, pct, round_label))
+                    pct, alnlen = float(parts[2]), int(float(parts[3]))
+                    qlen, tlen = int(float(parts[10])), int(float(parts[11]))
+                    qcov, tcov = float(parts[12]), float(parts[13])
+                except (ValueError, IndexError):
+                    continue
+                hits_by_query.setdefault(qid, []).append((sid, pct, qcov, tcov, alnlen, qlen, tlen, round_label))
     except FileNotFoundError:
         pass
     return hits_by_query
@@ -348,7 +329,7 @@ def _fmt_float(value: object) -> str:
 
 def _build_taxonomic_disagreement_rows(
     candidate_hits_by_query: Dict[str, List[CandidateHit]],
-    best_hit: Dict[str, Tuple[str, float]],
+    best_hit: Dict[str, Tuple[str, float, float, float, int, int, int, str]],
     taxa_map: dict,
     classify_round: Dict[str, str],
     high_quality_threshold_pct: float,
@@ -363,20 +344,21 @@ def _build_taxonomic_disagreement_rows(
         seen_details: set = set()
         tax_groups: Dict[str, dict] = {}
 
-        for sid, pct, round_label in candidate_hits_by_query.get(qid, []):
-            if pct < high_quality_threshold_pct:
+        for sid, pct, qcov, tcov, alnlen, qlen, tlen, round_label in candidate_hits_by_query.get(qid, []):
+            # "High-quality" disagreement candidates must have adequate
+            # coverage as well as identity; partial local matches do not count.
+            if pct < high_quality_threshold_pct or qcov < 90.0 or tcov < 80.0:
                 continue
 
             high_quality_count += 1
             tax, conf = _resolve_taxon(sid, taxa_map)
-            if conf is None and pct:
-                conf = round(pct / 100.0, 4)
 
             detail = "|".join([
                 _tsv_safe(sid),
                 _fmt_float(pct),
                 _tsv_safe(tax),
                 _tsv_safe(conf),
+                _tsv_safe(f'qcov={qcov:.1f};tcov={tcov:.1f};aln={alnlen}'),
                 _tsv_safe(round_label),
             ])
             if detail not in seen_details:
@@ -405,10 +387,10 @@ def _build_taxonomic_disagreement_rows(
         if len(tax_groups) < 2:
             continue
 
-        selected_hit, selected_identity = best_hit.get(qid, ("NA", 0.0))
+        selected = best_hit.get(qid, ("NA", 0.0, None, None, None, None, None, "NA"))
+        selected_hit, selected_identity = selected[:2]
+        selected_qcov, selected_tcov, selected_alnlen = selected[2:5]
         selected_tax, selected_conf = _resolve_taxon(selected_hit, taxa_map)
-        if selected_conf is None and selected_identity:
-            selected_conf = round(selected_identity / 100.0, 4)
 
         disagreeing_taxa = []
         for group in sorted(
@@ -425,7 +407,10 @@ def _build_taxonomic_disagreement_rows(
             "SelectedBestHit": selected_hit,
             "SelectedIdentity": selected_identity,
             "SelectedTaxon": selected_tax,
-            "SelectedConfidence": selected_conf,
+            "SourceClassifierConfidence": selected_conf,
+            "SelectedQueryCoverage": selected_qcov,
+            "SelectedTargetCoverage": selected_tcov,
+            "SelectedAlignmentLength": selected_alnlen,
             "ClassifiedRound": classify_round.get(qid, "round1"),
             "HighQualityHitCount": high_quality_count,
             "TaxonAssignedHitCount": assigned_hit_count,
@@ -449,7 +434,10 @@ def _write_taxonomic_disagreement_tsv(
         "SelectedBestHit",
         "SelectedIdentity",
         "SelectedTaxon",
-        "SelectedConfidence",
+        "SourceClassifierConfidence",
+        "SelectedQueryCoverage",
+        "SelectedTargetCoverage",
+        "SelectedAlignmentLength",
         "ClassifiedRound",
         "HighQualityHitCount",
         "TaxonAssignedHitCount",
@@ -460,7 +448,8 @@ def _write_taxonomic_disagreement_tsv(
     with open(out_path, "w", newline="") as fh:
         fh.write(
             f"# Query 16S sequences from dataset '{dataset_name}' where high-quality "
-            f"candidate hits (>={high_quality_threshold_pct:.1f}% identity) resolve "
+            f"candidate hits (identity>={high_quality_threshold_pct:.1f}%, "
+            "query coverage>=90%, reference coverage>=80%) resolve "
             "to multiple different taxonomies.\n"
         )
         fh.write(
@@ -582,21 +571,15 @@ def classify_fasta(
                 if cur_id is not None:
                     input_ids[cur_id] = cur_len
         except Exception:
-            pass
+            logger.debug('Could not count sequences in input FASTA %s', fasta_path)
 
     n_input = len(input_ids)
 
-    ref_to_use = ref_fasta
-    if str(ref_fasta).endswith(".gz"):
-        ref_unc = os.path.join(outdir, f"{dataset_name}_ref_uncompressed.fasta")
-        if not os.path.exists(ref_unc):
-            logger.info("[BACKGROUND CHECK] Decompressing reference %s → %s", ref_fasta, ref_unc)
-            recs = list(read_fasta(ref_fasta))
-            write_fasta(recs, ref_unc)
-        ref_to_use = ref_unc
+    ref_unc_name = f"{dataset_name}_ref_uncompressed.fasta"
+    ref_to_use = ensure_uncompressed_reference(ref_fasta, outdir, out_name=ref_unc_name)
 
     matches_r1 = os.path.join(outdir, f"{dataset_name}_matches.tsv")
-    best_hit: Dict[str, Tuple[str, float]] = _run_vsearch_pass(
+    best_hit: Dict[str, Tuple[str, float, float, float, int, int, int, str]] = _run_vsearch_pass(
         query_fasta=norm_query,
         ref_fasta=ref_to_use,
         matches_path=matches_r1,
@@ -658,7 +641,7 @@ def classify_fasta(
 
         newly_found = 0
         for qid, hit in new_hits.items():
-            if qid not in best_hit or hit[1] > best_hit[qid][1]:
+            if qid not in best_hit or (hit[1], hit[2], hit[4]) > (best_hit[qid][1], best_hit[qid][2], best_hit[qid][4]):
                 best_hit[qid] = hit
                 classify_round[qid] = round_label
                 newly_found += 1
@@ -707,29 +690,42 @@ def classify_fasta(
     low_conf_tsv       = os.path.join(outdir, f"{dataset_name}_low_confidence.tsv")
     tax_disagree_tsv   = os.path.join(outdir, f"{dataset_name}_taxonomic_disagreement.tsv")
 
-    # Resolve taxonomy for each best hit
-    full_rows: List[Tuple[str, str, float, Optional[str], Optional[float]]] = []
+    # Resolve taxonomy for each best hit. Source confidence is only retained
+    # when supplied by the taxonomy source; percentage identity is never used
+    # as a substitute for confidence.
+    from branchmanager.pipeline.evidence_policy import classification_evidence_interpretation
+    full_rows: List[Tuple[str, str, float, Optional[str], Optional[float], float, float, int, int, int, str]] = []
     tax_rows:  List[Tuple[str, Optional[str], Optional[float]]] = []
     classified_ids: set = set()
 
-    for qid, (sid, pct) in best_hit.items():
+    for qid, hit in best_hit.items():
+        sid, pct, qcov, tcov, alnlen, qlen, tlen, round_label = hit
         tax, conf = _resolve_taxon(sid, taxa_map)
-        if conf is None and pct:
-            conf = round(pct / 100.0, 4)
         classified_ids.add(qid)
-        full_rows.append((qid, sid, pct, tax, conf))
+        full_rows.append((qid, sid, pct, tax, conf, qcov, tcov, alnlen, qlen, tlen, round_label))
         tax_rows.append((qid, tax, conf))
 
     written = len(full_rows)
 
     with open(classification_tsv, "w", newline="") as cf:
-        cf.write("ID\tBestHit\tIdentity\tTaxon\tConfidence\tClassifiedRound\n")
-        for qid, sid, pct, tax, conf in full_rows:
+        cf.write(
+            "ID\\tBestHit\\tIdentityPct\\tQueryCoveragePct\\tTargetCoveragePct\\tAlignmentLength\\t"
+            "QueryLength\\tTargetLength\\tTaxon\\tSourceClassifierConfidence\\tEvidenceTier\\t"
+            "AssignmentStatus\\tTaxonomySupportPct\\tTaxonomyCandidateCount\\tAlignmentEvidenceStatus\\t"
+            "AssignmentEvidenceLevel\\tEvidenceInterpretation\\tClassifiedRound\\n"
+        )
+        for qid, sid, pct, tax, conf, qcov, tcov, alnlen, qlen, tlen, round_label in full_rows:
+            evidence = classification_evidence_interpretation(
+                pct, qcov, tcov, evidence_tier="BACKGROUND_CHECK",
+                assignment_status="PROVISIONAL", candidate_count=None,
+                alignment_length=alnlen, query_length=qlen, target_length=tlen,
+            )
             cf.write(
-                f"{qid}\t{sid}\t{pct}\t"
-                f"{tax if tax is not None else 'NA'}\t"
-                f"{conf if conf is not None else 'NA'}\t"
-                f"{classify_round.get(qid, 'round1')}\n"
+                f"{qid}\\t{sid}\\t{pct}\\t{qcov}\\t{tcov}\\t{alnlen}\\t{qlen}\\t{tlen}\\t"
+                f"{tax if tax is not None else 'NA'}\\t"
+                f"{conf if conf is not None else 'NA'}\\tBACKGROUND_CHECK\\tPROVISIONAL\\tNA\\tNA\\t"
+                f"{evidence['alignment_evidence_status']}\\t{evidence['assignment_evidence_level']}\\t"
+                f"{evidence['evidence_interpretation'] + '; single best-hit assignment, no multi-reference consensus computed'}\\t{round_label}\\n"
             )
     logger.info(
         "[BACKGROUND CHECK] Wrote %d classification rows for dataset '%s' → %s",
@@ -737,7 +733,7 @@ def classify_fasta(
     )
 
     with open(taxonomy_tsv, "w", newline="") as tf:
-        tf.write("ID\tTaxon\tConfidence\n")
+        tf.write("ID\tTaxon\tSourceClassifierConfidence\n")
         for qid, tax, conf in tax_rows:
             tf.write(
                 f"{qid}\t{tax if tax is not None else 'NA'}\t"
@@ -778,30 +774,34 @@ def classify_fasta(
     )
 
     low_conf_rows = [
-        (qid, sid, pct, tax, conf)
-        for qid, sid, pct, tax, conf in full_rows
+        (qid, sid, pct, tax, conf, qcov, tcov, alnlen, qlen, tlen, round_label)
+        for qid, sid, pct, tax, conf, qcov, tcov, alnlen, qlen, tlen, round_label in full_rows
         if pct < (low_confidence_threshold * 100)
     ]
     with open(low_conf_tsv, "w", newline="") as lf:
         lf.write(
             f"# Sequences from dataset '{dataset_name}' classified below "
-            f"{low_confidence_threshold * 100:.1f}% identity\n"
+            f"{low_confidence_threshold * 100:.1f}% identity\\n"
         )
         lf.write(
-            "# These hits are ambiguous at species level and may require "
-            "manual review or lower-rank assignment.\n"
+            "# These identity-tier hits also retain query/reference coverage; inspect the alignment before interpreting taxonomy.\\n"
         )
-        lf.write("ID\tBestHit\tIdentity\tTaxon\tConfidence\tClassifiedRound\n")
-        for qid, sid, pct, tax, conf in sorted(low_conf_rows, key=lambda x: x[2]):
+        lf.write("ID\\tBestHit\\tIdentityPct\\tQueryCoveragePct\\tTargetCoveragePct\\tAlignmentLength\\tTaxon\\tSourceClassifierConfidence\\tAssignmentEvidenceLevel\\tEvidenceInterpretation\\tClassifiedRound\\n")
+        for qid, sid, pct, tax, conf, qcov, tcov, alnlen, qlen, tlen, round_label in sorted(low_conf_rows, key=lambda x: x[2]):
+            evidence = classification_evidence_interpretation(
+                pct, qcov, tcov, evidence_tier="BACKGROUND_CHECK",
+                assignment_status="PROVISIONAL", candidate_count=None,
+                alignment_length=alnlen, query_length=qlen, target_length=tlen,
+            )
             lf.write(
-                f"{qid}\t{sid}\t{pct}\t"
-                f"{tax if tax is not None else 'NA'}\t"
-                f"{conf if conf is not None else 'NA'}\t"
-                f"{classify_round.get(qid, 'round1')}\n"
+                f"{qid}\\t{sid}\\t{pct}\\t{qcov}\\t{tcov}\\t{alnlen}\\t"
+                f"{tax if tax is not None else 'NA'}\\t"
+                f"{conf if conf is not None else 'NA'}\\t{evidence['assignment_evidence_level']}\\t"
+                f"{evidence['evidence_interpretation'] + '; single best-hit assignment, no multi-reference consensus computed'}\\t{round_label}\\n"
             )
     n_low_conf = len(low_conf_rows)
     logger.info(
-        "[BACKGROUND CHECK] %d sequences have low-confidence hits (<%d%%) → %s",
+        "[BACKGROUND CHECK] %d sequences have low-identity hits (<%d%%) → %s",
         n_low_conf, int(low_confidence_threshold * 100), low_conf_tsv,
     )
 
@@ -875,7 +875,7 @@ def run_background_check(
     min_identity:
         Minimum vsearch identity threshold (0–1, default 0.80 = 80 %).
     low_confidence_threshold:
-        Identity threshold below which a hit is flagged as low-confidence
+        Identity threshold below which a hit is flagged as low-identity
         (0–1, default 0.97 = 97 %).  Sequences below this are written to
         ``{dataset}_low_confidence.tsv`` for manual review.
     max_hits:
@@ -944,7 +944,7 @@ def run_background_check(
             logger.warning("[BACKGROUND CHECK] Could not read taxonomy for dataset '%s': %s", ds_name, exc)
 
     with open(combined_path, "w", newline="") as fh:
-        fh.write("ID\tDataset\tTaxon\tConfidence\n")
+        fh.write("ID\tDataset\tTaxon\tSourceClassifierConfidence\n")
         for qid, ds_name, tax, conf in combined_rows:
             fh.write(f"{qid}\t{ds_name}\t{tax}\t{conf}\n")
     logger.info("[BACKGROUND CHECK] Wrote combined taxonomy (%d rows) → %s", len(combined_rows), combined_path)
@@ -953,7 +953,7 @@ def run_background_check(
     # Pass directly as --taxa-assignments to Filing Cabinet or Performance Review.
     pipeline_combined_path = os.path.join(outdir, "pipeline_taxonomy.tsv")
     with open(pipeline_combined_path, "w", newline="") as fh:
-        fh.write("ID\tTaxon\tConfidence\n")
+        fh.write("ID\tTaxon\tSourceClassifierConfidence\n")
         for qid, _, tax, conf in combined_rows:
             fh.write(f"{qid}\t{tax}\t{conf}\n")
     logger.info("[BACKGROUND CHECK] Wrote pipeline-ready taxonomy → %s", pipeline_combined_path)
@@ -991,10 +991,10 @@ def run_background_check(
 
 # Dataset summary CSV writer
 
-# Confidence tier boundaries (identity %)
-# High   : ≥ high_threshold   (default 97 %) – reliable species-level assignment
-# Medium : 90 % ≤ x < 97 %   – genus-level confidence
-# Low    : min_id ≤ x < 90 % – family/order level, ambiguous
+# Identity tier boundaries (%)
+# High   : ≥ high_threshold   (default 97 %) – strong identity; coverage and taxonomy evidence still need checking
+# Medium : 90 % ≤ x < 97 %   – moderate identity; not a calibrated confidence level
+# Low    : min_id ≤ x < 90 % – lower identity; taxonomic resolution remains ambiguous
 # No hit : no vsearch match after all retry rounds
 _MEDIUM_CONF_FLOOR = 90.0  # lower boundary of the medium tier (%)
 
@@ -1012,11 +1012,11 @@ def _write_dataset_summary_csv(
     -------
     Dataset, Label, InputFASTA, TotalInput,
     Classified, Unclassified,
-    HighConfidence, MediumConfidence, LowConfidence,
-    PctHighConfidence, PctMediumConfidence, PctLowConfidence,
+    HighIdentity, ModerateIdentity, LowIdentity,
+    PctHighIdentity, PctModerateIdentity, PctLowIdentity,
     PctClassified, PctUnclassified,
-    HighConfThreshold_pct, MediumConfFloor_pct, MinIdentity_pct,
-    ClassificationTSV, UnclassifiedTSV, LowConfidenceTSV,
+    HighIdentityThreshold_pct, ModerateIdentityFloor_pct, MinIdentity_pct,
+    ClassificationTSV, UnclassifiedTSV, LowIdentityTSV,
     TaxonomicDisagreements, TaxonomicDisagreementTSV
     """
     import csv as _csv
@@ -1027,11 +1027,11 @@ def _write_dataset_summary_csv(
     header = [
         "Dataset", "Label", "InputFASTA",
         "TotalInput", "Classified", "Unclassified",
-        "HighConfidence", "MediumConfidence", "LowConfidence",
-        "PctHighConfidence", "PctMediumConfidence", "PctLowConfidence",
+        "HighIdentity", "ModerateIdentity", "LowIdentity",
+        "PctHighIdentity", "PctModerateIdentity", "PctLowIdentity",
         "PctClassified", "PctUnclassified",
-        "HighConfThreshold_pct", "MediumConfFloor_pct", "MinIdentity_pct",
-        "ClassificationTSV", "UnclassifiedTSV", "LowConfidenceTSV",
+        "HighIdentityThreshold_pct", "ModerateIdentityFloor_pct", "MinIdentity_pct",
+        "ClassificationTSV", "UnclassifiedTSV", "LowIdentityTSV",
         "TaxonomicDisagreements", "TaxonomicDisagreementTSV",
     ]
 
@@ -1067,7 +1067,7 @@ def _write_dataset_summary_csv(
                 reader = _csv.DictReader(fh, delimiter="\t")
                 for row in reader:
                     try:
-                        pct = float(row.get("Identity", 0) or 0)
+                        pct = float(row.get("IdentityPct", row.get("Identity", 0)) or 0)
                     except (ValueError, TypeError):
                         pct = 0.0
                     if pct >= high_floor:
@@ -1123,7 +1123,9 @@ def _write_summary(
     _first = next((r for r in results.values() if isinstance(r, dict)), {})
     lines.append(f"Candidate hits  : up to {_first.get('max_hits', 10)} per query (best selected)")
     lines.append(f"Max rejects     : {_first.get('max_rejects', 256)}")
-    lines.append(f"Low-conf cutoff : <{low_confidence_threshold * 100:.0f}% identity")
+    lines.append(f"Low-identity cutoff : <{low_confidence_threshold * 100:.0f}% identity")
+    lines.append("Identity is calculated over the aligned segment; inspect query and reference coverage before interpreting a match.")
+    lines.append("SourceClassifierConfidence is source-provided only and is never derived from percentage identity.")
     lines.append(f"\nDatasets processed: {len(datasets)}")
     lines.append("")
 
@@ -1167,16 +1169,16 @@ def _write_summary(
             lines.append(f"  │  Input sequences                    : {n_input}")
             lines.append("  │")
 
-            # High-confidence — the "good" classifications
+            # High-identity — the "good" classifications
             if isinstance(n_high, int) and isinstance(n_classified, int):
                 lines.append(
-                    f"  │  ✓  High-confidence   (≥{lc_pct}% identity)  : "
+                    f"  │  ✓  High-identity   (≥{lc_pct}% identity)  : "
                     f"{n_high}/{n_input}  ({_pct(n_high)})"
                 )
             else:
-                lines.append(f"  │  High-confidence (≥{lc_pct}% identity) : ?")
+                lines.append(f"  │  High-identity (≥{lc_pct}% identity) : ?")
 
-            # Medium-confidence (90–97 %)
+            # Moderate-identity (90–97 %)
             n_med_raw = res.get("n_medium_confidence")  # may be absent in older runs
             # Fall back to reading classification TSV if needed
             if n_med_raw is None:
@@ -1186,34 +1188,34 @@ def _write_summary(
                     with open(str(res.get("classification_tsv", ""))) as _cf:
                         for _row in _csv2.DictReader(_cf, delimiter="\t"):
                             try:
-                                _p2 = float(_row.get("Identity", 0) or 0)
+                                _p2 = float(_row.get("IdentityPct", row.get("Identity", 0)) or 0)
                             except (ValueError, TypeError):
                                 _p2 = 0.0
                             if _MEDIUM_CONF_FLOOR <= _p2 < (lc_pct):
                                 n_med_raw += 1
                 except Exception:
-                    pass
+                    logger.debug('Could not read classification TSV for moderate-identity count')
             n_med = n_med_raw
             if isinstance(n_med, int) and n_med > 0:
                 lines.append(
-                    f"  │  ~  Medium-confidence ({_MEDIUM_CONF_FLOOR:.0f}–{lc_pct}% identity): "
+                    f"  │  ~  Moderate-identity ({_MEDIUM_CONF_FLOOR:.0f}–{lc_pct}% identity): "
                     f"{n_med}/{n_input}  ({_pct(n_med)})  → {low_conf_tsv}"
                 )
             elif isinstance(n_med, int):
                 lines.append(
-                    f"  │     Medium-confidence ({_MEDIUM_CONF_FLOOR:.0f}–{lc_pct}% identity): 0"
+                    f"  │     Moderate-identity ({_MEDIUM_CONF_FLOOR:.0f}–{lc_pct}% identity): 0"
                 )
 
-            # Low-confidence (min_id – 90 %)
+            # Low-identity (min_id – 90 %)
             n_low_strict = (n_low - n_med) if isinstance(n_low, int) and isinstance(n_med, int) else n_low
             if isinstance(n_low_strict, int) and n_low_strict > 0:
                 lines.append(
-                    f"  │  ⚠  Low-confidence    ({min_id_pct}–{_MEDIUM_CONF_FLOOR:.0f}% identity): "
+                    f"  │  ⚠  Low-identity    ({min_id_pct}–{_MEDIUM_CONF_FLOOR:.0f}% identity): "
                     f"{n_low_strict}/{n_input}  ({_pct(n_low_strict)})  → {low_conf_tsv}"
                 )
             elif isinstance(n_low_strict, int):
                 lines.append(
-                    f"  │     Low-confidence    ({min_id_pct}–{_MEDIUM_CONF_FLOOR:.0f}% identity): 0"
+                    f"  │     Low-identity    ({min_id_pct}–{_MEDIUM_CONF_FLOOR:.0f}% identity): 0"
                 )
 
             # Unclassified — no hit at all across all retry rounds
@@ -1244,7 +1246,7 @@ def _write_summary(
             if isinstance(n_unclass, int) and n_unclass > 0:
                 lines.append(f"  │  Unclassified TSV     : {unclass_tsv}")
             if isinstance(n_low, int) and n_low > 0:
-                lines.append(f"  │  Low-confidence TSV   : {low_conf_tsv}")
+                lines.append(f"  │  Low-identity TSV   : {low_conf_tsv}")
             if isinstance(n_tax_dis, int) and n_tax_dis > 0:
                 lines.append(f"  │  Taxonomic disagreement TSV: {tax_dis_tsv}")
         else:
@@ -1271,7 +1273,7 @@ def _write_summary(
             with open(str(r.get("classification_tsv", ""))) as _cf:
                 for _row in _csv3.DictReader(_cf, delimiter="\t"):
                     try:
-                        _p3 = float(_row.get("Identity", 0) or 0)
+                        _p3 = float(_row.get("IdentityPct", row.get("Identity", 0)) or 0)
                     except (ValueError, TypeError):
                         _p3 = 0.0
                     if _p3 >= high_floor_pct:
@@ -1281,7 +1283,7 @@ def _write_summary(
                     else:
                         total_low_strict += 1
         except Exception:
-            pass
+            logger.debug('Could not read classification TSV for overall identity totals')
 
     lc_pct_global = int(low_confidence_threshold * 100)
 
@@ -1293,16 +1295,16 @@ def _write_summary(
     lines.append("─" * 70)
     lines.append(f"  Input sequences                              : {total_input}")
     lines.append(
-        f"  ✓  High-confidence   (≥{lc_pct_global}% identity)     : "
+        f"  ✓  High-identity   (≥{lc_pct_global}% identity)     : "
         f"{total_high}  ({_gpct(total_high)})"
     )
     lines.append(
-        f"  ~  Medium-confidence ({_MEDIUM_CONF_FLOOR:.0f}–{lc_pct_global}% identity) : "
+        f"  ~  Moderate-identity ({_MEDIUM_CONF_FLOOR:.0f}–{lc_pct_global}% identity) : "
         f"{total_med}  ({_gpct(total_med)})"
         + ("  ← review *_low_confidence.tsv" if total_med else "")
     )
     lines.append(
-        f"  ⚠  Low-confidence    (<{_MEDIUM_CONF_FLOOR:.0f}% identity)     : "
+        f"  ⚠  Low-identity    (<{_MEDIUM_CONF_FLOOR:.0f}% identity)     : "
         f"{total_low_strict}  ({_gpct(total_low_strict)})"
         + ("  ← review *_low_confidence.tsv" if total_low_strict else "")
     )

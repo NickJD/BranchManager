@@ -6,13 +6,16 @@ the reference database. This gives a gradient from 0 (no hit at all, or
 very distant) to 100 (identical to a known sequence).
 
 The distinction from classify.py is important:
-  - classify.py runs vsearch at --id 0.8 to find the best taxonomic hit
-  - novelty.py runs vsearch at --id 0.0 (no threshold) to find the NEAREST
-    neighbour regardless of distance, so we always get a real distance metric
+  - classify.py performs taxonomic assignment using a high-stringency adaptive
+    identity/coverage ladder with bounded candidate collection
+  - novelty.py uses a descending 90→50% identity ladder, preferring >=95%
+    query coverage and retaining >=80% partial-coverage evidence separately;
+    nearest-hit searches are bounded, while density searches remain exhaustive
+    because they calculate exact qualifying-neighbour counts
 
 The two vsearch runs serve different purposes and MUST NOT share matches.tsv.
-classify.py  → outdir/matches.tsv         (taxonomy, min 80% identity)
-novelty.py   → outdir/novelty_matches.tsv (distances, no threshold)
+classify.py  → outdir/matches.tsv         (adaptive high-stringency taxonomy)
+novelty.py   → outdir/novelty_matches.tsv (nearest-neighbour evidence)
 
 Output columns: ID\tNearestIdentity\tNearestHit\tNovel
   NearestIdentity : float 0–100, identity to best reference hit
@@ -26,6 +29,7 @@ from __future__ import annotations
 import logging
 import os
 import shlex
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -37,13 +41,20 @@ from branchmanager.pipeline.selection_sets import (
     DEFAULT_BASELINE_REDUNDANCY_QUERY_COVERAGE,
     DEFAULT_PANGENOME_TARGET,
 )
-from branchmanager.taxonomy import parse_taxon_string
+from branchmanager.taxonomy import normalise_taxon_name, parse_taxon_string
 from branchmanager.utils.fasta import read_fasta, write_fasta
 from branchmanager.utils.subprocess import run_cmd
+from branchmanager.pipeline.vsearch_audit import run_vsearch_audited
+from branchmanager.utils.reference import ensure_uncompressed_reference
 
 logger = logging.getLogger(__name__)
 VSEARCH_USERFIELDS = 'query+target+id+alnlen+mism+gaps+qlo+qhi+tlo+thi+ql+tl+qcov+tcov'
 MIN_NEAREST_QUERY_COVERAGE = DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE
+PARTIAL_NEAREST_QUERY_COVERAGE = 80.0
+# Density is a prioritisation signal, not a census. Bound accepted hits to
+# reduce repeated all-vs-all work as partner/reference collections grow.
+DENSITY_HIT_CAP = 100
+NEAREST_IDENTITY_LADDER = (90, 80, 70, 60, 50)
 
 
 def _alignment_evidence(parts: list[str]) -> tuple[Optional[float], Optional[int]]:
@@ -155,6 +166,33 @@ def run_novelty(
         Path(matches_path).write_text('')
         return output
 
+    # Preferred path: reuse the authoritative Stage B project nearest-hit
+    # results produced by build_reference_novelty_metrics. This prevents the
+    # legacy report from launching a second VSEARCH against a different pool.
+    project_matches = Path(outdir) / 'novelty_project_nearest_matches.tsv'
+    if project_matches.exists():
+        import shutil
+        shutil.copyfile(project_matches, matches_path)
+        best_hits = _parse_best_hits(str(project_matches))
+        novel_threshold_pct = id_threshold * 100.0
+        with open(output, "w") as fh:
+            fh.write("ID\tNearestIdentity\tNearestHit\tNovel\n")
+            for header, _sequence in read_fasta(input_fasta):
+                if tree_pipeline.is_ref_anchor(header):
+                    continue
+                hit = best_hits.get(header, (0.0, "None", None, None))
+                fh.write(
+                    f"{header}\t{hit[0]:.2f}\t{hit[1]}\t"
+                    f"{hit[0] < novel_threshold_pct}\n"
+                )
+        logger.info(
+            "[NOVELTY] Derived legacy novelty outputs from Stage B project matches; "
+            "no additional VSEARCH search was run"
+        )
+        return output
+
+    # Compatibility fallback for direct callers that have not run the
+    # consolidated reference/project novelty workflow first.
     # Priority: explicit target_fasta > DB-derived submitted sequences > nothing
     db_fasta = Path(outdir) / "submitted_sequences.fasta"
     submission_db_exists = False
@@ -194,13 +232,17 @@ def run_novelty(
             f"--strand both "
             f"--userout {shlex.quote(str(matches_path))} "
             f"--userfields {VSEARCH_USERFIELDS} "
-            f"--maxaccepts 0 --maxrejects 0 --maxhits 0 "
+            f"--maxaccepts 32 --maxrejects 256 --maxhits 32 "
             f"--query_cov {MIN_NEAREST_QUERY_COVERAGE / 100.0:.2f}"
             f"{thread_flag}"
         )
         logger.info("[NOVELTY] Running vsearch against previously submitted sequences")
         try:
-            run_cmd(cmd)
+            run_vsearch_audited(
+                cmd, audit_path=Path(outdir) / 'vsearch_search_audit.tsv',
+                stage='B', purpose='legacy_project_novelty', query_fasta=input_fasta,
+                reference_fasta=db_fasta, runner=run_cmd,
+            )
             logger.info("[NOVELTY] vsearch done → %s", matches_path)
         except Exception as e:
             raise RuntimeError(f'vsearch against the submitted-sequence pool failed: {e}') from e
@@ -273,61 +315,12 @@ def _parse_best_hits(matches_path: str) -> dict[str, tuple[float, str, Optional[
 
 
 def _ensure_uncompressed(ref_fasta: str, outdir: str) -> str:
-    """Decompress gzipped reference fasta to outdir if needed. Returns path to use."""
-    if not str(ref_fasta).endswith(".gz"):
-        return ref_fasta
-    ref_unc = os.path.join(outdir, "ref_uncompressed.fasta")
-    if os.path.exists(ref_unc):
-        # File already exists - check if it's non-empty
-        try:
-            size = os.path.getsize(ref_unc)
-            if size > 0:
-                logger.info("[NOVELTY] Using existing decompressed reference: %s (%.1f MB)", ref_unc, size / (1024*1024))
-                return ref_unc
-            else:
-                logger.warning("[NOVELTY] Existing decompressed file is empty; re-decompressing")
-                os.remove(ref_unc)
-        except Exception as e:
-            logger.warning("[NOVELTY] Could not check existing file: %s; re-decompressing", e)
-
-    # Get compressed file size for progress estimation
-    import time
-    try:
-        compressed_size = os.path.getsize(ref_fasta)
-        logger.info("[NOVELTY] Decompressing %s (%.1f MB compressed) → %s",
-                   ref_fasta, compressed_size / (1024*1024), ref_unc)
-        if compressed_size > 100 * 1024 * 1024:  # > 100 MB
-            logger.warning("[NOVELTY] Large reference file detected (%.1f MB compressed). "
-                          "Decompression may take several minutes depending on disk I/O speed. "
-                          "Please be patient...", compressed_size / (1024*1024))
-    except Exception:
-        logger.info("[NOVELTY] Decompressing %s → %s", ref_fasta, ref_unc)
-
-    import gzip as _gzip
-    import shutil as _shutil
-    # Decompress using fast byte-level streaming
-    start_time = time.time()
-
-    try:
-        with _gzip.open(ref_fasta, 'rb') as _src, open(ref_unc, 'wb') as _dst:
-            _shutil.copyfileobj(_src, _dst, length=1 << 20)  # 1 MiB buffer
-
-        elapsed = time.time() - start_time
-        final_size = os.path.getsize(ref_unc)
-        final_mb = final_size / (1024 * 1024)
-        logger.info("[NOVELTY] Decompression complete: %.1f MB written in %.1f seconds (%.1f MB/s)",
-                    final_mb, elapsed, final_mb / elapsed if elapsed > 0 else 0)
-    except Exception as e:
-        logger.error("[NOVELTY] Decompression failed: %s", e)
-        # Clean up partial file
-        try:
-            if os.path.exists(ref_unc):
-                os.remove(ref_unc)
-        except Exception:
-            pass
-        raise
-
-    return ref_unc
+    """Return a validated, source-specific uncompressed reference cache."""
+    source = Path(ref_fasta)
+    safe_stem = ''.join(ch if ch.isalnum() else '_' for ch in source.name.removesuffix('.gz'))[:48]
+    return ensure_uncompressed_reference(
+        ref_fasta, outdir, out_name=f"ref_uncompressed_{safe_stem}.fasta"
+    )
 
 
 def build_novelty_itol(
@@ -456,11 +449,15 @@ def compute_db_nearest_identities(mapped_derep: str, outdir: str, db, run_datase
                 f"--db {shlex.quote(str(db_preset_fasta))} --id 0.5 --strand both "
                 f"--userout {shlex.quote(str(novelty_matches))} "
                 f"--userfields {VSEARCH_USERFIELDS} "
-                f"--maxaccepts 0 --maxrejects 0 --maxhits 0 "
+                f"--maxaccepts 32 --maxrejects 256 --maxhits 32 "
                 f"--query_cov {MIN_NEAREST_QUERY_COVERAGE / 100.0:.2f}{thread_flag}"
             )
             logger.info("[NOVELTY] Running vsearch against registered project collection to compute novelty")
-            run_cmd(cmd)
+            run_vsearch_audited(
+                cmd, audit_path=Path(outdir) / 'vsearch_search_audit.tsv',
+                stage='B', purpose='legacy_project_novelty', query_fasta=mapped_derep,
+                reference_fasta=db_preset_fasta, runner=run_cmd,
+            )
             if novelty_matches.exists():
                 with open(novelty_matches) as nm:
                     for line in nm:
@@ -503,7 +500,7 @@ def build_run_novelty_itol(outdir: str, run_ids, mapped_derep: str, db, run_data
         nov_lines.append('LEGEND_COLORS,' + ','.join(colours))
         nov_lines.append('LEGEND_LABELS,' + ','.join(labels))
     except Exception:
-        pass
+        logger.debug('Could not generate iTOL novelty legend; skipping')
 
     novel_results = compute_db_nearest_identities(mapped_derep, outdir, db, run_dataset, threads=threads)
 
@@ -514,7 +511,7 @@ def build_run_novelty_itol(outdir: str, run_ids, mapped_derep: str, db, run_data
             if s:
                 forms.append(s)
         except Exception:
-            pass
+            pass  # orig_to_short lookup failed; continuing with original ID
         forms.append(x)
         if '|' in x:
             forms.append(x.split('|')[-1])
@@ -523,7 +520,7 @@ def build_run_novelty_itol(outdir: str, run_ids, mapped_derep: str, db, run_data
             forms.append(forms[0].upper())
             forms.append(forms[0].lower())
         except Exception:
-            pass
+            pass  # case conversion failed; continuing with original forms
         import re as _re
         forms.append(_re.sub(r'_n?\d+$', '', forms[0] if forms else x))
         seen = set()
@@ -553,6 +550,7 @@ def build_run_novelty_itol(outdir: str, run_ids, mapped_derep: str, db, run_data
                 try:
                     colour = itol._identity_to_colour(float(v), vmin=0.90, vmax=1.0)
                 except Exception:
+                    pass  # could not parse identity value; using default colour
                     colour = '#cccccc'
             else:
                 try:
@@ -563,6 +561,7 @@ def build_run_novelty_itol(outdir: str, run_ids, mapped_derep: str, db, run_data
                         if r:
                             colour = itol._identity_to_colour(r[0], vmin=0.90, vmax=1.0)
                 except Exception:
+                    pass  # could not query database for identity; using default colour
                     colour = '#cccccc'
         nov_lines.append(f'{iid},{colour}')
 
@@ -652,14 +651,14 @@ def _discover_tiered_baseline_datasets(
                     role_tiers[dataset] = tier
                     add([dataset], tier)
             except Exception:
-                pass
+                logger.debug('Could not query dataset roles for baseline tiers')
         else:
             try:
                 for dataset, metadata in db.get_dataset_roles().items():
                     if metadata.get('role') == 'baseline':
                         role_tiers[dataset] = _infer_baseline_tier_name(dataset, metadata.get('baseline_tier'))
             except Exception:
-                pass
+                logger.debug('Could not query dataset roles for baseline tier names')
 
     for name in _normalise_dataset_names(baseline_datasets):
         add([name], role_tiers.get(name) or _infer_baseline_tier_name(name))
@@ -679,57 +678,22 @@ def _query_db_pool(
     exclude_datasets=None,
     evidence_pool: str = 'primary',
 ):
-    # Once the evidence registry has been backfilled, only eligible HIGH/MODERATE
-    # primary markers may enter the normal project/cultured pools. Barrnap-derived
+    # The evidence registry is the only source of pool eligibility. Direct writers
+    # to ``sequences`` are reconciled conservatively first, so HIGH/MODERATE primary
+    # markers are the only sequences that can enter primary pools; Barrnap-derived
     # observations are queried separately and never affect primary novelty scores.
-    try:
-        from branchmanager.marker_evidence import query_marker_evidence_pool
-        with db.connect() as conn:
-            registry_ready = conn.execute(
-                "SELECT value FROM marker_evidence_meta WHERE key='legacy_backfill_v1'"
-            ).fetchone()
-            registry_exists = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='marker_evidence'"
-            ).fetchone()
-            if registry_ready and registry_ready[0] == 'complete' and registry_exists:
-                return query_marker_evidence_pool(
-                    conn, pool=evidence_pool, run_dataset=run_dataset,
-                    include_datasets=include_datasets, include_ids=include_ids,
-                    exclude_datasets=exclude_datasets,
-                )
-    except Exception as exc:
-        logger.warning('[NOVELTY] Evidence registry unavailable; using legacy sequence pool: %s', exc)
-    include = _normalise_dataset_names(include_datasets)
-    ids = list(dict.fromkeys(str(item) for item in (include_ids or []) if str(item)))
-    exclude = _normalise_dataset_names(exclude_datasets)
-    clauses = ["sequence IS NOT NULL", "sequence != ''"]
-    params: list[object] = []
-    if run_dataset:
-        clauses.append("(dataset != ? OR dataset IS NULL)")
-        params.append(run_dataset)
-    if include or ids:
-        include_clauses = []
-        if include:
-            placeholders = ','.join('?' for _ in include)
-            include_clauses.append(f"dataset IN ({placeholders})")
-            params.extend(include)
-        if ids:
-            placeholders = ','.join('?' for _ in ids)
-            include_clauses.append(f"id IN ({placeholders})")
-            params.extend(ids)
-        clauses.append('(' + ' OR '.join(include_clauses) + ')')
-    if exclude:
-        placeholders = ','.join('?' for _ in exclude)
-        clauses.append(f"(dataset NOT IN ({placeholders}) OR dataset IS NULL)")
-        params.extend(exclude)
-    where = ' AND '.join(clauses)
+    from branchmanager.marker_evidence import (
+        backfill_legacy_marker_evidence, query_marker_evidence_pool, sync_registry_with_sequences,
+    )
+    backfill_legacy_marker_evidence(db)
+    sync_registry_with_sequences(db)
     with db.connect() as conn:
-        cur = conn.cursor()
-        cur.execute(f"SELECT id, sequence, dataset FROM sequences WHERE {where}", tuple(params))
-        rows = cur.fetchall()
-    records = [(str(r[0]), str(r[1])) for r in rows if r[0] and r[1]]
-    datasets = sorted({str(r[2]) for r in rows if r[2] not in (None, '')})
-    return records, datasets
+        return query_marker_evidence_pool(
+            conn, pool=evidence_pool, run_dataset=run_dataset,
+            include_datasets=_normalise_dataset_names(include_datasets) or None,
+            include_ids=include_ids,
+            exclude_datasets=_normalise_dataset_names(exclude_datasets) or None,
+        )
 
 
 def _write_pool_fasta(records, path: Path) -> Optional[str]:
@@ -830,48 +794,161 @@ def _run_nearest_search(
     *,
     exclude_self: bool = False,
 ):
-    thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ""
-    cmd = (
-        f"vsearch --usearch_global {shlex.quote(str(input_fasta))} "
-        f"--db {shlex.quote(str(db_fasta))} "
-        f"--id 0.5 "
-        f"--strand both "
-        f"--userout {shlex.quote(str(matches_path))} "
-        f"--userfields {VSEARCH_USERFIELDS} "
-        f"--maxaccepts 0 --maxrejects 0 --maxhits 0 "
-        f"--query_cov {MIN_NEAREST_QUERY_COVERAGE / 100.0:.2f}{thread_flag}"
+    """Find one best hit/query using 90→50% identity and 95→80% coverage tiers.
+
+    Full-coverage (>=95%) matches are preferred. Only queries without a
+    full-coverage hit enter the partial-coverage pass (>=80%). Partial hits
+    are reported but do not satisfy the existing >=95% support criterion
+    used by downstream novelty scoring.
+    """
+    import csv
+    import tempfile
+
+    identity_ladder = NEAREST_IDENTITY_LADDER
+    coverage_tiers = (
+        ("FULL", MIN_NEAREST_QUERY_COVERAGE),
+        ("PARTIAL", PARTIAL_NEAREST_QUERY_COVERAGE),
     )
-    run_cmd(cmd)
+    matches_path = Path(matches_path)
+    matches_path.parent.mkdir(parents=True, exist_ok=True)
+    query_records = list(read_fasta(input_fasta))
+    unresolved = dict(query_records)
     best = {}
-    if matches_path.exists():
-        with open(matches_path) as handle:
-            for line in handle:
-                parts = line.rstrip('\n').split('\t')
-                if len(parts) < 3 or (exclude_self and parts[0] == parts[1]):
-                    continue
-                try:
-                    pct = float(parts[2])
-                except Exception:
-                    continue
-                query_coverage, alignment_length = _alignment_evidence(parts)
-                candidate = (pct, parts[1], query_coverage, alignment_length)
-                current = best.get(parts[0])
-                candidate_rank = (
-                    query_coverage is not None and query_coverage >= MIN_NEAREST_QUERY_COVERAGE,
-                    pct,
-                    query_coverage if query_coverage is not None else -1.0,
-                    alignment_length if alignment_length is not None else -1,
-                    parts[1],
+    summary_rows = []
+    total_raw_hits = 0
+    thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ""
+
+    with tempfile.TemporaryDirectory(
+        prefix=f".{matches_path.stem}_ladder_", dir=str(matches_path.parent)
+    ) as temp_dir:
+        root = Path(temp_dir)
+        for coverage_label, coverage_floor in coverage_tiers:
+            tier_unresolved = dict(unresolved)
+            for round_number, identity_floor in enumerate(identity_ladder, 1):
+                if not tier_unresolved:
+                    break
+                query_path = root / f"queries_{coverage_label}_{identity_floor}.fasta"
+                raw_path = root / f"raw_{coverage_label}_{identity_floor}.tsv"
+                write_fasta(list(tier_unresolved.items()), str(query_path))
+                cmd = (
+                    f"vsearch --usearch_global {shlex.quote(str(query_path))} "
+                    f"--db {shlex.quote(str(db_fasta))} "
+                    f"--id {identity_floor / 100.0:.2f} --strand both "
+                    f"--userout {shlex.quote(str(raw_path))} "
+                    f"--userfields {VSEARCH_USERFIELDS} "
+                    f"--maxaccepts 32 --maxrejects 256 --maxhits 32 "
+                    f"--query_cov {coverage_floor / 100.0:.2f}{thread_flag}"
                 )
-                current_rank = (
-                    current[2] is not None and current[2] >= MIN_NEAREST_QUERY_COVERAGE,
-                    current[0],
-                    current[2] if current[2] is not None else -1.0,
-                    current[3] if current[3] is not None else -1,
-                    current[1],
-                ) if current else None
-                if current_rank is None or candidate_rank > current_rank:
-                    best[parts[0]] = candidate
+                logger.info(
+                    "[NOVELTY][LADDER] coverage=%s(%.1f%%) identity_floor=%d%% "
+                    "round=%d unresolved_queries=%d",
+                    coverage_label, coverage_floor, identity_floor,
+                    round_number, len(tier_unresolved),
+                )
+                run_vsearch_audited(
+                    cmd, audit_path=matches_path.parent / 'vsearch_search_audit.tsv',
+                    stage='B', purpose=f'nearest_hit_{coverage_label.lower()}',
+                    query_fasta=query_path, reference_fasta=db_fasta, runner=run_cmd,
+                )
+                round_best = {}
+                raw_hit_count = 0
+                if raw_path.exists():
+                    with open(raw_path) as handle:
+                        for line in handle:
+                            parts = line.rstrip("\n").split("\t")
+                            if len(parts) < 3 or parts[0] not in tier_unresolved:
+                                continue
+                            if exclude_self and parts[0] == parts[1]:
+                                continue
+                            try:
+                                pct = float(parts[2])
+                            except (TypeError, ValueError):
+                                continue
+                            qcov, alnlen = _alignment_evidence(parts)
+                            if qcov is None or qcov < coverage_floor:
+                                continue
+                            raw_hit_count += 1
+                            candidate = (pct, parts[1], qcov, alnlen,
+                                         identity_floor, round_number, coverage_label,
+                                         parts[:14])
+                            rank = (pct, qcov, alnlen if alnlen is not None else -1, parts[1])
+                            current = round_best.get(parts[0])
+                            current_rank = (
+                                current[0], current[2],
+                                current[3] if current[3] is not None else -1, current[1]
+                            ) if current else None
+                            if current_rank is None or rank > current_rank:
+                                round_best[parts[0]] = candidate
+                total_raw_hits += raw_hit_count
+                for qid, hit in round_best.items():
+                    best[qid] = hit
+                tier_unresolved = {
+                    qid: seq for qid, seq in tier_unresolved.items()
+                    if qid not in round_best
+                }
+                summary_rows.append({
+                    "coverage_tier": coverage_label,
+                    "minimum_query_coverage": f"{coverage_floor:.1f}",
+                    "identity_floor": identity_floor,
+                    "round": round_number,
+                    "queries_searched": len(tier_unresolved) + len(round_best),
+                    "queries_resolved": len(round_best),
+                    "queries_remaining_in_tier": len(tier_unresolved),
+                    "raw_qualifying_hits": raw_hit_count,
+                })
+                logger.info(
+                    "[NOVELTY][LADDER] coverage=%s identity_floor=%d%% "
+                    "raw_hits=%d resolved=%d remaining=%d",
+                    coverage_label, identity_floor, raw_hit_count,
+                    len(round_best), len(tier_unresolved),
+                )
+            unresolved = tier_unresolved
+
+    fields = [
+        "query", "target", "id", "alnlen", "mism", "gaps", "qlo", "qhi",
+        "tlo", "thi", "ql", "tl", "qcov", "tcov",
+        "search_threshold", "search_round", "coverage_tier", "match_status",
+    ]
+    with open(matches_path, "w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
+        writer.writerow(fields)
+        for qid, _seq in query_records:
+            hit = best.get(qid)
+            if hit is None:
+                writer.writerow([qid, "NA", "NA", * (["NA"] * 11),
+                                 "NA", "NA", "NONE", "NO_MATCH"])
+            else:
+                pct, target, qcov, alnlen, threshold, round_no, tier, raw_fields = hit
+                writer.writerow(
+                    raw_fields + [
+                        threshold, round_no, tier,
+                        "MATCH" if tier == "FULL" else "PARTIAL_COVERAGE",
+                    ]
+                )
+
+    summary_name = (
+        "novelty_reference_search_summary.tsv"
+        if "reference" in matches_path.name
+        else f"{matches_path.stem}_search_summary.tsv"
+    )
+    summary_path = matches_path.with_name(summary_name)
+    with open(summary_path, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(summary_rows[0]) if summary_rows else [
+            "coverage_tier", "minimum_query_coverage", "identity_floor", "round",
+            "queries_searched", "queries_resolved", "queries_remaining_in_tier",
+            "raw_qualifying_hits",
+        ], delimiter="\t")
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+    full = sum(hit[6] == "FULL" for hit in best.values())
+    partial = sum(hit[6] == "PARTIAL" for hit in best.values())
+    logger.info(
+        "[NOVELTY][LADDER] Complete: queries=%d full=%d partial=%d unmatched=%d "
+        "raw_hits=%d; matches=%s; summary=%s",
+        len(query_records), full, partial, len(query_records) - len(best),
+        total_raw_hits, matches_path, summary_path,
+    )
     return best
 
 
@@ -882,8 +959,12 @@ def _run_density_search(
     threads: Optional[int] = None,
     *,
     exclude_self: bool = False,
+    coverage_floor: float = MIN_NEAREST_QUERY_COVERAGE,
+    retain_matches: bool = True,
 ):
     thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ""
+    # Density is a bounded prioritisation signal. Counts are explicitly
+    # reported as lower bounds; nearest-hit evidence remains uncapped separately.
     cmd = (
         f"vsearch --usearch_global {shlex.quote(str(input_fasta))} "
         f"--db {shlex.quote(str(db_fasta))} "
@@ -891,10 +972,14 @@ def _run_density_search(
         f"--strand both "
         f"--userout {shlex.quote(str(matches_path))} "
         f"--userfields {VSEARCH_USERFIELDS} "
-        f"--maxaccepts 0 --maxrejects 0 --maxhits 0 "
-        f"--query_cov {MIN_NEAREST_QUERY_COVERAGE / 100.0:.2f}{thread_flag}"
+        f"--maxaccepts {DENSITY_HIT_CAP} --maxrejects 256 --maxhits {DENSITY_HIT_CAP} "
+        f"--query_cov {coverage_floor / 100.0:.2f}{thread_flag}"
     )
-    run_cmd(cmd)
+    run_vsearch_audited(
+        cmd, audit_path=Path(matches_path).parent / 'vsearch_search_audit.tsv',
+        stage='B', purpose=f'density_qcov{int(coverage_floor)}', query_fasta=input_fasta,
+        reference_fasta=db_fasta, runner=run_cmd,
+    )
 
     density_counts = {}
     if matches_path.exists():
@@ -917,7 +1002,233 @@ def _run_density_search(
                     bucket['ge_97'] += 1
                 if pct >= 99.0:
                     bucket['ge_99'] += 1
+    if not retain_matches:
+        Path(matches_path).unlink(missing_ok=True)
     return density_counts
+
+
+def _run_density_search_coverage_pair(
+    input_fasta: str,
+    db_fasta: str,
+    matches_path: Path,
+    threads: Optional[int] = None,
+    *,
+    exclude_self: bool = False,
+    retain_95_matches: bool = True,
+    batch_size: int = 500,
+    hit_cap: int = DENSITY_HIT_CAP,
+) -> tuple[dict, dict]:
+    """Calculate bounded qcov95/qcov80 density in restartable query batches.
+
+    Each batch is searched against the *entire* reference pool, but VSEARCH
+    stops after ``hit_cap`` accepted hits per query. Counts are therefore
+    lower bounds, not exhaustive neighbour counts.
+    A batch is only marked complete after VSEARCH exits successfully and its
+    output has been audited. On restart,
+    completed batches are checksum-verified and reused; an interrupted batch
+    is rerun. The final qcov95 compatibility file is rebuilt atomically from
+    the verified batch outputs.
+
+    The identity/coverage criteria remain 95% identity, both strands, and an
+    80% query-coverage search floor. Per-hit query coverage splits qcov80 and
+    qcov95 counts. The accepted-hit cap bounds runtime and output size.
+
+    Batching trades a small amount of repeated reference-database setup for
+    bounded intermediate files and recovery without repeating completed
+    batches. The default (500 queries) gives two batches for a 692-query
+    cohort; callers/tests may override it.
+    """
+    import hashlib
+    import json
+
+    started = time.monotonic()
+    matches_path = Path(matches_path)
+    matches_path.parent.mkdir(parents=True, exist_ok=True)
+    query_records = list(read_fasta(input_fasta))
+    if batch_size < 1:
+        raise ValueError('density batch_size must be at least 1')
+    if int(hit_cap) < 1:
+        raise ValueError('density hit_cap must be at least 1')
+
+    def sha256(path: str | Path) -> str:
+        digest = hashlib.sha256()
+        with open(path, 'rb') as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b''):
+                digest.update(block)
+        return digest.hexdigest()
+
+    query_sha = sha256(input_fasta)
+    reference_sha = sha256(db_fasta)
+    settings = {
+        'schema_version': 1,
+        'query_sha256': query_sha,
+        'reference_sha256': reference_sha,
+        'identity': 0.95,
+        'strand': 'both',
+        'query_coverage_floor': 0.80,
+        'maxaccepts': int(hit_cap),
+        'maxrejects': 256,
+        'maxhits': int(hit_cap),
+        'batch_size': int(batch_size),
+        'query_count': len(query_records),
+        'density_count_semantics': 'LOWER_BOUND',
+    }
+    run_key = hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()[:12]
+    checkpoint_dir = matches_path.parent / f'.{matches_path.stem}_density_checkpoints_{run_key}'
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    settings_path = checkpoint_dir / 'run.json'
+    if settings_path.exists():
+        existing = json.loads(settings_path.read_text(encoding='utf-8'))
+        if existing != settings:
+            raise RuntimeError(
+                f'Density checkpoint settings do not match current inputs: {checkpoint_dir}. '
+                'Do not reuse these checkpoints for a different query/reference set.'
+            )
+    else:
+        temporary_settings = settings_path.with_suffix('.json.tmp')
+        temporary_settings.write_text(json.dumps(settings, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+        os.replace(temporary_settings, settings_path)
+
+    thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ''
+    batch_outputs: list[Path] = []
+    completed_batches = 0
+    total_batches = (len(query_records) + batch_size - 1) // batch_size
+    logger.info(
+        '[NOVELTY][DENSITY] resumable exhaustive search START qcov=80/95 queries=%d batches=%d '
+        'batch_size=%d db=%s',
+        len(query_records), total_batches, batch_size, db_fasta,
+    )
+
+    for batch_index, offset in enumerate(range(0, len(query_records), batch_size), start=1):
+        batch_records = query_records[offset:offset + batch_size]
+        batch_query = checkpoint_dir / f'queries_{batch_index:04d}.fasta'
+        batch_output = checkpoint_dir / f'hits_{batch_index:04d}.tsv'
+        batch_state = checkpoint_dir / f'batch_{batch_index:04d}.json'
+        # Re-write the small deterministic query chunk so its content is
+        # explicit and can be independently audited.
+        write_fasta(batch_records, str(batch_query))
+        batch_query_sha = sha256(batch_query)
+        valid_checkpoint = False
+        if batch_state.is_file() and batch_output.is_file():
+            try:
+                state = json.loads(batch_state.read_text(encoding='utf-8'))
+                valid_checkpoint = (
+                    state.get('query_sha256') == batch_query_sha
+                    and state.get('reference_sha256') == reference_sha
+                    and state.get('settings') == settings
+                    and state.get('output_sha256') == sha256(batch_output)
+                )
+            except (OSError, ValueError, TypeError):
+                valid_checkpoint = False
+        if valid_checkpoint:
+            completed_batches += 1
+            batch_outputs.append(batch_output)
+            logger.info(
+                '[NOVELTY][DENSITY] batch %d/%d reused from verified checkpoint (%d queries)',
+                batch_index, total_batches, len(batch_records),
+            )
+            continue
+
+        # Never allow an old/incomplete output to be mistaken for a successful
+        # run. The completion record is written only after VSEARCH and the audit
+        # wrapper both return successfully; without it, any output is discarded
+        # and the batch is rerun on the next invocation.
+        batch_state.unlink(missing_ok=True)
+        batch_output.unlink(missing_ok=True)
+        cmd = (
+            f"vsearch --usearch_global {shlex.quote(str(batch_query))} "
+            f"--db {shlex.quote(str(db_fasta))} --id 0.95 --strand both "
+            f"--userout {shlex.quote(str(batch_output))} "
+            f"--userfields {VSEARCH_USERFIELDS} "
+            f"--maxaccepts {int(hit_cap)} --maxrejects 256 --maxhits {int(hit_cap)} "
+            f"--query_cov 0.80{thread_flag}"
+        )
+        logger.info(
+            '[NOVELTY][DENSITY] batch %d/%d START queries=%d',
+            batch_index, total_batches, len(batch_records),
+        )
+        run_vsearch_audited(
+            cmd, audit_path=matches_path.parent / 'vsearch_search_audit.tsv',
+            stage='B', purpose='density_qcov80_and_95_resumable_batch',
+            query_fasta=batch_query, reference_fasta=db_fasta, runner=run_cmd,
+        )
+        if not batch_output.exists():
+            # A successful zero-hit VSEARCH invocation may leave no userout
+            # file on some builds; represent that valid result as an empty TSV.
+            batch_output.touch()
+        with batch_output.open(encoding='utf-8', errors='replace') as completed_output:
+            raw_hit_count = sum(1 for line in completed_output if line.strip())
+        state = {
+            'batch': batch_index,
+            'query_count': len(batch_records),
+            'query_sha256': batch_query_sha,
+            'reference_sha256': reference_sha,
+            'settings': settings,
+            'output_sha256': sha256(batch_output),
+            'raw_hit_count': raw_hit_count,
+        }
+        temporary_state = batch_state.with_suffix('.json.tmp')
+        temporary_state.write_text(json.dumps(state, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+        os.replace(temporary_state, batch_state)
+        completed_batches += 1
+        batch_outputs.append(batch_output)
+        logger.info(
+            '[NOVELTY][DENSITY] batch %d/%d COMPLETE queries=%d raw_hits=%d',
+            batch_index, total_batches, len(batch_records), state['raw_hit_count'],
+        )
+
+    counts_80, counts_95 = {}, {}
+    aggregate_tmp = matches_path.with_name(matches_path.name + '.partial')
+    aggregate_tmp.unlink(missing_ok=True)
+    output_handle = aggregate_tmp.open('w', encoding='utf-8') if retain_95_matches else None
+    try:
+        for batch_output in batch_outputs:
+            with batch_output.open(encoding='utf-8', errors='replace') as source:
+                for line in source:
+                    parts = line.rstrip('\n').split('\t')
+                    if len(parts) < 14:
+                        continue
+                    qid, target = parts[0], parts[1]
+                    if exclude_self and target == qid:
+                        continue
+                    try:
+                        identity, qcov = float(parts[2]), float(parts[12])
+                    except (TypeError, ValueError):
+                        continue
+                    if identity < 95.0 or qcov < 80.0:
+                        continue
+                    bucket80 = counts_80.setdefault(qid, {'ge_99': 0, 'ge_97': 0, 'ge_95': 0})
+                    bucket80['ge_95'] += 1
+                    if identity >= 97.0:
+                        bucket80['ge_97'] += 1
+                    if identity >= 99.0:
+                        bucket80['ge_99'] += 1
+                    if qcov >= 95.0:
+                        bucket95 = counts_95.setdefault(qid, {'ge_99': 0, 'ge_97': 0, 'ge_95': 0})
+                        bucket95['ge_95'] += 1
+                        if identity >= 97.0:
+                            bucket95['ge_97'] += 1
+                        if identity >= 99.0:
+                            bucket95['ge_99'] += 1
+                        if output_handle is not None:
+                            output_handle.write(line)
+        if output_handle is not None:
+            output_handle.close()
+            output_handle = None
+            os.replace(aggregate_tmp, matches_path)
+    except BaseException:
+        if output_handle is not None:
+            output_handle.close()
+        aggregate_tmp.unlink(missing_ok=True)
+        raise
+
+    logger.info(
+        '[NOVELTY][DENSITY] resumable exhaustive search COMPLETE batches=%d/%d '
+        'qcov80_queries=%d qcov95_queries=%d elapsed=%.2fs checkpoints=%s',
+        completed_batches, total_batches, len(counts_80), len(counts_95),
+        time.monotonic() - started, checkpoint_dir,
+    )
+    return counts_95, counts_80
 
 
 def _crowding_from_counts(counts: dict) -> str:
@@ -961,6 +1272,7 @@ def _metrics_from_nearest_and_density(qids, nearest_hits, density_counts, *, sou
             'crowding': crowding,
             'sequencing_priority': priority,
             'density_source': source,
+            'density_count_method': f'LOWER_BOUND_MAX_{DENSITY_HIT_CAP}_HITS',
         }
     return rows
 
@@ -980,6 +1292,7 @@ def _empty_pool_metrics(qids, *, source: str = 'none'):
             'crowding': 'unknown',
             'sequencing_priority': 'NA',
             'density_source': source,
+            'density_count_method': 'NOT_AVAILABLE',
         }
         for qid in qids
     }
@@ -1011,12 +1324,261 @@ def _empty_sequencing_context(qids, pangenome_target: int = DEFAULT_PANGENOME_TA
             'genome_same_species_available': 0,
             'genome_same_species_selected': 0,
             'genome_same_species_pending': 0,
-            'pangenome_target': target_count,
-            'pangenome_gap': target_count,
+            'pangenome_target': 'NA',
+            'pangenome_gap': 'NA',
+            'pangenome_eligibility_status': 'DEFERRED_TO_TREE_VALIDATED_SELECTION_SETS',
         }
         for qid in qids
     }
 
+
+
+def _build_combined_baseline_pool_with_provenance(
+    *, db, outdir: str, hungate_datasets, secondary_datasets,
+) -> tuple[Optional[str], dict[str, str], list[str], int]:
+    """Build one cultured-baseline FASTA and retain each target's tier provenance."""
+    datasets_by_tier = {
+        'HUNGATE': _normalise_dataset_names(hungate_datasets),
+        'SECONDARY': _normalise_dataset_names(secondary_datasets),
+    }
+    all_datasets = list(dict.fromkeys(
+        datasets_by_tier['HUNGATE'] + datasets_by_tier['SECONDARY']
+    ))
+    if db is None or not all_datasets:
+        return None, {}, [], 0
+
+    from branchmanager.marker_evidence import (
+        backfill_legacy_marker_evidence, sync_registry_with_sequences,
+    )
+    backfill_legacy_marker_evidence(db)
+    sync_registry_with_sequences(db)
+    placeholders = ','.join('?' for _ in all_datasets)
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT sequence_id, sequence, dataset FROM marker_evidence "
+            "WHERE eligible_primary=1 AND active_for_selection=1 "
+            "AND evidence_tier IN ('HIGH','MODERATE') "
+            f"AND dataset IN ({placeholders}) "
+            "ORDER BY sequence_id, created_at DESC, evidence_id DESC",
+            tuple(all_datasets),
+        ).fetchall()
+
+    tier_by_dataset = {name: tier for tier, names in datasets_by_tier.items() for name in names}
+    records_by_id = {}
+    provenance = {}
+    for sequence_id, sequence, dataset in rows:
+        if not sequence_id or not sequence or not dataset:
+            continue
+        sid = str(sequence_id)
+        # The evidence registry can contain historical versions. Keep the first
+        # (latest) record per sequence ID, matching query_marker_evidence_pool.
+        if sid in records_by_id:
+            continue
+        records_by_id[sid] = str(sequence)
+        provenance[sid] = tier_by_dataset.get(str(dataset), 'SECONDARY')
+
+    pool_path = _write_pool_fasta(
+        sorted(records_by_id.items()),
+        Path(outdir) / 'novelty_combined_baseline_pool.fasta',
+    )
+    return pool_path, provenance, all_datasets, len(records_by_id)
+
+
+def _run_nearest_search_by_provenance(
+    input_fasta: str, db_fasta: str, matches_prefix: Path, target_provenance: dict[str, str],
+    threads: Optional[int] = None,
+) -> dict[str, dict]:
+    """Run one ladder search against a combined pool, retaining best hit per tier/query."""
+    import csv
+    import tempfile
+
+    query_records = list(read_fasta(input_fasta))
+    query_by_id = dict(query_records)
+    groups = ('HUNGATE', 'SECONDARY')
+    active_groups = tuple(group for group in groups if group in set(target_provenance.values()))
+    best = {group: {} for group in groups}
+    unresolved = {(qid, group) for qid in query_by_id for group in active_groups}
+    summary_rows = []
+    thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ''
+
+    with tempfile.TemporaryDirectory(prefix='.baseline_ladder_', dir=str(matches_prefix.parent)) as temp_dir:
+        root = Path(temp_dir)
+        for coverage_label, coverage_floor in (
+            ('FULL', MIN_NEAREST_QUERY_COVERAGE),
+            ('PARTIAL', PARTIAL_NEAREST_QUERY_COVERAGE),
+        ):
+            for round_number, identity_floor in enumerate(NEAREST_IDENTITY_LADDER, 1):
+                active_qids = sorted({qid for qid, group in unresolved})
+                if not active_qids:
+                    break
+                query_path = root / f'queries_{coverage_label}_{identity_floor}.fasta'
+                raw_path = root / f'raw_{coverage_label}_{identity_floor}.tsv'
+                write_fasta([(qid, query_by_id[qid]) for qid in active_qids], str(query_path))
+                cmd = (
+                    f"vsearch --usearch_global {shlex.quote(str(query_path))} "
+                    f"--db {shlex.quote(str(db_fasta))} --id {identity_floor / 100.0:.2f} "
+                    f"--strand both --userout {shlex.quote(str(raw_path))} "
+                    f"--userfields {VSEARCH_USERFIELDS} "
+                    f"--maxaccepts 32 --maxrejects 256 --maxhits 32 "
+                    f"--query_cov {coverage_floor / 100.0:.2f}{thread_flag}"
+                )
+                run_vsearch_audited(
+                    cmd, audit_path=matches_prefix.parent / 'vsearch_search_audit.tsv',
+                    stage='B', purpose=f'baseline_nearest_{coverage_label.lower()}',
+                    query_fasta=query_path, reference_fasta=db_fasta, runner=run_cmd,
+                )
+                round_best = {}
+                raw_hits = 0
+                if raw_path.exists():
+                    with open(raw_path) as handle:
+                        for line in handle:
+                            parts = line.rstrip('\n').split('\t')
+                            if len(parts) < 14 or parts[0] not in query_by_id:
+                                continue
+                            group = target_provenance.get(parts[1])
+                            if group not in groups or (parts[0], group) not in unresolved:
+                                continue
+                            try:
+                                identity = float(parts[2])
+                            except (TypeError, ValueError):
+                                continue
+                            qcov, alnlen = _alignment_evidence(parts)
+                            if qcov is None or qcov < coverage_floor:
+                                continue
+                            raw_hits += 1
+                            rank = (identity, qcov, alnlen or -1, parts[1])
+                            key = (parts[0], group)
+                            previous = round_best.get(key)
+                            if previous is None or rank > previous[0]:
+                                round_best[key] = (rank, (identity, parts[1], qcov, alnlen,
+                                    identity_floor, round_number, coverage_label, parts[:14]))
+                for (qid, group), (_rank, hit) in round_best.items():
+                    best[group][qid] = hit
+                    unresolved.discard((qid, group))
+                summary_rows.append({
+                    'coverage_tier': coverage_label, 'minimum_query_coverage': coverage_floor,
+                    'identity_floor': identity_floor, 'round': round_number,
+                    'queries_searched': len(active_qids), 'queries_resolved': len(round_best),
+                    'query_group_pairs_remaining': len(unresolved), 'raw_qualifying_hits': raw_hits,
+                })
+
+    fields = ['query', 'target', 'id', 'alnlen', 'mism', 'gaps', 'qlo', 'qhi', 'tlo', 'thi',
+              'ql', 'tl', 'qcov', 'tcov', 'search_threshold', 'search_round', 'coverage_tier', 'match_status']
+    output_by_group = {}
+    for group in groups:
+        path = matches_prefix.with_name(
+            'novelty_hungate_baseline_nearest_matches.tsv' if group == 'HUNGATE'
+            else 'novelty_secondary_baseline_nearest_matches.tsv'
+        )
+        output_by_group[group] = path
+        with open(path, 'w', newline='') as handle:
+            writer = csv.writer(handle, delimiter='\t', lineterminator='\n')
+            writer.writerow(fields)
+            for qid, _sequence in query_records:
+                hit = best[group].get(qid)
+                if hit is None:
+                    writer.writerow([qid, 'NA', 'NA'] + ['NA'] * 11 + ['NA', 'NA', 'NONE', 'NO_MATCH'])
+                else:
+                    identity, target, qcov, alnlen, threshold, round_no, tier, raw_fields = hit
+                    writer.writerow(raw_fields + [threshold, round_no, tier,
+                        'MATCH' if tier == 'FULL' else 'PARTIAL_COVERAGE'])
+
+    summary_fields = list(summary_rows[0]) if summary_rows else [
+        'coverage_tier','minimum_query_coverage','identity_floor','round','queries_searched',
+        'queries_resolved','query_group_pairs_remaining','raw_qualifying_hits',
+    ]
+    summary_path = matches_prefix.with_name('novelty_baseline_nearest_search_summary.tsv')
+    with open(summary_path, 'w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=summary_fields, delimiter='\t')
+        writer.writeheader(); writer.writerows(summary_rows)
+    # Preserve the historical per-pool summary filenames for downstream scripts.
+    for group in groups:
+        compatibility_path = output_by_group[group].with_name(output_by_group[group].stem + '_search_summary.tsv')
+        with open(compatibility_path, 'w', newline='') as handle:
+            writer = csv.DictWriter(handle, fieldnames=summary_fields, delimiter='\t')
+            writer.writeheader(); writer.writerows(summary_rows)
+    combined_summary = matches_prefix.with_name('novelty_baseline_nearest_matches_search_summary.tsv')
+    with open(combined_summary, 'w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=summary_fields, delimiter='\t')
+        writer.writeheader(); writer.writerows(summary_rows)
+    return best
+
+
+def _run_combined_baseline_density(
+    input_fasta: str, db_fasta: str, outdir: str, target_provenance: dict[str, str],
+    threads: Optional[int] = None,
+) -> dict[str, dict]:
+    """Run bounded 95% and 80% density comparisons against the combined baseline pool.
+
+    At most DENSITY_HIT_CAP accepted hits are counted per query; all resulting
+    density values are lower bounds.
+    """
+    results = {}
+    thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ''
+    # Bounded qcov95/qcov80 lower-bound counts are derived from one qcov80
+    # superset scan. Provenance is retained while streaming; only historical
+    # qcov95 match files are written to disk.
+    started = time.monotonic()
+    raw_path = Path(outdir) / 'novelty_baseline_density_all_qcov80_raw.tsv'
+    cmd = (
+        f"vsearch --usearch_global {shlex.quote(str(input_fasta))} "
+        f"--db {shlex.quote(str(db_fasta))} --id 0.95 --strand both "
+        f"--userout {shlex.quote(str(raw_path))} --userfields {VSEARCH_USERFIELDS} "
+        f"--maxaccepts {DENSITY_HIT_CAP} --maxrejects 256 --maxhits {DENSITY_HIT_CAP} "
+        f"--query_cov 0.80{thread_flag}"
+    )
+    raw_path.unlink(missing_ok=True)
+    logger.info(
+        '[NOVELTY][DENSITY][BASELINE] START bounded combined qcov=80/95 hit_cap=%d pool=%s',
+        DENSITY_HIT_CAP, db_fasta,
+    )
+    run_vsearch_audited(
+        cmd, audit_path=Path(outdir) / 'vsearch_search_audit.tsv',
+        stage='B', purpose='baseline_density_qcov80_and_95_bounded_lower_bound',
+        query_fasta=input_fasta, reference_fasta=db_fasta, runner=run_cmd,
+    )
+    counts = {coverage: {group: {} for group in ('HUNGATE', 'SECONDARY')} for coverage in (95, 80)}
+    output_paths = {
+        group: Path(outdir) / f'novelty_{label}_density_matches.tsv'
+        for group, label in (('HUNGATE', 'hungate_baseline'), ('SECONDARY', 'secondary_baseline'), ('ALL', 'baseline'))
+    }
+    handles = {group: path.open('w', encoding='utf-8') for group, path in output_paths.items()}
+    combined_qcov95_handle = (Path(outdir) / 'novelty_baseline_density_all_qcov95.tsv').open('w', encoding='utf-8')
+    try:
+        with raw_path.open(encoding='utf-8', errors='replace') as source:
+            for line in source:
+                parts = line.rstrip('\n').split('\t')
+                if len(parts) < 14:
+                    continue
+                group = target_provenance.get(parts[1])
+                if group not in {'HUNGATE', 'SECONDARY'}:
+                    continue
+                try:
+                    identity, qcov = float(parts[2]), float(parts[12])
+                except (TypeError, ValueError):
+                    continue
+                for coverage in (80, 95):
+                    if qcov < coverage:
+                        continue
+                    bucket = counts[coverage][group].setdefault(parts[0], {'ge_99': 0, 'ge_97': 0, 'ge_95': 0})
+                    if identity >= 95: bucket['ge_95'] += 1
+                    if identity >= 97: bucket['ge_97'] += 1
+                    if identity >= 99: bucket['ge_99'] += 1
+                if qcov >= 95:
+                    handles[group].write(line)
+                    handles['ALL'].write(line)
+                    combined_qcov95_handle.write(line)
+    finally:
+        for handle in handles.values():
+            handle.close()
+        combined_qcov95_handle.close()
+        raw_path.unlink(missing_ok=True)
+    results[95] = counts[95]
+    results[80] = counts[80]
+    logger.info('[NOVELTY][DENSITY][BASELINE] COMPLETE qcov80_queries=%d qcov95_queries=%d elapsed=%.2fs',
+                sum(len(v) for v in counts[80].values()), sum(len(v) for v in counts[95].values()),
+                time.monotonic() - started)
+    return results
 
 def _compute_db_pool_metrics(
     *,
@@ -1084,6 +1646,8 @@ def _compute_sequencing_context(
     if db is None:
         return _empty_sequencing_context(qids, pangenome_target)
 
+    from branchmanager.marker_evidence import sync_registry_with_sequences
+    sync_registry_with_sequences(db)
     project_metrics = project_metrics or {}
     reference_metrics = reference_metrics or {}
     cultured_metrics = cultured_metrics or {}
@@ -1111,7 +1675,9 @@ def _compute_sequencing_context(
                 "FROM sequences s "
                 "LEFT JOIN taxonomy t ON s.id = t.id AND (t.dataset = s.dataset OR t.dataset IS NULL) "
                 "LEFT JOIN sequencing_metadata m ON s.id = m.id "
-                "WHERE s.sequence IS NOT NULL AND s.sequence != ''"
+                "WHERE s.sequence IS NOT NULL AND s.sequence != '' "
+                "AND s.id IN (SELECT sequence_id FROM marker_evidence WHERE eligible_primary=1 "
+                "AND active_for_selection=1 AND evidence_tier IN ('HIGH','MODERATE'))"
             )
             rows = cur.fetchall()
         by_id = {}
@@ -1127,6 +1693,43 @@ def _compute_sequencing_context(
             })
             if taxonomy and not entry['taxonomy']:
                 entry['taxonomy'] = str(taxonomy)
+        # Only taxonomically validated records may contribute to species-level
+        # pangenome counts. Require confident evidence in every configured DB
+        # and exact normalised species agreement across those assignments.
+        confident_taxonomy_ids = set()
+        try:
+            classification_evidence = db.get_classification_evidence(set(by_id))
+            evidence_by_id_db = {}
+            for (sid, ref_db), evidence_row in classification_evidence.items():
+                evidence_by_id_db.setdefault(str(sid), {})[str(ref_db)] = evidence_row
+            alt_ref_dbs = list(db.get_alt_ref_dbs() or [])
+            alt_taxonomies = db.get_taxonomy_alt_for_ids(set(by_id)) if alt_ref_dbs else {}
+            for sid, evidence_rows in evidence_by_id_db.items():
+                if not evidence_rows or any(
+                    str(item.get('assignment_status') or '').upper() != 'CONFIDENT'
+                    for item in evidence_rows.values()
+                ):
+                    continue
+                primary_species = str(parse_taxon_string(by_id[sid].get('taxonomy', '')).get('s') or '').strip()
+                if not primary_species:
+                    continue
+                concordant = True
+                for ref_db in alt_ref_dbs:
+                    alt_evidence = evidence_rows.get(str(ref_db))
+                    alt_entry = (alt_taxonomies.get(sid) or {}).get(str(ref_db))
+                    if not alt_evidence or str(alt_evidence.get('assignment_status') or '').upper() != 'CONFIDENT' or not alt_entry:
+                        concordant = False
+                        break
+                    alt_species = str(parse_taxon_string(str(alt_entry[0] or '')).get('s') or '').strip()
+                    if not alt_species or normalise_taxon_name(alt_species) != normalise_taxon_name(primary_species):
+                        concordant = False
+                        break
+                if concordant:
+                    confident_taxonomy_ids.add(sid)
+        except Exception as exc:
+            logger.warning('[NOVELTY] Could not validate cross-database taxonomy for pangenome context: %s', exc)
+            confident_taxonomy_ids = set()
+
         for sid, entry in by_id.items():
             if sid in qids:
                 query_taxonomy[sid] = entry.get('taxonomy', '')
@@ -1156,7 +1759,7 @@ def _compute_sequencing_context(
                 # tracked as a separate pending category.
                 'selected_pending': False,
             }
-            if is_baseline_genome or is_partner_genome:
+            if (is_baseline_genome or is_partner_genome) and sid in confident_taxonomy_ids:
                 genome_records.append((sid, entry['sequence']))
                 genome_metadata[sid] = collection_metadata[sid]
     except Exception as e:
@@ -1210,10 +1813,11 @@ def _compute_sequencing_context(
         meta = metadata.get(qid, {})
         current_available = meta.get('selected_for_wgs')
         current_selected = meta.get('selected_for_sequencing')
-        query_species = species_key(query_taxonomy.get(qid))
+        query_species = species_key(query_taxonomy.get(qid)) if qid in confident_taxonomy_ids else None
         same_species_ids = [
             sid for sid, values in collection_metadata.items()
-            if query_species and species_key(values.get('taxonomy')) == query_species
+            if sid in confident_taxonomy_ids
+            and query_species and species_key(values.get('taxonomy')) == query_species
         ]
         same_species_hungate = sum(
             1 for sid in same_species_ids if collection_metadata[sid].get('hungate_baseline_available')
@@ -1229,8 +1833,9 @@ def _compute_sequencing_context(
             1 for sid in same_species_ids if collection_metadata[sid].get('selected_pending')
         )
         same_species_committed = same_species_baseline + same_species_partner_available + same_species_pending
-        target_count = max(1, int(pangenome_target or DEFAULT_PANGENOME_TARGET))
-        pangenome_gap = max(0, target_count - same_species_committed)
+        # The authoritative pangenome gap is deferred until the tree and
+        # local-clade context have been built and cross-checked in selection_sets.
+        pangenome_gap = None
 
         # The name of the nearest OTHER submitted isolate, regardless of whether it has
         # been committed to genome sequencing. This is reported so a reviewer can always
@@ -1267,12 +1872,6 @@ def _compute_sequencing_context(
         elif current_selected:
             adjusted_priority = 'SELECTED_PENDING'
             adjusted_score = base_score
-        elif query_species and pangenome_gap > 0:
-            adjusted_priority = base_priority
-            adjusted_score = base_score
-        elif query_species and pangenome_gap == 0 and nearest_pct >= 98.65:
-            adjusted_priority = 'LOW_PANGENOME_TARGET_MET'
-            adjusted_score = max(0.0, base_score - 25.0)
         elif clade_already_selected:
             adjusted_priority = 'MEDIUM_RELATED_GENOME_CLADE'
             adjusted_score = max(0.0, base_score - 10.0)
@@ -1305,8 +1904,9 @@ def _compute_sequencing_context(
             'genome_same_species_available': same_species_baseline,
             'genome_same_species_selected': same_species_partner_available,
             'genome_same_species_pending': same_species_pending,
-            'pangenome_target': target_count,
-            'pangenome_gap': pangenome_gap,
+            'pangenome_target': 'NA',
+            'pangenome_gap': 'NA',
+            'pangenome_eligibility_status': 'DEFERRED_TO_TREE_VALIDATED_SELECTION_SETS',
         }
     return context
 
@@ -1326,6 +1926,7 @@ def _metric_values(metrics, qid):
         'NA' if row.get('nearest_query_coverage') is None else f"{float(row['nearest_query_coverage']):.2f}",
         'NA' if row.get('nearest_alignment_length') is None else str(int(row['nearest_alignment_length'])),
         row['density_source'],
+        row.get('density_count_method', 'NOT_AVAILABLE'),
     ]
 
 
@@ -1411,7 +2012,7 @@ def _write_novelty_metrics_table(
     metric_fields = [
         'NearestIdentity', 'NearestHit', 'Novel', 'MatchesGE99', 'MatchesGE97', 'MatchesGE95',
         'NoveltyScore', 'Crowding', 'SequencingPriority', 'NearestQueryCoverage',
-        'NearestAlignmentLength', 'DensitySource',
+        'NearestAlignmentLength', 'DensitySource', 'DensityCountMethod',
     ]
     headers = ['ID']
     headers.extend(metric_fields)
@@ -1419,7 +2020,7 @@ def _write_novelty_metrics_table(
         headers.extend(prefix + field for field in metric_fields)
     headers.extend([
         'BaselineEvidenceClass',
-        'PartnerID', 'SelectedForGenomeSequencing', 'GenomeAlreadySequenced',
+        'PartnerID', 'AlreadySelectedForGenomeSequencing', 'GenomeAlreadySequenced',
         'NearestGenomeHit', 'NearestGenomeIdentity',
         'GenomeCollectionMatchesGE99', 'GenomeCollectionMatchesGE97', 'GenomeCollectionMatchesGE95',
         'RelatedGenomeCladeGE97',
@@ -1430,9 +2031,11 @@ def _write_novelty_metrics_table(
         'BaselineGenomeCountSameAssessmentSpecies',
         'SequencedPartnerGenomeCountSameAssessmentSpecies',
         'SelectedPendingGenomeCountSameAssessmentSpecies',
-        'PangenomeTarget', 'PangenomeGap',
+        'PangenomeTarget', 'PangenomeGap', 'PangenomeEligibilityStatus',
         'GenomeSequencingMetadataSource',
         'ClosestProjectIsolate', 'ClosestProjectIsolateIdentity', 'ProjectIsolateOnlyMatch',
+        'ReferenceEvidenceInterpretation', 'ProjectEvidenceInterpretation',
+        'GenomeRepresentationInterpretation',
     ])
 
     with open(output, 'w') as fh:
@@ -1469,12 +2072,61 @@ def _write_novelty_metrics_table(
                 str(seq_ctx['genome_same_species_pending']),
                 str(seq_ctx['pangenome_target']),
                 str(seq_ctx['pangenome_gap']),
+                str(seq_ctx.get('pangenome_eligibility_status', 'DEFERRED_TO_TREE_VALIDATED_SELECTION_SETS')),
                 seq_ctx['source'],
                 seq_ctx.get('closest_project_isolate', 'None'),
                 f"{float(seq_ctx.get('closest_project_isolate_identity') or 0.0):.2f}",
                 seq_ctx.get('project_isolate_only_match', 'False'),
+                'MARKER_SEQUENCE_RECOGNITION_ONLY',
+                'PROJECT_MARKER_SEQUENCE_REPRESENTATION_NOT_PROOF_OF_GENOME_AVAILABILITY',
+                'CULTURED_BASELINE_AND_COMPLETED_PARTNER_GENOME_EVIDENCE',
             ]
             fh.write('\t'.join([qid] + primary + hungate + secondary + cultured + baseline_alias + project + reference + sequencing) + '\n')
+    return str(output)
+
+
+def _run_supplementary_reference_checks(
+    input_fasta: str, references, outdir: str, threads: Optional[int] = None,
+) -> Optional[str]:
+    """Assess marker recognition in supplementary 16S references without genome scoring."""
+    import csv
+    rows = []
+    seen = set()
+    for item in references or []:
+        if not item:
+            continue
+        ref_path = item[0] if isinstance(item, (tuple, list)) else item
+        name = item[2] if isinstance(item, (tuple, list)) and len(item) > 2 else Path(str(ref_path)).stem
+        if not ref_path or not Path(ref_path).exists():
+            logger.warning('[NOVELTY] Supplementary reference %s is unavailable; skipping', name)
+            continue
+        resolved = str(Path(ref_path).resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        slug = ''.join(ch if ch.isalnum() else '_' for ch in str(name)).strip('_')[:40] or 'reference'
+        pool = _ensure_uncompressed(str(ref_path), outdir)
+        matches_path = Path(outdir) / f'novelty_supplementary_{slug}_nearest_matches.tsv'
+        nearest = _run_nearest_search(input_fasta, pool, matches_path, threads=threads)
+        for qid, _sequence in read_fasta(input_fasta):
+            hit = nearest.get(qid)
+            rows.append({
+                'sequence_id': qid, 'reference_database': str(name),
+                'nearest_hit': hit[1] if hit else 'NA',
+                'identity': f'{hit[0]:.3f}' if hit else '0.000',
+                'query_coverage': f'{hit[2]:.2f}' if hit and hit[2] is not None else 'NA',
+                'alignment_length': hit[3] if hit and hit[3] is not None else 'NA',
+                'coverage_tier': hit[6] if hit else 'NONE',
+                'interpretation': 'MARKER_SEQUENCE_RECOGNITION_ONLY',
+            })
+    if not rows:
+        return None
+    output = Path(outdir) / 'novelty_supplementary_reference_summary.tsv'
+    fields = ['sequence_id','reference_database','nearest_hit','identity','query_coverage',
+              'alignment_length','coverage_tier','interpretation']
+    with output.open('w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', lineterminator='\n')
+        writer.writeheader(); writer.writerows(rows)
     return str(output)
 
 
@@ -1489,6 +2141,7 @@ def build_reference_novelty_metrics(
     baseline_datasets=None,
     hungate_datasets=None,
     secondary_baseline_datasets=None,
+    supplementary_references=None,
     pangenome_target: int = DEFAULT_PANGENOME_TARGET,
 ):
     """Write per-sequence novelty metrics comparing against project and baseline sequences.
@@ -1594,12 +2247,10 @@ def build_reference_novelty_metrics(
             threads=threads,
             exclude_self=True,
         )
-        all_density = _run_density_search(
-            input_fasta,
-            all_pool_path,
+        all_density, all_density_80 = _run_density_search_coverage_pair(
+            input_fasta, all_pool_path,
             Path(outdir) / 'novelty_project_density_matches.tsv',
-            threads=threads,
-            exclude_self=True,
+            threads=threads, exclude_self=True,
         )
         all_metrics = _metrics_from_nearest_and_density(
             qids,
@@ -1628,9 +2279,8 @@ def build_reference_novelty_metrics(
             Path(outdir) / 'novelty_reference_nearest_matches.tsv',
             threads=threads,
         )
-        reference_density = _run_density_search(
-            input_fasta,
-            reference_pool_path,
+        reference_density, reference_density_80 = _run_density_search_coverage_pair(
+            input_fasta, reference_pool_path,
             Path(outdir) / 'novelty_reference_density_matches.tsv',
             threads=threads,
         )
@@ -1643,45 +2293,104 @@ def build_reference_novelty_metrics(
         )
     else:
         reference_metrics = _empty_pool_metrics(qids, source='none')
+        reference_density = {}
+        reference_density_80 = {}
 
-    hungate_pool_path, hungate_metrics, hungate_source, _hungate_found, _hungate_count = _compute_db_pool_metrics(
-        input_fasta=input_fasta,
-        outdir=outdir,
-        qids=qids,
-        db=db,
-        run_dataset=run_dataset,
-        datasets=hungate_names,
-        pool_name='hungate_baseline',
-        source_prefix='hungate_baseline',
-        threads=threads,
-    )
-    secondary_pool_path, secondary_metrics, secondary_source, _secondary_found, _secondary_count = _compute_db_pool_metrics(
-        input_fasta=input_fasta,
-        outdir=outdir,
-        qids=qids,
-        db=db,
-        run_dataset=run_dataset,
-        datasets=secondary_names,
-        pool_name='secondary_baseline',
-        source_prefix='secondary_baseline',
-        threads=threads,
-    )
-    cultured_pool_path, cultured_metrics, cultured_source, cultured_found, cultured_count = _compute_db_pool_metrics(
-        input_fasta=input_fasta,
-        outdir=outdir,
-        qids=qids,
-        db=db,
-        run_dataset=run_dataset,
-        datasets=baseline_names,
-        pool_name='baseline',
-        source_prefix='cultured_project',
-        threads=threads,
-    )
-    if baseline_names and db is not None and not cultured_pool_path:
-        raise RuntimeError(
-            f'no cultured-baseline sequences were found for registered dataset(s): {baseline_names}'
+    if all_pool_path or reference_pool_path:
+        import csv
+        marker_comparison = Path(outdir) / 'novelty_marker_density_coverage_comparison.tsv'
+        with open(marker_comparison, 'w', newline='') as handle:
+            writer = csv.writer(handle, delimiter='\t', lineterminator='\n')
+            writer.writerow(['sequence_id','collection','query_coverage','matches_ge_95','matches_ge_97','matches_ge_99'])
+            for collection, density_sets in (
+                ('PROJECT', {95: all_density if all_pool_path else {}, 80: all_density_80 if all_pool_path else {}}),
+                ('GTDB_REFERENCE', {95: reference_density, 80: reference_density_80}),
+            ):
+                for qid in qids:
+                    for coverage, counts in density_sets.items():
+                        values = counts.get(qid, {})
+                        writer.writerow([qid, collection, coverage, values.get('ge_95',0), values.get('ge_97',0), values.get('ge_99',0)])
+
+    # Hungate and secondary cultured-genome baselines are searched together once.
+    # Target provenance is retained so group-specific nearest hits and density
+    # counts can still be reported independently.
+    combined_pool_path, baseline_provenance, baseline_found, combined_count = (
+        _build_combined_baseline_pool_with_provenance(
+            db=db, outdir=outdir, hungate_datasets=hungate_names,
+            secondary_datasets=secondary_names,
         )
+    )
+    hungate_pool_path = combined_pool_path if any(v == 'HUNGATE' for v in baseline_provenance.values()) else None
+    secondary_pool_path = combined_pool_path if any(v == 'SECONDARY' for v in baseline_provenance.values()) else None
+    cultured_pool_path = combined_pool_path
+    hungate_source = 'hungate_baseline:' + ','.join(hungate_names) if hungate_pool_path else 'none'
+    secondary_source = 'secondary_baseline:' + ','.join(secondary_names) if secondary_pool_path else 'none'
+    cultured_source = 'cultured_project:' + ','.join(baseline_found) if combined_pool_path else 'none'
+    hungate_nearest = {}
+    secondary_nearest = {}
+    if combined_pool_path:
+        nearest_by_group = _run_nearest_search_by_provenance(
+            input_fasta, combined_pool_path,
+            Path(outdir) / 'novelty_baseline_nearest_matches.tsv',
+            baseline_provenance, threads=threads,
+        )
+        hungate_nearest = nearest_by_group['HUNGATE']
+        secondary_nearest = nearest_by_group['SECONDARY']
+        # The combined nearest-hit output is the best hit across either baseline.
+        combined_nearest = {}
+        for qid in qids:
+            candidates = [h[qid] for h in (hungate_nearest, secondary_nearest) if qid in h]
+            if candidates:
+                combined_nearest[qid] = max(candidates, key=lambda x: (x[0], x[2] or 0, x[3] or 0, x[1]))
+        # Write the combined result using the same stable schema as the group files.
+        import csv
+        combined_path = Path(outdir) / 'novelty_baseline_nearest_matches.tsv'
+        match_fields = ['query','target','id','alnlen','mism','gaps','qlo','qhi','tlo','thi','ql','tl','qcov','tcov',
+                        'search_threshold','search_round','coverage_tier','match_status']
+        with open(combined_path, 'w', newline='') as handle:
+            writer = csv.writer(handle, delimiter='\t', lineterminator='\n'); writer.writerow(match_fields)
+            for qid in qids:
+                hit = combined_nearest.get(qid)
+                if hit is None: writer.writerow([qid,'NA','NA'] + ['NA'] * 11 + ['NA','NA','NONE','NO_MATCH'])
+                else: writer.writerow(hit[7] + [hit[4],hit[5],hit[6], 'MATCH' if hit[6]=='FULL' else 'PARTIAL_COVERAGE'])
 
+        density_by_coverage = _run_combined_baseline_density(
+            input_fasta, combined_pool_path, outdir, baseline_provenance, threads=threads,
+        )
+        # Keep the existing 95%-coverage density outputs as the primary metrics;
+        # the 80%-coverage outputs are an explicit sensitivity comparison.
+        density95 = density_by_coverage[95]
+        def _merge_density(groups):
+            merged = {}
+            for group_counts in groups:
+                for qid, values in group_counts.items():
+                    bucket = merged.setdefault(qid, {'ge_99':0,'ge_97':0,'ge_95':0})
+                    for key in bucket: bucket[key] += values[key]
+            return merged
+        hungate_density = density95['HUNGATE']
+        secondary_density = density95['SECONDARY']
+        combined_density = _merge_density([hungate_density, secondary_density])
+        # Save a compact comparison table so the 80% and 95% coverage effects are visible.
+        comparison_path = Path(outdir) / 'novelty_baseline_density_coverage_comparison.tsv'
+        with open(comparison_path, 'w', newline='') as handle:
+            writer = csv.writer(handle, delimiter='\t', lineterminator='\n')
+            writer.writerow(['sequence_id','collection','query_coverage','matches_ge_95','matches_ge_97','matches_ge_99'])
+            for collection in ('HUNGATE','SECONDARY'):
+                for qid in qids:
+                    for coverage in (95,80):
+                        values = density_by_coverage[coverage][collection].get(qid, {})
+                        writer.writerow([qid, collection, coverage, values.get('ge_95',0), values.get('ge_97',0), values.get('ge_99',0)])
+        hungate_metrics = _metrics_from_nearest_and_density(qids, hungate_nearest, hungate_density, source=hungate_source, id_threshold=0.97)
+        secondary_metrics = _metrics_from_nearest_and_density(qids, secondary_nearest, secondary_density, source=secondary_source, id_threshold=0.97)
+        cultured_metrics = _metrics_from_nearest_and_density(qids, combined_nearest, combined_density, source=cultured_source, id_threshold=0.97)
+    else:
+        hungate_metrics = _empty_pool_metrics(qids, source='none')
+        secondary_metrics = _empty_pool_metrics(qids, source='none')
+        cultured_metrics = _empty_pool_metrics(qids, source='none')
+        if baseline_names and db is not None:
+            raise RuntimeError(f'no cultured-baseline sequences were found for registered dataset(s): {baseline_names}')
+    cultured_found = baseline_found
+    cultured_count = combined_count
     primary_metrics = cultured_metrics if cultured_pool_path else all_metrics
     sequencing_context = _compute_sequencing_context(
         input_fasta,
@@ -1709,8 +2418,11 @@ def build_reference_novelty_metrics(
     genome_derived_context = _write_genome_derived_context(
         input_fasta, outdir, db, qids, threads=threads,
     )
+    supplementary_summary = _run_supplementary_reference_checks(
+        input_fasta, supplementary_references, outdir, threads=threads,
+    )
     logger.info(
-        '[NOVELTY] Wrote novelty metrics to %s (primary=%s; hungate=%s; secondary=%s; cultured=%s; project=%s; reference=%s; genome-derived-context=%s)',
+        '[NOVELTY] Wrote novelty metrics to %s (primary=%s; hungate=%s; secondary=%s; cultured=%s; project=%s; reference=%s; genome-derived-context=%s; supplementary=%s)',
         output,
         'cultured_project' if cultured_pool_path else all_source,
         hungate_source,
@@ -1719,5 +2431,6 @@ def build_reference_novelty_metrics(
         all_source,
         reference_source,
         genome_derived_context or 'none',
+        supplementary_summary or 'none',
     )
     return str(output)
