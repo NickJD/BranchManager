@@ -38,3 +38,8 @@ def test_demo_dashboard_builds_from_committed_fixtures(tmp_path):
     assert (output_dir / "taxonomy" / "taxonomy_GTDB_r232.tsv").is_file()
     assert (output_dir / "assessment" / "selection_summary.tsv").is_file()
     assert (output_dir / "run_manifest.json").is_file()
+
+
+def test_demo_root_resolves_to_repository_docs_demo():
+    assert DEMO_ROOT == Path(__file__).resolve().parents[1] / "docs" / "demo"
+    assert (DEMO_ROOT / "assessment" / "selection_summary.tsv").is_file()
