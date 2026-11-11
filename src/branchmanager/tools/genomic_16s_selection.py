@@ -649,7 +649,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--minimum-taxonomy-target-coverage", type=float, default=80.0,
                         help="Minimum GTDB reference-target coverage percentage before taxonomy concordance is assessed (default: 80).")
     parser.add_argument("--species-identity-threshold", type=float, default=98.65,
-                        help="16S identity heuristic required before species-level concordance is reported (default: 98.65%).")
+                        help="16S identity heuristic required before species-level concordance is reported (default: 98.65).")
     parser.add_argument("--near-top-identity-delta", type=float, default=0.5,
                         help="Treat reference hits within this many identity percentage points of the best as near-ties (default: 0.5).")
     parser.add_argument("--min-full-length", type=int, default=1400,
