@@ -17,6 +17,7 @@ This directory contains the maintained user and developer documentation. The roo
 
 ## Release notes
 
+- [BranchManager v1.1.0](releases/v1.1.0.md)
 - [BranchManager v1.0.0](releases/v1.0.0.md)
 
 ## Documentation policy

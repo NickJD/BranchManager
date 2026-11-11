@@ -11,6 +11,21 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
+
+@pytest.fixture(autouse=True)
+def _restore_branchmanager_imports():
+    """Keep test-local sys.modules stubs from leaking into other test modules."""
+    import sys
+    before = {
+        name: module for name, module in sys.modules.items()
+        if name == 'branchmanager' or name.startswith('branchmanager.')
+    }
+    yield
+    for name in list(sys.modules):
+        if (name == 'branchmanager' or name.startswith('branchmanager.')) and name not in before:
+            sys.modules.pop(name, None)
+    sys.modules.update(before)
+
 PACKAGE_ROOT = ROOT / 'src' / 'branchmanager'
 
 

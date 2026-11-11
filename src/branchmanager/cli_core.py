@@ -420,6 +420,7 @@ def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_shor
             for sequence_id, dataset in conn.execute('SELECT id, dataset FROM sequences')
         }
     dataset_roles = db.get_dataset_roles()
+    isolate_statuses = db.get_isolate_statuses()
     maldi_sequence_ids = {
         str(item.get('sequence_id') or '')
         for item in db.get_maldi_identifications()
@@ -543,18 +544,32 @@ def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_shor
             addition_method = 'both'
         if addition_method:
             project_metadata['addition_method'] = addition_method
+        lifecycle_status = str(isolate_statuses.get(str(mapped), {}).get('status') or '').upper()
+        if lifecycle_status == 'SAB_APPROVED':
+            selected_commitment = True
+        elif lifecycle_status in {'SAB_DECLINED', 'SAB_DEFERRED'}:
+            selected_commitment = False
+        else:
+            # A catalogue's stale 'no' must not erase a later SAB approval.
+            selected_commitment = bool(row.get('selected_for_sequencing')) or bool(existing_metadata.get('selected_for_sequencing'))
         resolved_rows.append({
             'id': mapped,
             'partner_id': row.get('partner_id') or source_id,
             # Preserve the dataset in which an earlier isolate entered the
             # project instead of relabelling it as part of the current batch.
             'dataset': mapped_dataset or getattr(args, 'dataset', ''),
-            'selected_for_sequencing': bool(row.get('selected_for_sequencing')),
-            'selected_for_wgs': bool(row.get('selected_for_wgs')),
+            'selected_for_sequencing': selected_commitment,
+            # A registered genome is factual evidence and must not be erased
+            # by a stale catalogue row. New genome availability is monotonic.
+            'selected_for_wgs': bool(row.get('selected_for_wgs')) or bool(existing_metadata.get('selected_for_wgs')),
             'source_id': source_id,
             'source_file': str(metadata_path),
             'raw_selected_value': row.get('raw_selected_value', ''),
-            'raw_commitment_value': row.get('raw_commitment_value', ''),
+            'raw_commitment_value': (
+                existing_metadata.get('raw_commitment_value', '')
+                if existing_metadata.get('selected_for_sequencing') and not row.get('selected_for_sequencing')
+                else row.get('raw_commitment_value', '')
+            ),
             'project_metadata': project_metadata,
         })
 
@@ -962,8 +977,8 @@ def _write_output_explanations(outdir: str):
             'Unified per-sequence assessment. '
             'COLUMN GROUPS: '
             '(1) TAXONOMY/CLASSIFICATION — GTDBTaxonomy, GTDBClassificationHit, '
-            'GTDBClassificationIdentity, GTDBQueryCoverage, GTDBTargetCoverage, GTDBAlignmentLength, ' 
-            'GTDBSourceClassifierConfidence, GTDBAssignmentEvidenceLevel, ' 
+            'GTDBClassificationIdentity, GTDBQueryCoverage, GTDBTargetCoverage, GTDBAlignmentLength, '
+            'GTDBSourceClassifierConfidence, GTDBAssignmentEvidenceLevel, '
             'GTDBAlignmentEvidenceStatus, GTDBEvidenceTier, GTDBEvidenceInterpretation: authoritative GTDB assignment and qualified alignment evidence. '
             'Repeated as Taxonomy_<DB>, ClassificationHit_<DB>, Identity_<DB>, SourceClassifierConfidence_<DB> '
             'for each additional --alt-ref database. '
@@ -4158,15 +4173,6 @@ def cmd_performance_review(args):
                 staged, outdir / 'assessment' / 'genome_collection_assessment.tsv',
             )
             manifest.add_output(genome_assessment, role='genome_collection_assessment')
-            dashboard = write_performance_review_dashboard(
-                outdir / 'assessment' / 'selection_summary.tsv', outdir,
-                sequence_assessment=outdir / 'assessment' / 'sequence_assessment.tsv',
-                pangenome_hierarchy=outdir / 'assessment' / 'pangenome_hierarchy.tsv',
-                novelty_metrics=outdir / 'assessment' / 'novelty_metrics.tsv',
-                run_manifest=outdir / 'run_manifest.json',
-                genome_assessment=genome_assessment,
-            )
-            manifest.add_output(dashboard, role='performance_review_dashboard')
             manifest.add_stage('performance_review', 'COMPLETE')
             manifest.add_stage('hiring_panel', 'COMPLETE', detail='candidate sets and board summary')
             manifest.finish('COMPLETE')
@@ -4185,6 +4191,18 @@ def cmd_performance_review(args):
                     raise RuntimeError('staged project database failed SQLite integrity_check')
             os.replace(publish_tmp, original_db)
             staged_db.unlink(missing_ok=True)
+            # Capture the published database (post-assessment) rather than
+            # leaving the dashboard labelled with only the pre-run DB hash.
+            manifest.add_output(original_db, role='project_database_after')
+            dashboard = write_performance_review_dashboard(
+                outdir / 'assessment' / 'selection_summary.tsv', outdir,
+                sequence_assessment=outdir / 'assessment' / 'sequence_assessment.tsv',
+                pangenome_hierarchy=outdir / 'assessment' / 'pangenome_hierarchy.tsv',
+                novelty_metrics=outdir / 'assessment' / 'novelty_metrics.tsv',
+                run_manifest=outdir / 'run_manifest.json',
+                genome_assessment=genome_assessment,
+            )
+            manifest.add_output(dashboard, role='performance_review_dashboard')
         except BaseException as exc:
             manifest.finish('FAILED', error=exc)
             raise
@@ -7617,6 +7635,7 @@ def cmd_dashboard(args):
         novelty_metrics=novelty_metrics if novelty_metrics.is_file() else None,
         run_manifest=run_manifest if run_manifest.is_file() else None,
         genome_assessment=genome_assessment if genome_assessment.is_file() else None,
+        database=getattr(args, 'db', None),
     )
     logging.getLogger(__name__).info("[DASHBOARD] Rebuilt dashboard: %s", dashboard)
     print(f"Dashboard regenerated: {dashboard}")
@@ -7718,6 +7737,12 @@ def main(argv=None):
         project_config = load_project_config(selected_config)
         apply_project_config_defaults(parser, project_config)
     args = parser.parse_args(argv)
+    if args.command in {'ground-truth', 'validate'}:
+        from branchmanager.validation import run_cli as _run_validation_cli
+        result = _run_validation_cli(args)
+        if result:
+            sys.exit(result)
+        return
     if args.command == 'assistant':
         # A cohort manifest is itself the complete input declaration. Ignore any
         # per-batch input path inherited from a reusable config profile.

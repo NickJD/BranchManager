@@ -1391,7 +1391,7 @@ class Database:
     def get_sequencing_metadata_for_ids(self, ids=None):
         with self.connect() as conn:
             cur = conn.cursor()
-            if ids:
+            if ids is not None:
                 resolved = []
                 for sid in ids:
                     key = self._resolve_sequence_id_with_cursor(cur, sid)

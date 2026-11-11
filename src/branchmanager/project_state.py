@@ -17,6 +17,8 @@ ISOLATE_STATES = (
     'MARKER_QC_PASSED',
     'PROPOSED',
     'SAB_APPROVED',
+    'SAB_DECLINED',
+    'SAB_DEFERRED',
     'DNA_EXTRACTION_PENDING',
     'DNA_EXTRACTION_FAILED',
     'LIBRARY_PENDING',
@@ -98,8 +100,9 @@ def import_status_updates(db, path: str | Path) -> list[dict]:
     known = set(db.get_all_ids())
     results = []
     for line_number, row in enumerate(rows, start=2):
-        sequence_id = _value(row, 'sequence_id', 'isolate_id', 'sample_id', 'id')
+        sequence_id = _value(row, 'sequence_id', 'sequenceid', 'isolate_id', 'isolateid', 'sample_id', 'sampleid', 'id')
         state_text = _value(row, 'status', 'operational_status', 'isolate_status')
+        sab_decision = _value(row, 'SABDecision', 'SAB decision', 'board_decision')
         detail = _value(row, 'detail', 'status_detail', 'notes')
         if not sequence_id:
             results.append({'line': line_number, 'sequence_id': '', 'result': 'REJECTED', 'detail': 'missing sequence_id'})
@@ -107,12 +110,51 @@ def import_status_updates(db, path: str | Path) -> list[dict]:
         if sequence_id not in known:
             results.append({'line': line_number, 'sequence_id': sequence_id, 'result': 'REJECTED', 'detail': 'sequence ID is not in the project database'})
             continue
+        # The SAB can return the generated selection_summary.tsv directly:
+        # fill SABDecision with APPROVE / REJECT / DEFER and import that file.
+        if not state_text and sab_decision:
+            decision = sab_decision.strip().upper().replace('-', '_').replace(' ', '_')
+            decision_states = {
+                'APPROVE': 'SAB_APPROVED', 'APPROVED': 'SAB_APPROVED',
+                'YES': 'SAB_APPROVED', 'SELECT': 'SAB_APPROVED',
+                'SELECTED': 'SAB_APPROVED', 'TAKE_FORWARD': 'SAB_APPROVED',
+                'REJECT': 'SAB_DECLINED', 'REJECTED': 'SAB_DECLINED',
+                'NO': 'SAB_DECLINED', 'DO_NOT_SELECT': 'SAB_DECLINED',
+                'DEFER': 'SAB_DEFERRED', 'DEFERRED': 'SAB_DEFERRED',
+                'REVIEW': 'SAB_DEFERRED',
+            }
+            state_text = decision_states.get(decision, '')
+            if not state_text:
+                results.append({
+                    'line': line_number, 'sequence_id': sequence_id, 'result': 'REJECTED',
+                    'detail': f'unknown SABDecision {sab_decision!r}; use APPROVE, REJECT, or DEFER',
+                })
+                continue
+        if not state_text:
+            results.append({'line': line_number, 'sequence_id': sequence_id, 'result': 'SKIPPED', 'detail': 'no status or SABDecision supplied'})
+            continue
         try:
             state = normalise_state(state_text)
         except ValueError as exc:
             results.append({'line': line_number, 'sequence_id': sequence_id, 'result': 'REJECTED', 'detail': str(exc)})
             continue
         db.update_isolate_status(sequence_id, state, detail=detail, source_file=str(Path(path).resolve()))
+        # SAB approval/decline is an explicit selection decision. Persist it
+        # in the rolling metadata consumed by subsequent Performance Reviews.
+        if state in {'SAB_APPROVED', 'SAB_DECLINED', 'SAB_DEFERRED'}:
+            current = db.get_sequencing_metadata_for_ids([sequence_id]).get(sequence_id, {})
+            db.upsert_sequencing_metadata([{
+                'id': sequence_id,
+                'partner_id': current.get('partner_id', sequence_id),
+                'dataset': current.get('dataset', ''),
+                'selected_for_sequencing': state == 'SAB_APPROVED',
+                'selected_for_wgs': current.get('selected_for_wgs', False),
+                'source_id': sequence_id,
+                'source_file': str(Path(path).resolve()),
+                'raw_selected_value': state,
+                'raw_commitment_value': current.get('raw_commitment_value', ''),
+                'project_metadata': current.get('project_metadata', {}),
+            }])
         results.append({'line': line_number, 'sequence_id': sequence_id, 'result': 'IMPORTED', 'detail': state})
     return results
 
@@ -221,20 +263,22 @@ def import_genome_results(
         sequence_id = row['sequence_id']
         state = 'GENOME_QC_PASSED' if row['genome_qc_pass'] else row['genome_status']
         db.update_isolate_status(sequence_id, state, detail=row.get('notes', ''), source_file=str(Path(path).resolve()))
-        if row['genome_qc_pass']:
-            current = db.get_sequencing_metadata_for_ids([sequence_id]).get(sequence_id, {})
-            db.upsert_sequencing_metadata([{
-                'id': sequence_id,
-                'partner_id': current.get('partner_id', ''),
-                'dataset': current.get('dataset', ''),
-                'selected_for_sequencing': current.get('selected_for_sequencing', False),
-                'selected_for_wgs': True,
-                'source_id': sequence_id,
-                'source_file': str(Path(path).resolve()),
-                'raw_selected_value': 'genome_qc_pass',
-                'raw_commitment_value': current.get('raw_commitment_value', ''),
-                'project_metadata': current.get('project_metadata', {}),
-            }])
+        # A registered genome means sequencing has occurred, irrespective of
+        # whether the assembly subsequently passes genome QC. Keep QC status
+        # separate from the factual sequencing-completed flag.
+        current = db.get_sequencing_metadata_for_ids([sequence_id]).get(sequence_id, {})
+        db.upsert_sequencing_metadata([{
+            'id': sequence_id,
+            'partner_id': current.get('partner_id', ''),
+            'dataset': current.get('dataset', ''),
+            'selected_for_sequencing': current.get('selected_for_sequencing', False),
+            'selected_for_wgs': True,
+            'source_id': sequence_id,
+            'source_file': str(Path(path).resolve()),
+            'raw_selected_value': current.get('raw_selected_value', ''),
+            'raw_commitment_value': current.get('raw_commitment_value', ''),
+            'project_metadata': current.get('project_metadata', {}),
+        }])
     return results
 
 

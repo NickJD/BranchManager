@@ -1,5 +1,6 @@
 import json
 import re
+import sqlite3
 from pathlib import Path
 
 from branchmanager.reporting import write_performance_review_dashboard
@@ -41,6 +42,8 @@ def test_dashboard_embeds_assessment_and_is_interactive(tmp_path):
     (tmp_path / 'run_manifest.json').write_text(json.dumps({
         'workflow': 'performance_review', 'status': 'COMPLETE',
         'branchmanager_version': '0.1.7',
+        'workflow_version': '1.1.0',
+        'database_identity': {'schema_version': '6', 'sha256': 'abc123'},
     }))
 
     output = Path(write_performance_review_dashboard(
@@ -54,6 +57,9 @@ def test_dashboard_embeds_assessment_and_is_interactive(tmp_path):
     data = json.loads(embedded.group(1))
 
     assert data['counts']['total'] == 1
+    assert data['run']['workflow_version'] == '1.1.0'
+    assert data['run']['database_schema_version'] == '6'
+    assert data['run']['database_sha256'] == 'abc123'
     assert data['records'][0]['taxonomy'][0]['reference_coverage'] == 92.0
     assert data['pangenome'][0]['gap'] == 7.0
     assert data['records'][0]['pangenome_rank'] == 'SPECIES'
@@ -62,6 +68,66 @@ def test_dashboard_embeds_assessment_and_is_interactive(tmp_path):
     assert 'exportBtn' in page
     assert 'QUB_0001' in embedded.group(1)
 
+
+
+
+def test_dashboard_can_overlay_current_sab_and_genome_status_from_database(tmp_path):
+    assessment = tmp_path / 'assessment'
+    assessment.mkdir()
+    _write_tsv(assessment / 'selection_summary.tsv', [
+        {'SequenceID': 'QUB_0001', 'PartnerID': 'QUB', 'Recommendation': 'PRIORITISE - SET PRIMARY',
+         'AlreadySelectedForGenomeSequencing': 'False', 'GenomeAlreadySequenced': 'False'},
+        {'SequenceID': 'QUB_0002', 'PartnerID': 'QUB', 'Recommendation': 'PRIORITISE - SET PRIMARY',
+         'AlreadySelectedForGenomeSequencing': 'False', 'GenomeAlreadySequenced': 'False'},
+        {'SequenceID': 'QUB_0003', 'PartnerID': 'QUB', 'Recommendation': 'PRIORITISE - SET PRIMARY',
+         'AlreadySelectedForGenomeSequencing': 'False', 'GenomeAlreadySequenced': 'False'},
+    ])
+    _write_tsv(assessment / 'sequence_assessment.tsv', [
+        {'ID': 'QUB_0001'}, {'ID': 'QUB_0002'}, {'ID': 'QUB_0003'},
+    ])
+    db_path = tmp_path / 'project.sqlite'
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+            CREATE TABLE schema_migrations (version INTEGER);
+            INSERT INTO schema_migrations VALUES (6);
+            CREATE TABLE sequencing_metadata (
+                id TEXT PRIMARY KEY, selected_for_sequencing INTEGER,
+                selected_for_wgs INTEGER, operational_status TEXT
+            );
+            CREATE TABLE isolate_status (sequence_id TEXT PRIMARY KEY, status TEXT);
+            CREATE TABLE sequences (id TEXT PRIMARY KEY, dataset TEXT);
+            CREATE TABLE genome_records (
+                sequence_id TEXT, genome_id TEXT, genome_status TEXT,
+                genome_qc_pass INTEGER, completeness REAL, contamination REAL,
+                gtdb_taxonomy TEXT, genome_path TEXT, notes TEXT
+            );
+            INSERT INTO sequencing_metadata VALUES ('QUB_0001', 1, 0, 'SAB_APPROVED');
+            INSERT INTO sequencing_metadata VALUES ('QUB_0002', 0, 0, 'SAB_DEFERRED');
+            INSERT INTO sequencing_metadata VALUES ('QUB_0003', 0, 0, 'GENOME_QC_FAILED');
+            INSERT INTO isolate_status VALUES ('QUB_0001', 'SAB_APPROVED');
+            INSERT INTO isolate_status VALUES ('QUB_0002', 'SAB_DEFERRED');
+            INSERT INTO isolate_status VALUES ('QUB_0003', 'GENOME_QC_FAILED');
+            INSERT INTO sequences VALUES ('QUB_0003', 'QUB');
+            INSERT INTO genome_records VALUES ('QUB_0003', 'GCA_000003.1', 'GENOME_QC_FAILED', 0, 70, 8, '', '', 'QC failed');
+        """)
+
+    output = Path(write_performance_review_dashboard(
+        assessment / 'selection_summary.tsv', tmp_path, database=db_path,
+    ))
+    page = output.read_text(encoding='utf-8')
+    embedded = re.search(r'<script id="dashboard-data" type="application/json">(.*?)</script>', page, re.S)
+    data = json.loads(embedded.group(1))
+    records = {row['id']: row for row in data['records']}
+    assert records['QUB_0001']['recommendation'] == 'ALREADY SELECTED - GENOME PENDING'
+    assert records['QUB_0001']['sab_decision'] == 'APPROVED'
+    assert records['QUB_0002']['sab_decision'] == 'DEFERRED'
+    assert records['QUB_0003']['recommendation'] == 'ALREADY SEQUENCED'
+    assert records['QUB_0003']['genome_already_sequenced'] is True
+    assert data['counts']['selected_pending'] == 1
+    assert data['counts']['already_sequenced'] == 1
+    assert len(data['genome_records']) == 1
+    assert data['run']['database_overlay'] is True
+    assert data['run']['database_schema_version'] == '6'
 
 
 def test_dashboard_uses_classifier_taxonomy_exports_with_taxon_column(tmp_path):

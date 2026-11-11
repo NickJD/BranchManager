@@ -2,6 +2,49 @@
 
 BranchManager produces machine-readable tables, run manifests, visualisations and decision-support reports. Exact filenames vary by command and workflow options.
 
+## SAB decision summary versus full sequence assessment
+
+`assessment/selection_summary.tsv` is the decision-facing shortlist for the Scientific Advisory Board, not a list of every assessed isolate. It includes positive and provisional recommendations (`PRIORITISE`, `RESERVE`, `STRONG CANDIDATE`, `SECONDARY CANDIDATE`, and the two `REVIEW` categories). Already sequenced/committed isolates, explicit baseline-redundancy exclusions, no-marker resequencing cases, and lower-priority/no-added-value cases remain in `sequence_assessment.tsv` but are omitted from the SAB shortlist.
+
+The shortlist contains 17 fields: isolate and partner IDs; sampled host species; MWL ID, matched taxon and role; closest baseline genome ID, its GTDB taxonomy and percentage identity; NCBI, SILVA and GG2 taxonomy assignments; marker QC; evidence quality; recommendation and rationale; and a blank `SABDecision` field for the board. The comprehensive `sequence_assessment.tsv` remains the source for detailed evidence metrics and intermediate selection-set fields.
+
+`assessment/sequence_assessment.tsv` remains the technical evidence record. It is not a strict column-wise superset of the summary: recommendation, evidence-quality, marker-QC display, selection-set and several interpreted context fields are generated during the selection/reporting stage and are not all stored as columns in the full assessment. The two reports therefore have complementary roles; do not assume the summary can be reconstructed by selecting columns from the assessment TSV.
+
+The summary is an overview, not a replacement for the full evidence. SAB members should use the recommendation and rationale to navigate the shortlist and request the full assessment when a decision needs further scientific scrutiny.
+
+## Recording SAB decisions and completed sequencing
+
+After the SAB meeting, the simplest route is to return the generated `selection_summary.tsv` with the `SABDecision` column filled in. Use `APPROVE`, `REJECT` or `DEFER`; leave rows blank where no decision was made. Import that same file into the rolling project database:
+
+```text
+sequence_id	status	detail
+QUB_0001	SAB_APPROVED	Approved at SAB meeting 2026-11-XX
+QUB_0002	PROPOSED	Deferred pending further review
+```
+
+```bash
+branchmanager status-meeting --db project.sqlite --input sab_decisions.tsv -o sab_decision_import
+```
+
+`APPROVE` sets the persistent `selected_for_sequencing` commitment; `REJECT` clears that commitment; `DEFER` records a deferred decision and leaves the isolate uncommitted. These decisions remain distinct from genome availability. A positive commitment in the cumulative partner catalogue is imported, but a stale `no` cannot erase an existing SAB approval. To withdraw a prior approval, set `SABDecision` to `REJECT` and re-import the returned summary.
+
+When sequencing/assembly has produced a genome record, import the genome accession and status using `records-update`:
+
+```text
+sequence_id	genome_id	genome_status	genome_qc_pass	completeness	contamination
+QUB_0001	GCA_XXXXXXXXX.1	GENOME_QC_PASSED	yes	98.5	1.2
+```
+
+```bash
+branchmanager records-update --db project.sqlite --input completed_genomes.tsv -o genome_import
+```
+
+A registered genome is recorded as sequenced even if its assembly subsequently fails genome QC. Genome sequencing completion and genome QC outcome are separate facts. The next Performance Review incorporates the updated database state. Alternatively, refresh the existing dashboard immediately with `branchmanager dashboard /path/to/run_output --db project.sqlite`; this overlays current decisions and genome records read-only, without rerunning the biological assessment. Pangenome target/gap calculations remain from the original assessment until the next Performance Review.
+
+## Version identity
+
+Run manifests and the dashboard report the BranchManager package version, workflow version, database schema version and a SHA256 fingerprint of the database file. The schema version identifies the database structure; the SHA256 distinguishes the actual database contents. Two databases with the same schema version can therefore contain different project records.
+
 ## Evidence dimensions
 
 Do not collapse the following measurements into one informal notion of “confidence”.
@@ -131,7 +174,7 @@ Use the relevant status/records workflow to update facts. Do not infer that a no
 
 Interactive HTML dashboards provide a navigable summary of the run, including collection overview, taxonomy, pangenome coverage, candidate evidence and relevant visual outputs where available. The Performance Review dashboard's individual-isolate panel also reports the nearest cultured and partner-project sequence hits, with identity, query coverage and aligned length where those fields are available.
 
-Use `branchmanager dashboard /path/to/run_output` to regenerate the dashboard from an existing run. This rebuilds the HTML from the existing reports; it does not rerun the underlying biological analyses.
+Use `branchmanager dashboard /path/to/run_output` to regenerate the dashboard from an existing run. This rebuilds the HTML from the existing reports; it does not rerun the underlying biological analyses. Add `--db project.sqlite` to overlay current SAB decisions and registered genome records from the database in read-only mode.
 
 A dashboard is a presentation layer over the generated reports. When a dashboard and a source TSV appear to disagree, inspect the source TSVs and run manifest and report the discrepancy rather than relying on the visual summary alone.
 

@@ -829,7 +829,7 @@ def build_parser():
     )
     status_meeting_parser.add_argument('--db', required=True)
     status_meeting_parser.add_argument('--input', required=True,
-        help='CSV/TSV with sequence_id, status, and optional detail.')
+        help='CSV/TSV with sequence_id/status/detail, or the returned selection_summary.tsv with SABDecision filled as APPROVE, REJECT or DEFER.')
     status_meeting_parser.add_argument('-o', '--out', required=True)
 
     records_update_parser = sub.add_parser(
@@ -1263,7 +1263,7 @@ def build_parser():
         description=(
             'Rebuild the interactive performance-review dashboard from the reports already present in a '
             'BranchManager run directory. This command does not rerun taxonomy, novelty, QC, phylogeny, '
-            'pangenome or selection analyses and does not require the project database.\n\n'
+            'pangenome or selection analyses. Optionally supply --db to overlay current SAB commitments and genome records without rerunning the assessment.\n\n'
             'Provide either the run output directory or its assessment/ subdirectory. The dashboard is '
             'written to the run output directory as performance_review_dashboard.html.'
         ),
@@ -1273,6 +1273,7 @@ def build_parser():
         'output_dir',
         help='Existing BranchManager run output directory (or its assessment/ subdirectory).',
     )
+    dashboard_parser.add_argument('--db', default=None, help='Optional project SQLite database; read-only overlay of current SAB decisions and registered genomes.')
 
     regenerate_parser = sub.add_parser(
         'regenerate-assessment',
@@ -1293,5 +1294,10 @@ def build_parser():
     regenerate_parser.add_argument('--baseline-extension-min-query-coverage', type=float, default=baseline_extension_coverage)
     regenerate_parser.add_argument('--no-dashboard', action='store_true',
         help='Regenerate TSV reports only; do not rebuild the HTML dashboard.')
+
+    # Additive validation toolkit. Existing workflow parsers and execution
+    # paths remain unchanged.
+    from branchmanager.validation import add_cli_arguments as _add_validation_arguments
+    _add_validation_arguments(sub)
 
     return parser

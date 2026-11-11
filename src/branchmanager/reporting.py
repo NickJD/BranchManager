@@ -114,6 +114,69 @@ def write_genome_collection_assessment(db, output_path: str | Path) -> str:
         writer.writerows(rows)
     return str(path)
 
+
+def _read_dashboard_database(database_path: str | Path) -> tuple[dict, list[dict], dict]:
+    """Read current sequencing decisions and genome records without mutating SQLite."""
+    path = Path(database_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f'Project database does not exist: {path}')
+    states: dict[str, dict] = {}
+    genomes: list[dict] = []
+    identity = {'schema_version': 'unknown', 'sha256': '', 'path': str(path)}
+    digest = hashlib.sha256()
+    with path.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    identity['sha256'] = digest.hexdigest()
+    uri = f'file:{path}?mode=ro'
+    with sqlite3.connect(uri, uri=True, timeout=10) as conn:
+        conn.row_factory = sqlite3.Row
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'schema_migrations' in tables:
+            version = conn.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0]
+            if version is not None:
+                identity['schema_version'] = str(version)
+        if 'sequencing_metadata' in tables:
+            for row in conn.execute(
+                'SELECT id, selected_for_sequencing, selected_for_wgs, operational_status '
+                'FROM sequencing_metadata'
+            ):
+                states[str(row['id'])] = {
+                    'selected': bool(row['selected_for_sequencing']),
+                    'sequenced': bool(row['selected_for_wgs']),
+                    'status': str(row['operational_status'] or ''),
+                }
+        if 'isolate_status' in tables:
+            for row in conn.execute('SELECT sequence_id, status FROM isolate_status'):
+                state = states.setdefault(str(row['sequence_id']), {'selected': False, 'sequenced': False, 'status': ''})
+                state['status'] = str(row['status'] or state.get('status', ''))
+        if 'genome_records' in tables:
+            query = (
+                "SELECT g.sequence_id, COALESCE(s.dataset,''), g.genome_id, g.genome_status, "
+                "g.genome_qc_pass, g.completeness, g.contamination, g.gtdb_taxonomy, g.genome_path, g.notes "
+                "FROM genome_records g LEFT JOIN sequences s ON s.id=g.sequence_id "
+                "ORDER BY g.sequence_id, g.genome_id"
+            )
+            for row in conn.execute(query):
+                sequence_id = str(row[0] or '')
+                genomes.append({
+                    'sequence_id': sequence_id, 'partner_id': str(row[1] or ''),
+                    'genome_id': str(row[2] or ''), 'genome_status': str(row[3] or ''),
+                    'genome_qc_pass': row[4], 'completeness': row[5], 'contamination': row[6],
+                    'gtdb_taxonomy': str(row[7] or ''), 'genome_path': str(row[8] or ''),
+                    'notes': str(row[9] or ''),
+                })
+                state = states.setdefault(sequence_id, {'selected': False, 'sequenced': False, 'status': ''})
+                state['sequenced'] = True
+    for state in states.values():
+        if state.get('status') == 'SAB_APPROVED':
+            state['selected'] = True
+        elif state.get('status') in {'SAB_DECLINED', 'SAB_DEFERRED'}:
+            state['selected'] = False
+        if state.get('sequenced'):
+            state['selected'] = bool(state.get('selected'))
+    return states, genomes, identity
+
 def write_performance_review_dashboard(
     selection_summary: str | Path,
     outdir: str | Path,
@@ -123,6 +186,7 @@ def write_performance_review_dashboard(
     novelty_metrics: str | Path | None = None,
     run_manifest: str | Path | None = None,
     genome_assessment: str | Path | None = None,
+    database: str | Path | None = None,
 ) -> str:
     # Read existing TSV/JSON outputs; do not recalculate assessment decisions.
     selection_path = Path(selection_summary)
@@ -134,6 +198,9 @@ def write_performance_review_dashboard(
     manifest_path = Path(run_manifest) if run_manifest else output_dir / 'run_manifest.json'
 
     selection_rows = _read_tsv_rows(selection_path)
+    database_states, database_genome_rows, database_identity = (
+        _read_dashboard_database(database) if database else ({}, [], {})
+    )
     assessment_rows = _read_tsv_rows(assessment_path)
     pangenome_rows = _read_tsv_rows(pangenome_path)
     novelty_rows = _read_tsv_rows(novelty_path)
@@ -236,7 +303,7 @@ def write_performance_review_dashboard(
             if prefix == 'GTDB_r232':
                 # Prefer the standalone GTDB classifier export, then fall back
                 # to fields carried through the assessment summary.
-                taxon = classifier.get('Taxon_GTDB_r232', classifier.get('Taxon_GTDB', '')) or evidence.get('GTDBTaxonomy', source.get('GTDBTaxonomy', ''))
+                taxon = classifier.get('Taxon_GTDB_r232', classifier.get('Taxon_GTDB', '')) or evidence.get('GTDBTaxonomy', source.get('GTDBTaxonomy', source.get('Taxonomy', '')))
                 status = classifier.get('AssignmentStatus_GTDB_r232', classifier.get('AssignmentStatus_GTDB', '')) or evidence.get('GTDBAssignmentStatus', source.get('GTDBAssignmentStatus', ''))
                 identity = classifier.get('Identity_GTDB_r232', classifier.get('Identity_GTDB', '')) or evidence.get('GTDBClassificationIdentity', source.get('GTDBClassificationIdentity', ''))
                 qcov = classifier.get('QueryCoverage_GTDB_r232', classifier.get('QueryCoverage_GTDB', '')) or evidence.get('GTDBQueryCoverage', source.get('GTDBQueryCoverage', ''))
@@ -298,12 +365,15 @@ def write_performance_review_dashboard(
             'id': sequence_id,
             'partner': partner,
             'recommendation': recommendation,
-            'sequencing_role': str(source.get('SequencingSetRole', '') or ''),
+            'sequencing_role': str(source.get('SequencingSetRole', evidence.get('SequencingSetRole', '')) or ''),
             'marker_qc': qc,
             'marker_review': str(source.get('MarkerReview', evidence.get('MarkerManualReviewStatus', '')) or ''),
             'evidence_quality': str(source.get('EvidenceQuality', '') or ''),
-            'partner_taxon': str(source.get('PartnerTaxon', evidence.get('PartnerTaxon', '')) or ''),
-            'gtdb_taxonomy': str(source.get('GTDBTaxonomy', evidence.get('GTDBTaxonomy', '')) or ''),
+            'partner_taxon': str(source.get('PartnerTaxon', source.get('PartnerExpectedTaxon', evidence.get('PartnerTaxon', ''))) or ''),
+            'already_selected_for_genome_sequencing': str(source.get('AlreadySelectedForGenomeSequencing', '') or '').strip().lower() in {'true', '1', 'yes'},
+            'genome_already_sequenced': str(source.get('GenomeAlreadySequenced', '') or '').strip().lower() in {'true', '1', 'yes'},
+            'sab_decision': str(source.get('SABDecision', '') or ''),
+            'gtdb_taxonomy': str(source.get('GTDBTaxonomy', source.get('Taxonomy', evidence.get('GTDBTaxonomy', ''))) or ''),
             'cultured_gap': str(source.get('CulturedGap', '') or ''),
             'baseline_class': str(source.get('BaselineEvidenceClass', evidence.get('BaselineEvidenceClass', '')) or ''),
             # Prefer the explicit combined cultured-pool field. Older and
@@ -375,7 +445,11 @@ def write_performance_review_dashboard(
             'pangenome_target': pangenome_by_candidate.get(sequence_id, {}).get('target') if sequence_id in pangenome_by_candidate else _dashboard_number(source.get('PangenomeTarget', evidence.get('PangenomeTarget', ''))),
             'recommendation_reason': str(source.get('RecommendationReason', '') or ''),
             'species_context': str(source.get('SpeciesContext', '') or ''),
-            'genome_coverage': str(source.get('GenomeCoverage', '') or ''),
+            'genome_coverage': str(source.get('GenomeCoverage', '') or (
+                'Genome already sequenced' if str(source.get('GenomeAlreadySequenced', '')).strip().lower() in {'true', '1', 'yes'}
+                else 'Selected for sequencing; genome pending' if str(source.get('AlreadySelectedForGenomeSequencing', '')).strip().lower() in {'true', '1', 'yes'}
+                else 'Not currently selected for sequencing'
+            )),
             'local_tree_figure': str(source.get('LocalTreeFigure', evidence.get('LocalNeighbourhoodFigure', '')) or ''),
             'taxonomy': taxonomy,
             'novelty': novelty_comparisons,
@@ -385,6 +459,31 @@ def write_performance_review_dashboard(
             'genome_matches_95': _dashboard_number(novelty_source.get('GenomeCollectionMatchesGE95', '')),
             'genome_representation_interpretation': str(novelty_source.get('GenomeRepresentationInterpretation', '') or ''),
         })
+
+    # An optional live database overlay lets the user update a historical
+    # dashboard after the SAB meeting without rerunning biological analyses.
+    if database_states:
+        decision_labels = {
+            'SAB_APPROVED': 'APPROVED', 'SAB_DECLINED': 'REJECTED',
+            'SAB_DEFERRED': 'DEFERRED',
+        }
+        for record in records:
+            state = database_states.get(record['id'])
+            if state is None:
+                continue
+            selected = bool(state.get('selected'))
+            sequenced = bool(state.get('sequenced'))
+            record['already_selected_for_genome_sequencing'] = selected
+            record['genome_already_sequenced'] = sequenced
+            record['sab_decision'] = decision_labels.get(state.get('status', ''), record.get('sab_decision', ''))
+            if sequenced:
+                record['recommendation'] = 'ALREADY SEQUENCED'
+                record['sequencing_role'] = 'SEQUENCED'
+                record['genome_coverage'] = 'Genome already sequenced'
+            elif selected:
+                record['recommendation'] = 'ALREADY SELECTED - GENOME PENDING'
+                record['sequencing_role'] = 'COMMITTED'
+                record['genome_coverage'] = 'Selected for sequencing; genome pending'
 
     counts = Counter(row['recommendation'] for row in records)
     qc_counts = Counter(row['marker_qc'] for row in records)
@@ -409,8 +508,16 @@ def write_performance_review_dashboard(
         'started_at': manifest.get('started_at', ''),
         'completed_at': manifest.get('completed_at', ''),
         'version': manifest.get('branchmanager_version', ''),
+        'workflow_version': manifest.get('workflow_version', 'Not recorded'),
+        'database_schema_version': (manifest.get('database_identity') or {}).get('schema_version', 'Not recorded'),
+        'database_sha256': (manifest.get('database_identity') or {}).get('sha256', ''),
         'git_revision': manifest.get('git_revision', ''),
+        'database_overlay': bool(database),
+        'database_path': database_identity.get('path', ''),
     }
+    if database:
+        run_info['database_schema_version'] = database_identity.get('schema_version', 'unknown')
+        run_info['database_sha256'] = database_identity.get('sha256', '')
 
     # Aggregate the hierarchy at rank + taxon level. Candidate IDs are
     # deduplicated across repeated local-tree/context rows; when an older
@@ -564,7 +671,7 @@ def write_performance_review_dashboard(
     pangenome_source_rows = len(pangenome_rows)
 
     genome_path = Path(genome_assessment) if genome_assessment else selection_path.with_name('genome_collection_assessment.tsv')
-    genome_rows = _read_tsv_rows(genome_path)
+    genome_rows = database_genome_rows if database else _read_tsv_rows(genome_path)
     genome_records = []
     for row in genome_rows:
         genome_records.append({
@@ -772,14 +879,14 @@ $('pageSize').addEventListener('change',()=>{isolatePage=1;renderTable()});
 $('clearFilters').addEventListener('click',()=>{['search','partnerFilter','recommendationFilter','qcFilter'].forEach(id=>$(id).value='');isolatePage=1;renderTable()});
 $('isolateBody').addEventListener('click',e=>{let b=e.target.closest('[data-open]');if(b)openDetail(D.records.find(x=>x.id===b.dataset.open))});renderTable();
 function box(label,value){return `<div class="detailbox"><small>${esc(label)}</small><strong>${esc(value==null||value===''?'Not available':value)}</strong></div>`}
-function openDetail(x){if(!x)return;$('detailTitle').textContent=x.id;$('detailSubtitle').textContent=`${x.partner} · ${x.recommendation}`;let tax=x.taxonomy.map(t=>`<div class="taxcard"><strong>${esc(t.database)}</strong><div>${pill(t.status)}</div><p><b>Best taxon:</b> ${esc(t.taxon)}</p><p><b>Identity:</b> ${pct(t.identity)} · <b>Query coverage:</b> ${pct(t.query_coverage)} · <b>Reference coverage:</b> ${pct(t.reference_coverage)}</p><p><b>Assigned rank:</b> ${esc(t.rank||'Not available')}</p>${t.explanation?`<p>${esc(t.explanation)}</p>`:''}<p class="lineage">${esc(t.lineage)}</p></div>`).join('');let fig='';if(x.local_tree_figure&&!x.local_tree_figure.match(/^(\.\.|\/)/))fig=`<p><a href="${esc(x.local_tree_figure.startsWith('assessment/')?x.local_tree_figure:'assessment/'+x.local_tree_figure)}" target="_blank" rel="noopener">Open local phylogenetic figure</a></p>`;$('detailContent').innerHTML=`<div class="detailgrid">${box('Marker QC',x.marker_qc)}${box('Manual review',x.marker_review)}${box('Evidence quality',x.evidence_quality)}${box('Sequencing role',x.sequencing_role)}${box('Partner-supplied taxon',x.partner_taxon)}${box('Cultured baseline category',x.baseline_class)}<div class="detailbox"><small>Closest cultured identity</small><strong>${esc(pct(x.baseline_nearest_identity))}</strong><p><b>Nearest hit:</b> ${esc(x.baseline_nearest_hit||'No cultured hit recorded')}</p></div><div class="detailbox"><small>Closest project identity</small><strong>${esc(pct(x.project_nearest_identity))}</strong><p><b>Nearest hit:</b> ${esc(x.project_nearest_hit||'No project hit recorded')}</p>${x.project_identity_warning?`<p class="qc-warning-text">⚠ ${esc(x.project_identity_warning_reason)}</p>`:''}</div>${box('Pangenome group',x.pangenome_rank+' · '+x.pangenome_taxon)}${box('Pangenome gap / target',fmt(x.pangenome_gap)+' / '+fmt(x.pangenome_target))}</div><div class="detailbox" style="margin-top:12px"><small>Closest cultured and project sequence matches</small><div class="taxgrid">${[...(x.cultured_match_details||[]),{key:'Project',...x.project_match_details}].map(m=>`<div class="taxcard"><strong>${esc(m.label)}</strong><p><b>Identity:</b> ${pct(m.identity)}</p><p><b>Nearest hit:</b> ${esc(m.hit||'No hit recorded')}</p><p><b>Query coverage:</b> ${pct(m.query_coverage)} · <b>Aligned length:</b> ${fmt(m.alignment_length)} bp</p></div>`).join('')}</div></div><div class="detailbox"><small>Recommendation explanation</small><p>${esc(({ 'SECONDARY - STRAIN DIVERSITY':'This isolate is identified as a candidate that may add strain diversity to the current collection.','REVIEW BEFORE SELECTION':'The available evidence indicates that this isolate should be reviewed before a sequencing decision is made.','EXCLUDE - BASELINE REDUNDANT':'The assessment identifies a close match in the cultured baseline, so this isolate is not prioritised as an additional genome at present.','LOWER PRIORITY - TARGET MET':'The configured pangenome target is reported as met for the relevant group, so this isolate has a lower sequencing priority.','ALREADY SELECTED - GENOME PENDING':'This isolate is already selected for genome sequencing, but the genome is recorded as pending.','ALREADY SEQUENCED':'A genome is already recorded for this isolate.'})[x.recommendation]||'No plain-language definition is available for this recommendation.')}</p><p><b>Assessment rationale:</b> ${esc(x.recommendation_reason||'No detailed rationale recorded.')}</p></div><div class="detailbox" style="margin-top:12px"><small>Taxonomic evidence across reference databases</small><div class="taxgrid">${tax}</div></div><div class="detailbox" style="margin-top:12px"><small>Additional biological context</small><p>${esc(x.species_context||'No additional species context recorded.')}</p><p>${esc(x.genome_coverage||'')}</p>${fig}</div>`;$('detail').classList.add('open');document.body.style.overflow='hidden'}
+function openDetail(x){if(!x)return;$('detailTitle').textContent=x.id;$('detailSubtitle').textContent=`${x.partner} · ${x.recommendation}`;let tax=x.taxonomy.map(t=>`<div class="taxcard"><strong>${esc(t.database)}</strong><div>${pill(t.status)}</div><p><b>Best taxon:</b> ${esc(t.taxon)}</p><p><b>Identity:</b> ${pct(t.identity)} · <b>Query coverage:</b> ${pct(t.query_coverage)} · <b>Reference coverage:</b> ${pct(t.reference_coverage)}</p><p><b>Assigned rank:</b> ${esc(t.rank||'Not available')}</p>${t.explanation?`<p>${esc(t.explanation)}</p>`:''}<p class="lineage">${esc(t.lineage)}</p></div>`).join('');let fig='';if(x.local_tree_figure&&!x.local_tree_figure.match(/^(\.\.|\/)/))fig=`<p><a href="${esc(x.local_tree_figure.startsWith('assessment/')?x.local_tree_figure:'assessment/'+x.local_tree_figure)}" target="_blank" rel="noopener">Open local phylogenetic figure</a></p>`;$('detailContent').innerHTML=`<div class="detailgrid">${box('Marker QC',x.marker_qc)}${box('Manual review',x.marker_review)}${box('Evidence quality',x.evidence_quality)}${box('SAB decision',x.sab_decision||'Not recorded')}${box('Sequencing role',x.sequencing_role)}${box('Partner-supplied taxon',x.partner_taxon)}${box('Cultured baseline category',x.baseline_class)}<div class="detailbox"><small>Closest cultured identity</small><strong>${esc(pct(x.baseline_nearest_identity))}</strong><p><b>Nearest hit:</b> ${esc(x.baseline_nearest_hit||'No cultured hit recorded')}</p></div><div class="detailbox"><small>Closest project identity</small><strong>${esc(pct(x.project_nearest_identity))}</strong><p><b>Nearest hit:</b> ${esc(x.project_nearest_hit||'No project hit recorded')}</p>${x.project_identity_warning?`<p class="qc-warning-text">⚠ ${esc(x.project_identity_warning_reason)}</p>`:''}</div>${box('Pangenome group',x.pangenome_rank+' · '+x.pangenome_taxon)}${box('Pangenome gap / target',fmt(x.pangenome_gap)+' / '+fmt(x.pangenome_target))}</div><div class="detailbox" style="margin-top:12px"><small>Closest cultured and project sequence matches</small><div class="taxgrid">${[...(x.cultured_match_details||[]),{key:'Project',...x.project_match_details}].map(m=>`<div class="taxcard"><strong>${esc(m.label)}</strong><p><b>Identity:</b> ${pct(m.identity)}</p><p><b>Nearest hit:</b> ${esc(m.hit||'No hit recorded')}</p><p><b>Query coverage:</b> ${pct(m.query_coverage)} · <b>Aligned length:</b> ${fmt(m.alignment_length)} bp</p></div>`).join('')}</div></div><div class="detailbox"><small>Recommendation explanation</small><p>${esc(({ 'SECONDARY - STRAIN DIVERSITY':'This isolate is identified as a candidate that may add strain diversity to the current collection.','REVIEW BEFORE SELECTION':'The available evidence indicates that this isolate should be reviewed before a sequencing decision is made.','EXCLUDE - BASELINE REDUNDANT':'The assessment identifies a close match in the cultured baseline, so this isolate is not prioritised as an additional genome at present.','LOWER PRIORITY - TARGET MET':'The configured pangenome target is reported as met for the relevant group, so this isolate has a lower sequencing priority.','ALREADY SELECTED - GENOME PENDING':'This isolate is already selected for genome sequencing, but the genome is recorded as pending.','ALREADY SEQUENCED':'A genome is already recorded for this isolate.'})[x.recommendation]||'No plain-language definition is available for this recommendation.')}</p><p><b>Assessment rationale:</b> ${esc(x.recommendation_reason||'No detailed rationale recorded.')}</p></div><div class="detailbox" style="margin-top:12px"><small>Taxonomic evidence across reference databases</small><div class="taxgrid">${tax}</div></div><div class="detailbox" style="margin-top:12px"><small>Additional biological context</small><p>${esc(x.species_context||'No additional species context recorded.')}</p><p>${esc(x.genome_coverage||'')}</p>${fig}</div>`;$('detail').classList.add('open');document.body.style.overflow='hidden'}
 $('closeDetail').addEventListener('click',()=>{$('detail').classList.remove('open');document.body.style.overflow='' });$('detail').addEventListener('click',e=>{if(e.target===$('detail'))$('closeDetail').click()});document.addEventListener('keydown',e=>{if(e.key==='Escape'){if($('pangenomeDetail').classList.contains('open'))$('closePangenomeDetail').click();else $('closeDetail').click()}});
 $('exportBtn').addEventListener('click',()=>{let rows=filtered,cols=['id','partner','marker_qc','recommendation','sequencing_role','evidence_quality','partner_taxon','baseline_class','baseline_nearest_identity','baseline_nearest_hit','project_nearest_identity','project_nearest_hit','pangenome_rank','pangenome_taxon','pangenome_gap','recommendation_reason'];let csv=[cols.join(','),...rows.map(x=>cols.map(k=>'"'+String(x[k]??'').replaceAll('"','""')+'"').join(','))].join('\r\n');let a=document.createElement('a'),u=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));a.href=u;a.download='branchmanager_filtered_isolates.csv';a.click();URL.revokeObjectURL(u)});
 const navLinks=[...document.querySelectorAll('.nav a')],sections=navLinks.map(a=>document.querySelector(a.getAttribute('href'))).filter(Boolean);
 if('IntersectionObserver' in window){const io=new IntersectionObserver(entries=>entries.forEach(entry=>{if(entry.isIntersecting){navLinks.forEach(a=>a.classList.toggle('active',a.getAttribute('href')==='#'+entry.target.id))}}),{rootMargin:'-18% 0px -72% 0px'});sections.forEach(s=>io.observe(s))}
 const topButton=$('toTop');window.addEventListener('scroll',()=>topButton.classList.toggle('visible',window.scrollY>450),{passive:true});topButton.addEventListener('click',()=>window.scrollTo({top:0,behavior:'smooth'}));
 document.addEventListener('keydown',e=>{if(e.key==='/'&&!['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName)){e.preventDefault();$('search').focus()}});
-$('runDetails').innerHTML=[['Workflow',D.run.workflow],['Status',D.run.status],['Started',D.run.started_at],['Completed',D.run.completed_at],['BranchManager version',D.run.version],['Git revision',D.run.git_revision]].map(x=>`<div class="detailbox"><small>${esc(x[0])}</small><strong>${esc(x[1]||'Not recorded')}</strong></div>`).join('');
+$('runDetails').innerHTML=[['Workflow',D.run.workflow],['Status',D.run.status],['Started',D.run.started_at],['Completed',D.run.completed_at],['BranchManager version',D.run.version],['Workflow version',D.run.workflow_version],['Database schema version',D.run.database_schema_version],['Database file SHA256',D.run.database_sha256],['Live database overlay',D.run.database_overlay?'Yes':'No'],['Git revision',D.run.git_revision]].map(x=>`<div class="detailbox"><small>${esc(x[0])}</small><strong>${esc(x[1]||'Not recorded')}</strong></div>`).join('');
 })();
 </script></body></html>''')
     html_doc = html_doc.replace('__DATA__', payload)

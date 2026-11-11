@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import shutil
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -14,6 +15,24 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from branchmanager import __version__
+
+
+WORKFLOW_VERSION = '1.1.0'
+
+
+def _database_identity(path: str | Path) -> dict:
+    """Read the applied SQLite schema version without modifying the database."""
+    result = {'database_schema_version': 'unknown'}
+    try:
+        with sqlite3.connect(f'file:{Path(path).resolve()}?mode=ro', uri=True, timeout=5) as conn:
+            exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'").fetchone()
+            if exists:
+                row = conn.execute('SELECT MAX(version) FROM schema_migrations').fetchone()
+                if row and row[0] is not None:
+                    result['database_schema_version'] = str(row[0])
+    except (OSError, sqlite3.Error, ValueError):
+        pass
+    return result
 
 
 STAGE_LABELS = {
@@ -147,6 +166,7 @@ class RunManifest:
         self.tsv_path = self.outdir / 'run_manifest.tsv'
         self.data = {
             'schema_version': '1.0',
+            'workflow_version': WORKFLOW_VERSION,
             'workflow': workflow,
             'stage_label': STAGE_LABELS.get(workflow, workflow.replace('_', ' ').title()),
             'status': 'RUNNING',
@@ -189,6 +209,13 @@ class RunManifest:
 
     def add_input(self, path: str | Path, *, role: str = 'input', required: bool = True) -> dict:
         record = file_record(path, role=role, required=required)
+        if 'database' in str(role).lower() and record.get('kind') == 'file':
+            record.update(_database_identity(path))
+            self.data['database_identity'] = {
+                'schema_version': record['database_schema_version'],
+                'sha256': record.get('sha256', ''),
+                'path': record.get('path', ''),
+            }
         self.data['inputs'].append(record)
         self.write()
         return record
@@ -210,6 +237,13 @@ class RunManifest:
 
     def add_output(self, path: str | Path, *, role: str = 'output', required: bool = True) -> dict:
         record = file_record(path, role=role, required=required)
+        if 'database' in str(role).lower() and record.get('kind') == 'file':
+            record.update(_database_identity(path))
+            self.data['database_identity'] = {
+                'schema_version': record['database_schema_version'],
+                'sha256': record.get('sha256', ''),
+                'path': record.get('path', ''),
+            }
         self.data['outputs'].append(record)
         self.write()
         return record
@@ -237,10 +271,14 @@ class RunManifest:
         os.replace(temporary, self.json_path)
         rows = [('Field', 'Value')]
         for key in (
-            'schema_version', 'workflow', 'stage_label', 'status', 'started_at', 'completed_at',
+            'schema_version', 'workflow_version', 'workflow', 'stage_label', 'status', 'started_at', 'completed_at',
             'branchmanager_version', 'git_revision', 'error',
         ):
             rows.append((key, self.data.get(key, '')))
+        database_identity = self.data.get('database_identity') or {}
+        if database_identity:
+            rows.append(('database_schema_version', database_identity.get('schema_version', 'unknown')))
+            rows.append(('database_sha256', database_identity.get('sha256', '')))
         rows.append(('command', ' '.join(str(item) for item in self.data.get('command', []))))
         for stage in self.data.get('stages', []):
             rows.append((f"stage:{stage['name']}", f"{stage['status']} | {stage.get('detail', '')}"))

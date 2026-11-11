@@ -58,6 +58,12 @@ def test_dashboard_parser_accepts_assessment_directory():
     assert args.output_dir == "review_output/assessment"
 
 
+def test_dashboard_parser_accepts_read_only_database_overlay():
+    parser = build_parser()
+    args = parser.parse_args(["dashboard", "review_output", "--db", "project.sqlite"])
+    assert args.db == "project.sqlite"
+
+
 def test_dashboard_generates_from_run_directory(tmp_path, monkeypatch, capsys):
     run_dir, assessment_dir = _make_run_directory(tmp_path)
     expected_dashboard = run_dir / "performance_review_dashboard.html"
@@ -79,12 +85,13 @@ def test_dashboard_generates_from_run_directory(tmp_path, monkeypatch, capsys):
         fake_write_dashboard,
     )
 
-    result = cmd_dashboard(SimpleNamespace(output_dir=str(run_dir)))
+    result = cmd_dashboard(SimpleNamespace(output_dir=str(run_dir), db='project.sqlite'))
 
     assert result == expected_dashboard
     assert expected_dashboard.is_file()
     assert calls["selection_summary"] == assessment_dir / "selection_summary.tsv"
     assert calls["output_dir"] == run_dir
+    assert calls["kwargs"]["database"] == 'project.sqlite'
 
     assert calls["kwargs"]["sequence_assessment"] == (
         assessment_dir / "sequence_assessment.tsv"

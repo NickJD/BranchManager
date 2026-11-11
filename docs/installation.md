@@ -19,7 +19,7 @@ Install the command-line tools used by the production workflow:
 conda install -c conda-forge biopython vsearch mafft fasttree -y
 ```
 
-Install BranchManager from PyPI once the v1.0.0 package has been published:
+Install BranchManager from PyPI once the v1.1.0 package has been published:
 
 ```bash
 python -m pip install --upgrade BranchManager

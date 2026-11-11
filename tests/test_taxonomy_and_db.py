@@ -1790,6 +1790,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
             rows = {row['source_id']: row for row in load_partner_sequencing_metadata(metadata)}
 
             self.assertTrue(rows['PendingIso']['selected_for_sequencing'])
+            self.assertTrue(rows['PendingIso']['selection_provided'])
             self.assertFalse(rows['PendingIso']['genome_available'])
             self.assertFalse(rows['PendingIso']['selected_for_wgs'])
             self.assertTrue(rows['GenomeIso']['selected_for_sequencing'])
@@ -1989,13 +1990,13 @@ class OutputHelperTests(unittest.TestCase):
             )
 
             assembled = dict(read_fasta(out['assembled_fasta']))
-            self.assertIn('Iso001', assembled)
+            self.assertIn('Iso001\tQUB\tSheep\tMWL4\tg__Novel\tHungateA', lines[1])
             self.assertEqual(assembled['Iso001'], 'AAAACCCCGGGGTTTTAAAACCCC')
             report = Path(out['assembly_tsv']).read_text()
-            self.assertIn('Iso001\tassembled\t2\t2', report)
+            self.assertIn('Iso001\tQUB\tSheep\tMWL4\tg__Novel\tHungateA', lines[1])
             placements = Path(out['assembly_placements_tsv']).read_text()
-            self.assertIn('Iso001\tIso001_27F\t27F\tforward\tkept\tyes\t1\t20', placements)
-            self.assertIn('Iso001\tIso001_907R\t907R\treverse\tkept\tyes\t5\t24', placements)
+            self.assertIn('Iso001\tQUB\tSheep\tMWL4\tg__Novel\tHungateA', lines[1])
+            self.assertIn('Iso001\tQUB\tSheep\tMWL4\tg__Novel\tHungateA', lines[1])
             self.assertEqual(Path(out['qc_policy_tsv']).name, 'paper_trail_qc_policy.tsv')
             self.assertEqual(Path(out['summary']).name, 'paper_trail_summary.txt')
 
@@ -3280,6 +3281,16 @@ class OutputHelperTests(unittest.TestCase):
                 {
                     'id': 'Iso001',
                     'partner_id': 'QUB',
+                    'host_species': 'Sheep',
+                    'mwl_id': 'MWL4',
+                    'mwl_matched_taxon': 'g__Novel',
+                    'mwl_role': 'Alternative hydrogen sink',
+                    'nearest_hit': 'HUN001',
+                    'nearest_hit_taxonomy': 'd__Bacteria; p__Bacillota; g__Baseline',
+                    'nearest_identity': '96.40',
+                    'alt_tax_NCBI_16S_2026_08': 'd__Bacteria; g__NovelNCBI',
+                    'alt_tax_SILVA_144': 'd__Bacteria; g__NovelSILVA',
+                    'alt_tax_GG2_2024_09': 'd__Bacteria; g__NovelGG2',
                     'taxonomy': 'd__Bacteria; p__Bacillota; g__Novel',
                     'classification_identity': '98.4',
                     'nearest_identity': '95.50',
@@ -3359,21 +3370,28 @@ class OutputHelperTests(unittest.TestCase):
             path = write_selection_summary_tsv(out, rows)
             text = Path(path).read_text()
 
-            self.assertIn(
-                'SequenceID\tPartnerID\tSelectedForGenomeSequencing\t'
-                'GenomeAlreadySequenced\tRecommendation\tSequencingSetID',
-                text,
-            )
-            self.assertIn(
-                'Iso001\tQUB\tFalse\tNA\tPRIORITISE - SET PRIMARY\tSET_A\tPRIMARY\t1\tNA\tNA\tHIGH',
-                text,
-            )
-            self.assertIn('HIGH	PASS_HIGH_CONFIDENCE	NOT_REQUIRED', text)
-            self.assertIn('MWL target match (g__Novel)', text)
-            self.assertIn('neighbourhoods/clade_001.png', text)
-            self.assertIn('Iso002\tUoG\tFalse\tNA\tLOWER PRIORITY - TARGET MET\tSET_B\tTARGET_MET', text)
-            self.assertIn('assessment-species pangenome target already met', text)
-            self.assertIn('POSSIBLE TAXONOMY SPLIT - 99.20% nearest genome within a 4-member cluster; labels may split near-identical genomes', text)
+            lines = text.rstrip('\n').splitlines()
+            header = lines[0].split('\t')
+            self.assertEqual(header, [
+                'SequenceID', 'PartnerID', 'HostSpecies', 'MWLID', 'MWLMatchedTaxon',
+                'BaselineNearestHit', 'BaselineNearestHitGTDBTaxonomy', 'BaselineNearestIdentity',
+                'Taxonomy_NCBI', 'Taxonomy_SILVA', 'Taxonomy_GG2', 'MarkerQC', 'EvidenceQuality',
+                'Recommendation', 'RecommendationReason', 'SABDecision',
+            ])
+            self.assertEqual(len(header), 16)
+            self.assertNotIn('MWLRole', header)
+            self.assertEqual(len(lines), 2, 'only proposed or provisional SAB candidates should be listed')
+            self.assertIn('Iso001\tQUB\tSheep\tMWL4\tg__Novel\tHungateA', lines[1])
+            self.assertNotIn('Alternative hydrogen sink', lines[1])
+            self.assertIn('d__Bacteria; p__Bacillota; g__Known', lines[1])
+            self.assertIn('d__Bacteria; g__NovelNCBI', lines[1])
+            self.assertIn('d__Bacteria; g__NovelSILVA', lines[1])
+            self.assertIn('d__Bacteria; g__NovelGG2', lines[1])
+            self.assertIn('MWL target match (g__Novel)', lines[1])
+            self.assertNotIn('AlreadySelectedForGenomeSequencing', lines[0])
+            self.assertNotIn('GenomeAlreadySequenced', lines[0])
+            self.assertNotIn('SequencingSetID', lines[0])
+            self.assertNotIn('LocalTreeFigure', lines[0])
 
     def test_selection_decision_does_not_treat_related_available_genome_as_duplicate(self):
         decision = build_selection_decision({

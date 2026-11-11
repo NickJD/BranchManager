@@ -27,13 +27,125 @@ from branchmanager.pipeline.chimera import _parse_uchime_row
 from branchmanager.pipeline.kinnex import run_kinnex_import
 from branchmanager.pipeline.tree import _orient_tree_input_fasta
 from branchmanager.pipeline.workflow_helpers import build_selection_decision
-from branchmanager.project_state import import_genome_results
+from branchmanager.project_state import import_genome_results, import_status_updates
 from branchmanager.reporting import _manifest_dataset, write_annual_report
-from branchmanager.run_manifest import file_record
+from branchmanager.run_manifest import RunManifest, file_record
 from branchmanager.utils.subprocess import run_cmd
 
 
 class OperationalWorkflowTests(unittest.TestCase):
+    def test_sab_approval_persists_as_a_sequencing_commitment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db = Database(str(root / 'project.sqlite'))
+            db.initialise()
+            db.insert_sequences([('ISO_SAB', 'A' * 900)], dataset='PartnerA')
+            updates = root / 'sab_decisions.tsv'
+            updates.write_text('sequence_id\tstatus\tdetail\nISO_SAB\tSAB_APPROVED\tApproved by SAB\n')
+            result = import_status_updates(db, updates)
+            self.assertEqual(result[0]['result'], 'IMPORTED')
+            metadata = db.get_sequencing_metadata_for_ids(['ISO_SAB'])['ISO_SAB']
+            self.assertTrue(metadata['selected_for_sequencing'])
+            self.assertFalse(metadata['selected_for_wgs'])
+            self.assertEqual(db.get_isolate_statuses(['ISO_SAB'])['ISO_SAB']['status'], 'SAB_APPROVED')
+
+    def test_sab_can_return_selection_summary_with_decision_column(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db = Database(str(root / 'project.sqlite'))
+            db.initialise()
+            db.insert_sequences([('ISO_APPROVE', 'A' * 900), ('ISO_DEFER', 'C' * 900)], dataset='PartnerA')
+            summary = root / 'selection_summary.tsv'
+            summary.write_text(
+                'SequenceID\tPartnerID\tSABDecision\n'
+                'ISO_APPROVE\tPartnerA\tAPPROVE\n'
+                'ISO_DEFER\tPartnerA\tDEFER\n'
+            )
+            result = import_status_updates(db, summary)
+            self.assertEqual([row['result'] for row in result], ['IMPORTED', 'IMPORTED'])
+            metadata = db.get_sequencing_metadata_for_ids(['ISO_APPROVE', 'ISO_DEFER'])
+            self.assertTrue(metadata['ISO_APPROVE']['selected_for_sequencing'])
+            self.assertFalse(metadata['ISO_DEFER']['selected_for_sequencing'])
+            self.assertEqual(db.get_isolate_statuses(['ISO_APPROVE'])['ISO_APPROVE']['status'], 'SAB_APPROVED')
+            self.assertEqual(db.get_isolate_statuses(['ISO_DEFER'])['ISO_DEFER']['status'], 'SAB_DEFERRED')
+
+    def test_stale_partner_catalogue_does_not_erase_sab_commitment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db = Database(str(root / 'project.sqlite'))
+            db.initialise()
+            db.insert_sequences([('ISO_COMMITTED', 'A' * 900)], dataset='PartnerA')
+            db.upsert_sequencing_metadata([{
+                'id': 'ISO_COMMITTED', 'partner_id': 'PartnerA',
+                'selected_for_sequencing': True, 'selected_for_wgs': False,
+            }])
+            catalogue = root / 'partner_catalogue.tsv'
+            catalogue.write_text(
+                'sequence_id\tpartner_id\tselected_for_genome_sequencing\talready_sequenced\n'
+                'ISO_COMMITTED\tPartnerA\tno\tno\n'
+            )
+            from branchmanager.cli_core import _load_partner_metadata_for_run
+            _load_partner_metadata_for_run(
+                Namespace(command='performance-review', partner_metadata=str(catalogue), dataset='PartnerA'),
+                db, str(root / 'run'), {}, ['ISO_COMMITTED'],
+            )
+            metadata = db.get_sequencing_metadata_for_ids(['ISO_COMMITTED'])['ISO_COMMITTED']
+            self.assertTrue(metadata['selected_for_sequencing'])
+
+    def test_explicit_sab_rejection_overrides_stale_positive_catalogue_value(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db = Database(str(root / 'project.sqlite'))
+            db.initialise()
+            db.insert_sequences([('ISO_REJECTED', 'A' * 900)], dataset='PartnerA')
+            decision = root / 'sab_decision.tsv'
+            decision.write_text('SequenceID\tSABDecision\nISO_REJECTED\tREJECT\n')
+            import_status_updates(db, decision)
+            catalogue = root / 'partner_catalogue.tsv'
+            catalogue.write_text(
+                'sequence_id\tpartner_id\tselected_for_genome_sequencing\talready_sequenced\n'
+                'ISO_REJECTED\tPartnerA\tyes\tno\n'
+            )
+            from branchmanager.cli_core import _load_partner_metadata_for_run
+            _load_partner_metadata_for_run(
+                Namespace(command='performance-review', partner_metadata=str(catalogue), dataset='PartnerA'),
+                db, str(root / 'run'), {}, ['ISO_REJECTED'],
+            )
+            metadata = db.get_sequencing_metadata_for_ids(['ISO_REJECTED'])['ISO_REJECTED']
+            self.assertFalse(metadata['selected_for_sequencing'])
+
+    def test_registered_genome_is_recorded_as_sequenced_even_if_genome_qc_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db = Database(str(root / 'project.sqlite'))
+            db.initialise()
+            db.insert_sequences([('ISO_GENOME', 'A' * 900)], dataset='PartnerA')
+            genome_results = root / 'genomes.tsv'
+            genome_results.write_text(
+                'sequence_id\tgenome_id\tgenome_status\tgenome_qc_pass\tcompleteness\tcontamination\n'
+                'ISO_GENOME\tASM001\tGENOME_QC_FAILED\tno\t70\t8\n'
+            )
+            result = import_genome_results(db, genome_results)
+            self.assertEqual(result[0]['result'], 'IMPORTED')
+            metadata = db.get_sequencing_metadata_for_ids(['ISO_GENOME'])['ISO_GENOME']
+            self.assertTrue(metadata['selected_for_wgs'])
+            self.assertFalse(metadata['selected_for_sequencing'])
+            self.assertEqual(db.get_isolate_statuses(['ISO_GENOME'])['ISO_GENOME']['status'], 'GENOME_QC_FAILED')
+
+    def test_run_manifest_records_workflow_and_database_schema_versions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_path = root / 'project.sqlite'
+            Database(str(db_path)).initialise()
+            manifest = RunManifest(root / 'run', 'performance_review', argv=[])
+            manifest.add_input(db_path, role='project_database_before')
+            self.assertEqual(manifest.data['workflow_version'], '1.1.0')
+            self.assertEqual(manifest.data['database_identity']['schema_version'], '6')
+            self.assertEqual(manifest.data['database_identity']['sha256'], file_record(db_path)['sha256'])
+            manifest_tsv = (root / 'run' / 'run_manifest.tsv').read_text()
+            self.assertIn('workflow_version\t1.1.0', manifest_tsv)
+            self.assertIn('database_schema_version\t6', manifest_tsv)
+
     def test_database_context_closes_connection(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db = Database(str(Path(tmpdir) / 'project.sqlite'))

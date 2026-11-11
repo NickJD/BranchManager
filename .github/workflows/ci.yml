@@ -34,11 +34,15 @@ jobs:
           python -m pip install pytest
 
       - name: Run dashboard and reporting regression tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
-          pytest -q \
+          python -m pytest -q \
             tests/test_reporting_dashboard.py \
             tests/test_reporting_dashboard_pangenome_fixes.py \
-            tests/test_demo_dashboard_build.py
+            tests/test_demo_dashboard_build.py \
+            tests/test_validation_toolkit.py \
+            tests/test_taxonomy_and_db.py::OutputHelperTests::test_write_selection_summary_tsv_keeps_board_facing_fields
 
       - name: Check Python syntax
         run: python -m compileall -q src scripts
