@@ -22,6 +22,12 @@ replace biological judgement.
 > taxonomy can all produce apparently unusual results. BranchManager
 > keeps these evidence types separate and flags cases requiring review.
 
+## Explore Sanger Studio
+
+**[Open the interactive Sanger Studio demo](https://nickjd.github.io/BranchManager/sanger-studio-demo/)**
+
+This synthetic-data walkthrough demonstrates isolate/read inventory, per-read QC, resequencing alternatives, simulated chromatograms, consensus review and batch summaries. It is a visual simulation only and does not process AB1 files. [Mock data and source](docs/sanger-studio-demo/) are included.
+
 ## Explore the interactive dashboard
 
 **[Open the BranchManager interactive dashboard
@@ -43,62 +49,18 @@ included in this repository.
 
 ## What BranchManager does
 
-  -----------------------------------------------------------------------
-  Area                                What it provides
-  ----------------------------------- -----------------------------------
-  Sanger Studio                       A local browser interface for
-                                      inspecting AB1/ABI chromatograms,
-                                      organising reads, reviewing
-                                      assemblies and processing batches.
-                                      ZIP archives containing nested
-                                      folders of chromatograms can be
-                                      uploaded directly.
-
-  Mailroom and Interview              Read inventory, sample-map
-                                      preparation, chromatogram QC and
-                                      resequencing triage.
-
-  Paper Trail                         Trimming, quality assessment, read
-                                      orientation, multi-read overlap
-                                      assembly and consensus generation.
-
-  Taxonomic classification            Reference-based classification with
-                                      identity, query coverage, reference
-                                      coverage, supporting hits,
-                                      assignment status and conflict
-                                      reporting.
-
-  Novelty and baseline assessment     Comparisons against project
-                                      baselines and configured external
-                                      references, with explicit evidence
-                                      and limitations.
-
-  Pangenome assessment                GTDB-derived taxonomic grouping,
-                                      genome representation and
-                                      target-gap reporting where the
-                                      necessary evidence is available.
-
-  Genome evidence                     Import and integration of
-                                      genome-derived 16S and genome
-                                      QC/taxonomy evidence.
-
-  Selection and reporting             Candidate panels, primary/backup
-                                      recommendations, decision-focused
-                                      SAB shortlists, quarterly review
-                                      outputs and interactive HTML
-                                      reporting.
-
-  Ground-truth validation             Create and approve checksummed
-                                      reference snapshots, compare
-                                      subsequent runs against approved
-                                      baselines, detect workflow drift
-                                      and generate validation reports.
-
-  Project profiles                    Reusable JSON configuration for
-                                      collection-specific paths,
-                                      references, baselines and workflow
-                                      defaults.
-  -----------------------------------------------------------------------
+| Area | What it provides |
+|---|---|
+| Sanger Studio | A local browser interface for inspecting AB1/ABI chromatograms, organising reads, reviewing assemblies and processing batches. ZIP archives containing nested folders of chromatograms can be uploaded directly. |
+| Mailroom and Interview | Read inventory, sample-map preparation, chromatogram QC and resequencing triage. |
+| Paper Trail | Trimming, quality assessment, read orientation, multi-read overlap assembly and consensus generation. |
+| Taxonomic classification | Reference-based classification with identity, query coverage, reference coverage, supporting hits, assignment status and conflict reporting. |
+| Novelty and baseline assessment | Comparisons against project baselines and configured external references, with explicit evidence and limitations. |
+| Pangenome assessment | GTDB-derived taxonomic grouping, genome representation and target-gap reporting where the necessary evidence is available. |
+| Genome evidence | Import and integration of genome-derived 16S and genome QC/taxonomy evidence. |
+| Selection and reporting | Candidate panels, primary/backup recommendations, decision-focused SAB shortlists, quarterly review outputs and interactive HTML reporting. |
+| Ground-truth validation | Create and approve checksummed reference snapshots, compare subsequent runs against approved baselines, detect workflow drift and generate validation reports. |
+| Project profiles | Reusable JSON configuration for collection-specific paths, references, baselines and workflow defaults. |
 
 BranchManager supports a staged workflow as well as the integrated
 `assistant` command. You can run individual stages when you need to

@@ -107,6 +107,8 @@ def test_dashboard_can_overlay_current_sab_and_genome_status_from_database(tmp_p
             INSERT INTO isolate_status VALUES ('QUB_0001', 'SAB_APPROVED');
             INSERT INTO isolate_status VALUES ('QUB_0002', 'SAB_DEFERRED');
             INSERT INTO isolate_status VALUES ('QUB_0003', 'GENOME_QC_FAILED');
+            INSERT INTO sequences VALUES ('QUB_0001', 'QUB');
+            INSERT INTO sequences VALUES ('QUB_0002', 'QUB');
             INSERT INTO sequences VALUES ('QUB_0003', 'QUB');
             INSERT INTO genome_records VALUES ('QUB_0003', 'GCA_000003.1', 'GENOME_QC_FAILED', 0, 70, 8, '', '', 'QC failed');
         """)
@@ -125,6 +127,11 @@ def test_dashboard_can_overlay_current_sab_and_genome_status_from_database(tmp_p
     assert records['QUB_0003']['genome_already_sequenced'] is True
     assert data['counts']['selected_pending'] == 1
     assert data['counts']['already_sequenced'] == 1
+    assert data['counts']['partner_lifecycle']['QUB']['total'] == 3
+    assert data['counts']['partner_lifecycle']['QUB']['selected_pending'] == 1
+    assert data['counts']['partner_lifecycle']['QUB']['sequenced'] == 1
+    assert data['counts']['partner_lifecycle']['QUB']['remaining'] == 1
+    assert 'partnerLifecycleBody' in page
     assert len(data['genome_records']) == 1
     assert data['run']['database_overlay'] is True
     assert data['run']['database_schema_version'] == '6'
@@ -457,3 +464,85 @@ def test_dashboard_displays_nearest_cultured_and_project_hits_from_novelty_metri
     assert 'Closest cultured and project sequence matches' in html
     assert 'H1000-P-2558860977' in html
     assert 'BSI_0065' in html
+
+
+def test_dashboard_uses_full_partner_catalogue_for_counts_explorer_and_pangenome(tmp_path):
+    assessment = tmp_path / 'assessment'
+    assessment.mkdir()
+    _write_tsv(assessment / 'selection_summary.tsv', [{
+        'SequenceID': 'QUB_MARKER_1', 'PartnerID': 'QUB',
+        'Recommendation': 'PRIORITISE - SET PRIMARY', 'MarkerQC': 'PASS_HIGH_CONFIDENCE',
+        'PangenomeRank': 'GENUS', 'PangenomeTaxon': 'Blautia',
+        'PangenomeEligible': 'Yes', 'PangenomeTarget': '9',
+        'PangenomeCommittedGenomeCount': '1',
+    }])
+    _write_tsv(assessment / 'pangenome_hierarchy.tsv', [{
+        'PangenomeRank': 'GENUS', 'PangenomeTaxon': 'Blautia',
+        'CandidateCount': '1', 'CommittedGenomeCount': '1', 'PangenomeTarget': '9',
+        'PangenomeEligible': 'Yes', 'CandidateIDs': 'QUB_MARKER_1',
+        'CommittedGenomeIDs': 'QUB_MARKER_1',
+    }])
+    db_path = tmp_path / 'project.sqlite'
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript('''
+            CREATE TABLE sequences (id TEXT PRIMARY KEY, dataset TEXT, baseline_tier TEXT);
+            CREATE TABLE taxonomy (id TEXT, taxonomy TEXT, confidence REAL, dataset TEXT);
+            CREATE TABLE sequencing_metadata (id TEXT PRIMARY KEY, selected_for_sequencing INTEGER, selected_for_wgs INTEGER, operational_status TEXT);
+            CREATE TABLE genome_records (sequence_id TEXT, genome_id TEXT, genome_status TEXT, genome_qc_pass INTEGER, completeness REAL, contamination REAL, gtdb_taxonomy TEXT, genome_path TEXT, notes TEXT);
+            INSERT INTO sequences VALUES ('QUB_MARKER_1','QUB','');
+            INSERT INTO sequences VALUES ('QUB_SELECTED_2','QUB','');
+            INSERT INTO sequences VALUES ('BSI_003','BSI','');
+            INSERT INTO sequences VALUES ('UOG_004','UoG','');
+            INSERT INTO taxonomy VALUES ('QUB_MARKER_1','d__Bacteria;g__Blautia',99,'QUB');
+            INSERT INTO taxonomy VALUES ('QUB_SELECTED_2','d__Bacteria;g__Blautia',99,'QUB');
+            INSERT INTO taxonomy VALUES ('BSI_003','d__Bacteria;g__Blautia',99,'BSI');
+            INSERT INTO taxonomy VALUES ('UOG_004','d__Bacteria;g__OtherGenus',99,'UoG');
+            INSERT INTO sequencing_metadata VALUES ('QUB_SELECTED_2',1,0,'SAB_APPROVED');
+        ''')
+    output = Path(write_performance_review_dashboard(assessment / 'selection_summary.tsv', tmp_path, database=db_path))
+    page = output.read_text(encoding='utf-8')
+    embedded = re.search(r'<script id="dashboard-data" type="application/json">(.*?)</script>', page, re.S)
+    data = json.loads(embedded.group(1))
+    assert data['counts']['total'] == 1  # marker assessment remains assessment-only
+    assert data['counts']['registered_total'] == 4
+    assert data['counts']['partners'] == {'QUB': 2, 'BSI': 1, 'UoG': 1}
+    assert data['counts']['registered_selected'] == 1
+    explorer = {row['id']: row for row in data['explorer_records']}
+    assert set(explorer) == {'QUB_MARKER_1', 'QUB_SELECTED_2', 'BSI_003', 'UOG_004'}
+    assert explorer['QUB_SELECTED_2']['recommendation'] == 'ALREADY SELECTED - GENOME PENDING'
+    genus = next(row for row in data['pangenome'] if row['taxon'] == 'Blautia')
+    member_ids = {member['id'] for member in genus['members']}
+    assert {'QUB_MARKER_1', 'QUB_SELECTED_2', 'BSI_003'} <= member_ids
+
+
+def test_dashboard_uses_full_assessment_not_shortlist_and_keeps_failed_qc_visible(tmp_path):
+    assessment_dir = tmp_path / 'assessment'
+    assessment_dir.mkdir()
+    _write_tsv(assessment_dir / 'sequence_assessment.tsv', [
+        {'ID': 'QUB_0001', 'PartnerID': 'QUB', 'MarkerQCClass': 'PASS_HIGH_CONFIDENCE',
+         'SequencingSetRole': 'PRIMARY', 'AlreadySelectedForGenomeSequencing': 'False',
+         'GenomeAlreadySequenced': 'False'},
+        {'ID': 'UoG_0001', 'PartnerID': 'UoG', 'MarkerQCClass': 'FAIL_QC',
+         'MarkerQCRecommendation': 'RESEQUENCE', 'SequencingSetRole': 'REVIEW_EVIDENCE',
+         'AlreadySelectedForGenomeSequencing': 'False', 'GenomeAlreadySequenced': 'False'},
+        {'ID': 'UoG_0002', 'PartnerID': 'UoG', 'MarkerQCClass': 'PASS_WITH_WARNINGS',
+         'SequencingSetRole': 'DIVERSITY_CANDIDATE', 'AlreadySelectedForGenomeSequencing': 'False',
+         'GenomeAlreadySequenced': 'False'},
+    ])
+    _write_tsv(assessment_dir / 'selection_summary.tsv', [{
+        'SequenceID': 'QUB_0001', 'PartnerID': 'QUB',
+        'Recommendation': 'PRIORITISE - SET PRIMARY', 'MarkerQC': 'PASS_HIGH_CONFIDENCE',
+    }])
+    dashboard = Path(write_performance_review_dashboard(
+        assessment_dir / 'selection_summary.tsv', tmp_path,
+        sequence_assessment=assessment_dir / 'sequence_assessment.tsv',
+    ))
+    html = dashboard.read_text(encoding='utf-8')
+    embedded = re.search(r'<script id="dashboard-data" type="application/json">(.*?)</script>', html, re.S)
+    data = json.loads(embedded.group(1))
+    assert data['counts']['total'] == 3
+    assert data['counts']['qc']['FAIL_QC'] == 1
+    assert len(data['explorer_records']) == 3
+    failed = next(row for row in data['explorer_records'] if row['id'] == 'UoG_0001')
+    assert failed['marker_qc'] == 'FAIL_QC'
+    assert failed['recommendation'] == 'REVIEW BEFORE SELECTION'

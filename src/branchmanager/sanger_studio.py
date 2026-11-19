@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import copy
+import hashlib
 import json
 import mimetypes
 import os
@@ -292,6 +293,10 @@ def _read_normalised_read_map(path: str | Path) -> tuple[dict[str, dict[str, str
             'primer': _row_get(row, ('primer', 'primer_name')),
             'direction': _row_get(row, ('direction', 'orientation', 'read_direction')),
             'processing_mode': mode,
+            'attempt_id': _row_get(row, ('attempt_id',)),
+            'attempt_group': _row_get(row, ('attempt_group',)),
+            'source_path': _row_get(row, ('source_path',)),
+            'source_sha256': _row_get(row, ('source_sha256',)),
             'partner_id': _row_get(row, ('partner_id', 'partner')),
             'dataset': _row_get(row, ('dataset', 'cohort_dataset')),
         }
@@ -2567,6 +2572,72 @@ class SangerStudio:
         self.last_inspection[sequence_id] = result
         return result
 
+    def assign_candidate_taxonomy(self, data: dict) -> dict:
+        """Run the standard conservative VSEARCH taxonomy screen on a retained candidate.
+
+        Candidate taxonomy is deliberately calculated from the exact selected
+        assembly/fallback sequence, not inferred from the component-read calls.
+        """
+        sequence_id = str(data.get('sequence_id') or '').strip()
+        candidate_id = str(data.get('candidate_id') or '').strip()
+        inspection = self.last_inspection.get(sequence_id)
+        if not inspection:
+            raise ValueError(f'No current inspection is available for {sequence_id!r}. Inspect the isolate first.')
+        if not self.screen_ref or not Path(self.screen_ref).is_file():
+            raise ValueError('Choose a valid taxonomy reference FASTA before assigning candidate taxonomy.')
+        candidate = next((row for row in inspection.get('assembly_candidates', [])
+                          if str(row.get('CandidateID') or '') == candidate_id), None)
+        if not candidate:
+            raise ValueError(f'Candidate {candidate_id!r} is not part of the current inspection.')
+        sequence = ''.join(str(candidate.get('Sequence') or '').split()).upper()
+        if not sequence or any(base not in 'ACGTNRYKMSWBDHV-' for base in sequence):
+            raise ValueError('The selected candidate does not contain a valid nucleotide sequence.')
+        if '-' in sequence:
+            raise ValueError('Candidate sequence contains alignment gaps and cannot be taxonomically screened.')
+
+        run_id = uuid.uuid4().hex[:12]
+        safe_candidate_id = re.sub(r'[^A-Za-z0-9_.-]+', '_', candidate_id).strip('._')[:100] or 'candidate'
+        run_dir = self.jobs / sequence_id / 'candidate_taxonomy' / f'{safe_candidate_id}_{run_id}'
+        run_dir.mkdir(parents=True, exist_ok=False)
+        query_fasta = run_dir / 'selected_candidate.fasta'
+        query_id = f'candidate_{run_id}'
+        query_fasta.write_text(f'>{query_id}\n' + '\n'.join(sequence[i:i+70] for i in range(0, len(sequence), 70)) + '\n', encoding='utf-8')
+        read = paper_trail.SangerRead(
+            read_id=query_id, sequence_id=sequence_id, primer='selected_candidate',
+            direction='forward', source_file='', raw_sequence=sequence,
+            raw_qualities=[], trimmed_sequence=sequence,
+        )
+        summaries, report_path = paper_trail._screen_primer_read_taxonomy(
+            [read], query_fasta, run_dir, ref_fasta=self.screen_ref,
+            taxa_tsv=self.screen_taxa or None, threads=4,
+        )
+        summary = summaries.get(query_id, {})
+        hit_rows = _read_tsv(run_dir / 'read_taxonomy_screen' / 'read_taxonomy_hits.tsv')
+        hits = [row for row in hit_rows if str(row.get('ReadID') or '') == query_id]
+        result = {
+            'sequence_id': sequence_id, 'candidate_id': candidate_id,
+            'candidate_type': ('INDIVIDUAL_READ' if len([x for x in str(candidate.get('ReadIDs') or '').split(';') if x]) <= 1 else 'ASSEMBLY'),
+            'sequence_length': len(sequence),
+            'sequence_sha256': hashlib.sha256(sequence.encode('ascii')).hexdigest(),
+            'taxonomy': summary.get('taxonomy', 'NA'),
+            'assigned_rank': summary.get('assigned_rank', 'NA'),
+            'status': summary.get('status', 'UNRESOLVED'),
+            'support': summary.get('support', 'NO_QUALIFYING_REFERENCE_HITS'),
+            'best_hit': summary.get('best_hit', ''),
+            'best_identity': summary.get('best_identity'),
+            'best_query_coverage': summary.get('best_query_coverage'),
+            'best_target_coverage': summary.get('best_target_coverage'),
+            'qualified_hit_count': summary.get('qualified_hit_count', 0),
+            'near_best_hit_count': summary.get('near_best_hit_count', 0),
+            'hits': hits, 'run_directory': str(run_dir),
+            'report_path': str(report_path or ''),
+            'reference': str(Path(self.screen_ref).resolve()),
+        }
+        (run_dir / 'candidate_taxonomy_result.json').write_text(
+            json.dumps(result, indent=2, ensure_ascii=False) + '\n', encoding='utf-8',
+        )
+        return result
+
     def process_all(self, data: dict) -> dict:
         """Run Paper Trail once across the loaded map and create a download bundle."""
         if not self.map_rows:
@@ -2944,6 +3015,8 @@ def serve(*, port: int = 8765, open_browser: bool = True) -> None:
                     self._json(200, studio.save_marker_review(payload))
                 elif self.path == '/api/inspect':
                     self._json(200, studio.inspect(payload))
+                elif self.path == '/api/assign-candidate-taxonomy':
+                    self._json(200, studio.assign_candidate_taxonomy(payload))
                 elif self.path == '/api/process-all':
                     self._json(200, studio.process_all(payload))
                 elif self.path == '/api/review':

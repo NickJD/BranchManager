@@ -21,7 +21,7 @@
 .panel-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.panel-heading h3{margin:0;font-size:16px}.panel-heading p{margin:4px 0 12px;color:var(--muted);font-size:12px}
 .sequence-toolbar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:9px 0;border-top:1px solid #edf1f5;font-size:11px;color:#52647a}.sequence-toolbar span:last-child{margin-left:auto}.legend-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}.blue-dot{background:#2474c6}.red-dot{background:#c64d53}.amber-dot{background:#d99a28}
 .sequence-scroll{max-height:260px;overflow:auto;border:1px solid #e4eaf1;border-radius:9px;padding:12px;background:#fbfcfe}.consensus-seq{font:600 13px/2.05 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere;word-break:break-all;letter-spacing:.025em}.base{display:inline-block;min-width:9px;text-align:center;border-radius:2px;cursor:pointer}.base:hover{background:#dcecff;outline:1px solid #8bb8e7}.base.discordant{background:#ffe1e2;color:#a52d37;text-decoration:underline;text-decoration-color:#c64d53;text-decoration-thickness:2px}.base.ambiguous{background:#fff0cc;color:#895600;font-weight:900}.sequence-inspector{min-height:36px;margin-top:9px;padding:9px 11px;border-radius:8px;background:#f3f6fa;font-size:12px;color:#43556b}.review-note{font-size:11px;color:#66778c;margin-top:9px}
-.candidate-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px}.candidate-card{border:1px solid #e0e7ef;border-radius:10px;padding:12px;background:#fcfdff;min-width:0}.candidate-top{display:flex;justify-content:space-between;gap:8px;align-items:center}.candidate-top>b{overflow-wrap:anywhere}.candidate-length{font-size:25px;font-weight:800;margin:10px 0 2px}.candidate-length small{font-size:12px;color:var(--muted);font-weight:500}.candidate-card p{font-size:11px;color:#50637a;overflow-wrap:anywhere;margin:4px 0 8px}.candidate-meta{font-size:11px;color:#52647a;margin-bottom:7px}.candidate-card>small{font-size:10px;color:var(--muted)}
+.candidate-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px}.candidate-card{border:1px solid #e0e7ef;border-radius:10px;padding:12px;background:#fcfdff;min-width:0}.candidate-card[hidden]{display:none!important}.candidate-top{display:flex;justify-content:space-between;gap:8px;align-items:center}.candidate-top>b{overflow-wrap:anywhere}.candidate-length{font-size:25px;font-weight:800;margin:10px 0 2px}.candidate-length small{font-size:12px;color:var(--muted);font-weight:500}.candidate-card p{font-size:11px;color:#50637a;overflow-wrap:anywhere;margin:4px 0 8px}.candidate-meta{font-size:11px;color:#52647a;margin-bottom:7px}.candidate-card>small{font-size:10px;color:var(--muted)}
 .diagnostics{margin:9px 0;background:white;border:1px solid var(--line);border-radius:10px;overflow:hidden}.diagnostics summary{cursor:pointer;padding:13px 15px;font-weight:700;color:#344b64;background:#f8fafc;list-style-position:inside}.diagnostics[open] summary{border-bottom:1px solid var(--line)}.diagnostics .readscroll{padding:8px 12px}.position-table{max-height:420px}.position-table .reads{min-width:650px}
 @media(max-width:800px){.review-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.panel-heading{flex-direction:column}.panel-heading button{width:100%}.review-hero{flex-direction:column}.sequence-toolbar span:last-child{margin-left:0}}
 
@@ -39,7 +39,9 @@
 .trace-read-options input{accent-color:#2474c6}
 .trace-read-unavailable{opacity:.55}
 .trace-count-summary{font-size:10px;color:var(--muted);margin:4px 1px 9px}
-.trace-controls{grid-column:1/-1;display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:10px 12px;margin:8px 0 2px;background:#f5f8fc;border:1px solid var(--line);border-radius:8px;font-size:11px}.trace-controls label{display:flex;align-items:center;gap:7px;font-weight:700}.trace-controls select{border:1px solid #cbd5e1;border-radius:6px;padding:6px 9px;background:#fff;color:var(--ink)}.trace-control-note{color:var(--muted);font-size:10px}.trace-overlay-card{grid-column:1/-1}.trace-overlay-svg{height:340px}.trace-overlay-toggle input{accent-color:#2474c6}.trace-review-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:12px;margin-top:10px;align-items:stretch}.trace-read-card{border:1px solid var(--line);border-radius:9px;padding:12px;min-width:0;background:#fff}.trace-read-card h4{margin:0 0 6px;font-size:12px}.trace-read-card .trace-meta{font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.45}.trace-svg{width:100%;height:250px;display:block;background:#fbfcfe;border:1px solid #e6ebf2;border-radius:6px}.trace-note{font-size:11px;color:var(--muted);margin:7px 0}.trace-legend{display:flex;gap:12px;flex-wrap:wrap;font-size:10px;margin:7px 0}.trace-legend span{font-weight:700}.trace-no-data{padding:18px;background:#fff8e8;color:#875600;border-radius:6px;font-size:11px}.trace-review-grid>.trace-no-data{grid-column:1/-1}.trace-review-grid:has(>.trace-read-card:only-of-type){grid-template-columns:minmax(0,1fr)}</style>
+.trace-controls{grid-column:1/-1;display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:10px 12px;margin:8px 0 2px;background:#f5f8fc;border:1px solid var(--line);border-radius:8px;font-size:11px}.trace-controls label{display:flex;align-items:center;gap:7px;font-weight:700}.trace-controls select{border:1px solid #cbd5e1;border-radius:6px;padding:6px 9px;background:#fff;color:var(--ink)}.trace-control-note{color:var(--muted);font-size:10px}.trace-overlay-card{grid-column:1/-1}.trace-overlay-svg{height:340px}.trace-overlay-toggle input{accent-color:#2474c6}.trace-review-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:12px;margin-top:10px;align-items:stretch}.trace-read-card{border:1px solid var(--line);border-radius:9px;padding:12px;min-width:0;background:#fff}.trace-read-card h4{margin:0 0 6px;font-size:12px}.trace-read-card .trace-meta{font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.45}.trace-svg{width:100%;height:250px;display:block;background:#fbfcfe;border:1px solid #e6ebf2;border-radius:6px}.trace-note{font-size:11px;color:var(--muted);margin:7px 0}.trace-legend{display:flex;gap:12px;flex-wrap:wrap;font-size:10px;margin:7px 0}.trace-legend span{font-weight:700}.trace-no-data{padding:18px;background:#fff8e8;color:#875600;border-radius:6px;font-size:11px}.trace-review-grid>.trace-no-data{grid-column:1/-1}.trace-review-grid:has(>.trace-read-card:only-of-type){grid-template-columns:minmax(0,1fr)}
+.candidate-kind{display:inline-block;align-self:flex-start;padding:3px 7px;border-radius:5px;background:#edf3fa;color:#345a7d;font-size:9px;font-weight:800;letter-spacing:.04em}.candidate-card[hidden]{display:none!important}.candidate-component-count{display:inline-block;margin-left:6px;padding:2px 6px;border-radius:10px;background:#f1f5f9;color:#475569;font-size:10px;font-weight:700}.candidate-read-chip{display:inline-block;margin:2px 3px 2px 0;padding:2px 6px;border:1px solid #d8e2ec;border-radius:5px;background:#f8fafc;color:#334155;font-size:10px}.selection-bridge{margin:8px 0 10px;padding:9px 12px;border:1px solid #cfe0f1;border-radius:8px;background:#f4f8fd;color:#284b70;font-size:11px;line-height:1.5;overflow-wrap:anywhere}.candidate-taxonomy-result{margin-top:12px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:#f8fbff;font-size:12px}.candidate-taxonomy-result:empty{display:none}.candidate-taxonomy-result h4{margin:0 0 7px}.candidate-taxonomy-result p{margin:5px 0}.read-taxonomy-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:8px;margin:8px 0 14px}.read-taxonomy-card{border:1px solid var(--line);border-radius:8px;background:#fff;min-width:0}.read-taxonomy-card summary{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:10px;cursor:pointer}.read-taxonomy-card summary span:nth-child(2){flex:1;min-width:180px;overflow-wrap:anywhere}.taxon-status{font-size:10px;color:var(--muted);font-weight:700}.read-taxonomy-detail{padding:0 10px 10px;font-size:11px}.trace-hover-readout{margin-top:7px;padding:8px 10px;border-radius:7px;background:#f1f6fc;border:1px solid #cbdced;font:11px/1.5 ui-monospace,monospace;min-height:36px;overflow-wrap:anywhere}.trace-svg{cursor:crosshair}#primerReadSelectionPanel input[type=checkbox]{width:17px;height:17px;accent-color:#2474c6;cursor:pointer}
+</style>
 </head>
 <body>
 <div class="wrap">
@@ -507,7 +509,9 @@ function renderTaxonomyResults(r){
  if(!reads.length){
   html+='<p class="taxon-muted">The taxonomy screen ran, but no per-read assignments were produced. Check the taxonomy-screen output files and the run manifest.</p>';
  } else {
-  html+='<h4>Per-read taxonomy assignments</h4><div class="readscroll"><table class="reads qualityreads taxonomy-summary"><thead><tr><th>Read</th><th>Best reference hit</th><th>Identity</th><th>Query coverage</th><th>Target coverage</th><th>Taxonomy</th><th>Assigned rank</th><th>Qualified hits</th><th>Near-best hits</th><th>Classification status</th><th>Support</th></tr></thead><tbody>';
+  html+='<h4>Per-read taxonomy assignments</h4><div class="read-taxonomy-cards">';
+  html+=reads.map(x=>`<details class="read-taxonomy-card"><summary><b>${esc(x.ID)}</b><span>${esc(x.Taxon||'No assignment')}</span><span class="taxon-status">${esc(x.ReadClassificationStatus||'UNKNOWN')}</span></summary><div class="read-taxonomy-detail"><p><b>Best reference:</b> ${esc(x.BestHit||'—')} · <b>Identity:</b> ${esc(x.Identity||'—')}% · <b>Query coverage:</b> ${esc(x.QueryCoverage||'—')}% · <b>Target coverage:</b> ${esc(x.TargetCoverage||'—')}%</p><p><b>Assigned rank:</b> ${esc(x.AssignedRank||'NA')} · <b>Qualified hits:</b> ${esc(x.QualifiedHitCount??'0')} · <b>Near-best hits:</b> ${esc(x.NearBestHitCount??'0')} · <b>Support:</b> ${esc(x.TaxonomySupport||'—')}</p><div class="readscroll"><table class="reads qualityreads"><thead><tr><th>Reference</th><th>Taxonomy</th><th>Identity</th><th>Query coverage</th><th>Target coverage</th><th>Qualified</th><th>Near-best</th></tr></thead><tbody>${hits.filter(h=>h.ReadID===x.ID).slice(0,10).map(h=>`<tr><td>${esc(h.TargetID)}</td><td>${esc(h.Taxonomy||'—')}</td><td>${esc(h.Identity)}%</td><td>${esc(h.QueryCoverage)}%</td><td>${esc(h.TargetCoverage)}%</td><td>${esc(h.Qualified)}</td><td>${esc(h.NearBest)}</td></tr>`).join('')||'<tr><td colspan="7">No candidate reference hits.</td></tr>'}</tbody></table></div></div></details>`).join('');
+  html+='</div><div class="readscroll"><table class="reads qualityreads taxonomy-summary"><thead><tr><th>Read</th><th>Best reference hit</th><th>Identity</th><th>Query coverage</th><th>Target coverage</th><th>Taxonomy</th><th>Assigned rank</th><th>Qualified hits</th><th>Near-best hits</th><th>Classification status</th><th>Support</th></tr></thead><tbody>';
   html+=reads.map(x=>`<tr><td>${esc(x.ID)}</td><td>${esc(x.BestHit||'—')}</td><td>${esc(x.Identity||'—')}${x.Identity?'%':''}</td><td>${esc(x.QueryCoverage||'—')}${x.QueryCoverage?'%':''}</td><td>${esc(x.TargetCoverage||'—')}${x.TargetCoverage?'%':''}</td><td>${esc(x.Taxon||'No taxonomy assigned')}</td><td>${esc(x.AssignedRank||'NA')}</td><td>${esc(x.QualifiedHitCount??'0')}</td><td>${esc(x.NearBestHitCount??'0')}</td><td>${esc(x.ReadClassificationStatus||'UNKNOWN')}</td><td>${esc(x.TaxonomySupport||'—')}</td></tr>`).join('');
   html+='</tbody></table></div>';
   html+='<h4>Candidate reference hits</h4><p class="taxon-muted">Near-best hits are within the configured identity window of the best qualifying hit. Qualified indicates that identity and query/target coverage filters were met.</p>';
@@ -562,7 +566,7 @@ function renderResult(r){
   <div><b>${single}</b><span>Single-read positions</span></div>
  </div>
  <section class="review-panel">
-  <div class="panel-heading"><div><h3>Consensus sequence</h3><p>Ambiguous bases and read disagreements are highlighted. Select a base to inspect its evidence.</p></div><button class="blue" id="downloadConsensus">Download consensus FASTA</button></div>
+  <div class="panel-heading"><div><h3>Consensus sequence</h3><p>Ambiguous bases and read disagreements are highlighted. Select a base to inspect its evidence.</p></div><button class="blue" id="downloadConsensus" disabled>Download candidate FASTA</button></div>
   <div class="sequence-toolbar"><span><i class="legend-dot blue-dot"></i> Consensus</span><span><i class="legend-dot red-dot"></i> Read disagreement</span><span><i class="legend-dot amber-dot"></i> Ambiguous base</span><span class="muted">${consensus.length.toLocaleString()} positions</span></div>
   <div class="sequence-scroll">${seqHtml}</div>
   <div class="sequence-inspector" id="baseInspector">Select a nucleotide above to see its position-level evidence.</div>
@@ -580,22 +584,162 @@ function renderResult(r){
   <div class="trace-legend"><span style="color:#16a34a">A</span><span style="color:#2563eb">C</span><span style="color:#374151">G</span><span style="color:#dc2626">T</span><span>Vertical marker = called peak</span></div>
   <div id="traceReviewContent" class="trace-review-grid"><p class="trace-note">Select a nucleotide in the consensus or alignment to inspect its supporting chromatograms.</p></div>
  </section>
- <section class="review-panel">
-  <div class="panel-heading"><div><h3>Select the assembly to retain</h3><p>Choose one sequence for this isolate. QC-failed reads are included only in clearly flagged review candidates; selecting one is an explicit override, not a change to automated QC.</p></div><span class="small">${ranked.length} sequence-bearing candidates</span></div>
-  <div class="candidate-grid">${ranked.map((x,i)=>`<article class="candidate-card ${x.IncludesFailedRead==='yes'?'candidate-override':''}"><div class="candidate-top"><b>${esc(x.CandidateID)}</b><span class="candidate-qc ${String(x.QCClass).includes('PASS_HIGH')?'pass':String(x.QCClass).includes('PASS')?'warn':'fail'}">${esc(x.QCClass)}</span></div><div class="candidate-length">${x.len.toLocaleString()} <small>bp</small></div><p>${esc(x.ReadIDs||'Read set not recorded')}</p><div class="candidate-meta">Overlap: ${esc(x.OverlapLength||'—')} bp · Identity: ${Number.isFinite(Number(x.OverlapIdentity))?(Number(x.OverlapIdentity)*100).toFixed(2)+'%':'—'} · Ambiguous overlap conflicts: ${esc(x.AmbiguousConflicts||x.Conflicts||'0')}</div>${x.IncludesFailedRead==='yes'?`<div class="override-warning">Includes read(s) failing read-level QC: ${esc(x.ReadQC||'see read QC table')}</div>`:''}<small>${esc(x.Reasons||'No additional QC warnings reported')}</small><button class="candidate-select" data-candidate="${esc(x.CandidateID)}" ${x.Sequence?'':'disabled'}>Select this sequence</button></article>`).join('')||'<p class="muted">No sequence-bearing candidates were generated.</p>'}</div>
-  <div class="selection-footer"><span id="candidateSelectionStatus">No candidate selected for final extraction.</span><button class="blue" id="downloadSelectedCandidate" disabled>Download selected FASTA</button><button class="secondary" id="downloadSelectedBatch" ${Object.keys(selectedAssemblySequences).length?'':'disabled'}>Download selected isolates FASTA (${Object.keys(selectedAssemblySequences).length})</button></div>
-  <p class="help">The selected candidate is exported using its exact stored sequence from assembly_candidates.fasta. Selecting it does not alter the original automated result or QC classification.</p>
+ <details class="diagnostics"><summary>Read quality and trimming evidence (${r.reads.length} reads)</summary><div class="readscroll"><table class="reads qualityreads"><thead><tr><th>Read</th><th>Attempt / submission</th><th>Primer / direction</th><th>QC</th><th>Raw bp</th><th>Trimmed bp</th><th>Trim coordinates</th><th>Mean Q</th><th>Expected errors</th><th>Masked N%</th><th>Trace / peak evidence</th><th>Reason</th></tr></thead><tbody>${r.reads.map(x=>`<tr><td>${esc(x.ReadID)}</td><td>${esc(x.AttemptID||'—')}<small>${esc(x.AttemptGroup||'')}</small></td><td>${esc(x.Primer)} / ${esc(x.Direction)}</td><td>${esc(x.QCClass)}</td><td>${esc(x.RawLength)}</td><td>${esc(x.TrimmedLength)}</td><td>${esc(x.TrimStart)}–${esc(x.TrimEnd)}</td><td>${esc(x.MeanTrimmedQuality)}</td><td>${esc(x.TrimmedExpectedErrors)}</td><td>${esc(x.MaskedNPercent)}%</td><td>Trace ${esc(x.TraceAvailable)} · PCON ${esc(x.QualityAvailable)} · mixed peaks ${esc(x.MixedPeakCount)}</td><td>${esc(x.Reasons||'—')}</td></tr>`).join('')}</tbody></table></div></details>
+ <section class="review-panel" id="primerReadSelectionPanel">
+  <div class="panel-heading"><div><h3>1. Select the read to retain for each primer</h3><p>Repeated reads for the same primer are alternatives. Compare their QC and chromatogram evidence above, then select one attempt per primer. Only these selections are eligible for assembly.</p></div><span class="small" id="primerSelectionSummary"></span></div>
+  <div class="selection-bridge" id="selectedReadSummary">Selected reads will be listed here.</div>
+  <div class="readscroll"><table class="reads qualityreads"><thead><tr><th>Primer</th><th>Read / attempt</th><th>Submission</th><th>QC</th><th>Trimmed bp</th><th>Mean Q</th><th>Expected errors</th><th>Masked N%</th><th>Include</th></tr></thead><tbody id="primerReadChoices"></tbody></table></div>
+  <p class="help">Only one read can be active per primer. Untick the active read to exclude that primer entirely; ticking another attempt replaces the previous choice. Only checked reads are considered for assembly. QC status is never changed by selection.</p>
  </section>
- <details class="diagnostics"><summary>Read quality and trimming evidence (${r.reads.length} reads)</summary><div class="readscroll"><table class="reads qualityreads"><thead><tr><th>Read</th><th>Primer / direction</th><th>QC</th><th>Raw bp</th><th>Trimmed bp</th><th>Trim coordinates</th><th>Mean Q</th><th>Expected errors</th><th>Masked N%</th><th>Trace / peak evidence</th><th>Reason</th></tr></thead><tbody>${r.reads.map(x=>`<tr><td>${esc(x.ReadID)}</td><td>${esc(x.Primer)} / ${esc(x.Direction)}</td><td>${esc(x.QCClass)}</td><td>${esc(x.RawLength)}</td><td>${esc(x.TrimmedLength)}</td><td>${esc(x.TrimStart)}–${esc(x.TrimEnd)}</td><td>${esc(x.MeanTrimmedQuality)}</td><td>${esc(x.TrimmedExpectedErrors)}</td><td>${esc(x.MaskedNPercent)}%</td><td>Trace ${esc(x.TraceAvailable)} · PCON ${esc(x.QualityAvailable)} · mixed peaks ${esc(x.MixedPeakCount)}</td><td>${esc(x.Reasons||'—')}</td></tr>`).join('')}</tbody></table></div></details>
+ <section class="review-panel">
+  <div class="panel-heading"><div><h3>2. Select the assembly or read to retain</h3><p>These candidates are generated from the reads selected above. Assemblies use distinct primers; individual-read fallbacks remain available when no suitable overlap exists.</p></div><span class="small" id="candidateCountSummary">${ranked.length} sequence-bearing candidates</span></div>
+  <div class="candidate-grid">${ranked.map((x,i)=>`<article class="candidate-card ${x.IncludesFailedRead==='yes'?'candidate-override':''}"><div class="candidate-top"><b>${esc(x.CandidateID)}</b><span class="candidate-qc ${String(x.QCClass).includes('PASS_HIGH')?'pass':String(x.QCClass).includes('PASS')?'warn':'fail'}">${esc(x.QCClass)}</span></div><div class="candidate-kind">${String(x.ReadIDs||'').split(';').filter(Boolean).length<=1?'INDIVIDUAL READ FALLBACK':'ASSEMBLY CANDIDATE'}<span class="candidate-component-count">${String(x.ReadIDs||'').split(';').filter(Boolean).length} component read(s)</span></div><div class="candidate-length">${x.len.toLocaleString()} <small>bp</small></div><div class="candidate-read-chips">${String(x.ReadIDs||'').split(';').map(id=>id.trim()).filter(Boolean).map(id=>`<span class="candidate-read-chip">${esc(id)}</span>`).join('')||'No component reads recorded'}</div><div class="candidate-meta">Overlap: ${esc(x.OverlapLength||'—')} bp · Identity: ${Number.isFinite(Number(x.OverlapIdentity))?(Number(x.OverlapIdentity)*100).toFixed(2)+'%':'—'} · Ambiguous overlap conflicts: ${esc(x.AmbiguousConflicts||x.Conflicts||'0')}</div>${x.IncludesFailedRead==='yes'?`<div class="override-warning">Includes read(s) failing read-level QC: ${esc(x.ReadQC||'see read QC table')}</div>`:''}<small>${esc(x.Reasons||'No additional QC warnings reported')}</small><button class="candidate-select" data-candidate="${esc(x.CandidateID)}" ${x.Sequence?'':'disabled'}>Select this sequence</button></article>`).join('')||'<p class="muted">No sequence-bearing candidates were generated.</p>'}</div>
+  <div class="selection-footer"><span id="candidateSelectionStatus">No candidate selected for final extraction.</span><button class="secondary" id="assignCandidateTaxonomy" disabled>Assign taxonomy to selected sequence</button><button class="blue" id="downloadSelectedCandidate" disabled>Download selected FASTA</button><button class="secondary" id="downloadSelectedBatch" ${Object.keys(selectedAssemblySequences).length?'':'disabled'}>Download selected isolates FASTA (${Object.keys(selectedAssemblySequences).length})</button></div>
+  <div id="candidateTaxonomyResult" class="candidate-taxonomy-result" aria-live="polite"></div><p class="help">The selected candidate is exported using its exact stored sequence from assembly_candidates.fasta. Taxonomy is screened independently on that exact candidate sequence; component-read assignments are not inherited.</p>
+ </section>
+
  <details class="diagnostics"><summary>Read overlaps and assembly diagnostics (${r.overlap_candidates?.length||0} pairs)</summary><div class="readscroll"><table class="reads qualityreads"><thead><tr><th>Read A</th><th>Read B</th><th>Overlap</th><th>Identity</th><th>Outcome</th><th>Reason</th></tr></thead><tbody>${(r.overlap_candidates||[]).map(x=>`<tr><td>${esc(x.ReadA)}</td><td>${esc(x.ReadB)}</td><td>${esc(x.OverlapLength)} bp</td><td>${(Number(x.Identity)*100).toFixed(2)}%</td><td>${String(x.Accepted).toLowerCase()==='yes'?'Accepted':'Rejected'}</td><td>${esc(x.Reason)}</td></tr>`).join('')}</tbody></table></div></details>
  <details class="diagnostics"><summary>Full per-position evidence (${ev.length.toLocaleString()} positions)</summary><div class="readscroll position-table"><table class="reads qualityreads"><thead><tr><th>Position</th><th>Consensus</th><th>Supporting reads</th><th>Observed bases</th><th>Disagreement</th><th>Evidence class</th></tr></thead><tbody>${ev.map(x=>`<tr><td>${esc(x.ConsensusPosition)}</td><td><b>${esc(x.ConsensusBase)}</b></td><td>${esc(x.SupportingReads)}</td><td>${esc(x.ObservedBases)}</td><td>${esc(x.Disagreement)}</td><td>${esc(x.EvidenceClass)}</td></tr>`).join('')}</tbody></table></div></details>`;
- $('#downloadConsensus').onclick=()=>{const seq=activeConsensus||consensus;const label=selectedCandidate?selectedCandidate.CandidateID:'consensus';dl(`${r.sequence_id}_${label}.fasta`,`>${r.sequence_id}|${label}|${selectedCandidate?.QCClass||r.qc_class}\n${(seq.match(/.{1,70}/g)||[]).join('\n')}\n`,'text/x-fasta');};
+ $('#downloadConsensus').onclick=()=>{const seq=activeConsensus;if(!seq)return;const label=selectedCandidate?selectedCandidate.CandidateID:'candidate_preview';dl(`${r.sequence_id}_${label}.fasta`,`>${r.sequence_id}|${label}|${selectedCandidate?.QCClass||r.qc_class}\n${(seq.match(/.{1,70}/g)||[]).join('\n')}\n`,'text/x-fasta');};
  let selectedCandidate=null;
  const candidateById=new Map(ranked.map(x=>[x.CandidateID,x]));
- const selectedStatus=$('#candidateSelectionStatus');
+  // Stage 1: select exactly one read for each primer. Defaults favour passing
+  // QC, then higher mean quality and longer trimmed reads.
+  const primerGroups=new Map();
+  (r.reads||[]).forEach(read=>{
+    const primer=String(read.Primer||'').trim();
+    if(!primer)return;
+    if(!primerGroups.has(primer))primerGroups.set(primer,[]);
+    primerGroups.get(primer).push(read);
+  });
+  const readPrimerById=new Map();
+  const selectedReadByPrimer=new Map();
+  const qcRank=q=>q==='PASS_HIGH_CONFIDENCE'?3:q==='PASS_WITH_WARNINGS'?2:q==='FAIL_QC'?0:1;
+  const choiceBody=$('#primerReadChoices');
+  if(choiceBody){
+    const rows=[];
+    [...primerGroups.entries()].sort((a,b)=>a[0].localeCompare(b[0])).forEach(([primer,reads])=>{
+      reads.sort((a,b)=>qcRank(b.QCClass)-qcRank(a.QCClass)||
+        (Number(b.MeanTrimmedQuality)||0)-(Number(a.MeanTrimmedQuality)||0)||
+        (Number(b.TrimmedLength)||0)-(Number(a.TrimmedLength)||0));
+      const defaultRead=reads.find(x=>x.QCClass!=='FAIL_QC')||reads[0];
+      selectedReadByPrimer.set(primer,defaultRead.ReadID);
+      reads.forEach(read=>{
+        readPrimerById.set(read.ReadID,primer);
+        rows.push(`<tr><td>${esc(primer)}</td><td><b>${esc(read.ReadID)}</b><small>${esc(read.AttemptID||'Single attempt')}</small></td><td><small>${esc(read.AttemptGroup||read.SourcePath||read.SourceFile||'—')}</small></td><td>${esc(read.QCClass)}</td><td>${esc(read.TrimmedLength)}</td><td>${esc(read.MeanTrimmedQuality)}</td><td>${esc(read.TrimmedExpectedErrors)}</td><td>${esc(read.MaskedNPercent)}%</td><td><input type="checkbox" name="primer-choice-${esc(primer).replace(/[^a-zA-Z0-9_-]/g,'_')}" value="${esc(read.ReadID)}" data-primer="${esc(primer)}" ${read.ReadID===defaultRead.ReadID?'checked':''} aria-label="Use ${esc(read.ReadID)} for primer ${esc(primer)}"></td></tr>`);
+      });
+    });
+    choiceBody.innerHTML=rows.join('');
+  }
+  function applyPrimerReadChoices(){
+    const grid=$('.candidate-grid');
+    const selectedIds=[...selectedReadByPrimer.values()];
+    const selectedSet=new Set(selectedIds);
+    const compatibleCandidates=[];
+    if(grid)grid.querySelectorAll('.candidate-card').forEach(card=>{
+      const candidate=candidateById.get(card.querySelector('.candidate-select')?.dataset.candidate);
+      const ids=String(candidate?.ReadIDs||'').split(';').map(x=>x.trim()).filter(Boolean);
+      const primers=ids.map(id=>readPrimerById.get(id));
+      // A candidate must consist entirely of currently selected reads and
+      // must never contain two attempts from the same primer.
+      const compatible=ids.length>0 &&
+        ids.every((id,i)=>selectedSet.has(id)&&!!primers[i]) &&
+        new Set(primers).size===primers.length;
+      card.hidden=!compatible;
+      card.setAttribute('aria-hidden',compatible?'false':'true');
+      if(compatible)compatibleCandidates.push(candidate);
+    });
+    const summary=$('#primerSelectionSummary');
+    if(summary)summary.textContent=`${selectedIds.length} read(s) selected across ${selectedReadByPrimer.size} primer(s) · ${compatibleCandidates.length} compatible candidate(s)`;
+    const readSummary=$('#selectedReadSummary');
+    if(readSummary)readSummary.textContent=selectedIds.length
+      ?`Selected for assembly (${selectedIds.length}): ${selectedIds.join(' · ')}`
+      :'No reads selected. Select at least one read above to enable candidate review.';
+    const countNode=$('#candidateCountSummary');
+    if(countNode)countNode.textContent=`${compatibleCandidates.length} compatible candidate(s)`;
+    if(selectedCandidate && !compatibleCandidates.some(x=>x.CandidateID===selectedCandidate.CandidateID)){
+      selectedCandidate=null;
+      selectedStatus.textContent='Read selection changed; select a compatible sequence again.';
+      selectedDownload.disabled=true;
+      $('#assignCandidateTaxonomy').disabled=true;
+      $('#candidateTaxonomyResult').innerHTML='';
+      grid?.querySelectorAll('.candidate-card').forEach(card=>card.classList.remove('chosen'));
+    }
+    // The preview is always derived from the current selection. It is not a
+    // retained/exportable candidate until the user explicitly selects it.
+    const preview=compatibleCandidates[0]||null;
+    if(preview?.Sequence){
+      if(!selectedCandidate)activateCandidateAlignment(preview);
+      $('#downloadConsensus').disabled=!selectedCandidate;
+      grid?.querySelectorAll('.candidate-card').forEach(card=>card.classList.remove('viewer-active'));
+      grid?.querySelector(`[data-candidate="${CSS.escape(preview.CandidateID)}"]`)?.closest('.candidate-card')?.classList.add('viewer-active');
+    }else{
+      activeConsensus='';
+      alignmentPosition=0;
+      const emptyRange=$('#alignmentRange'), emptyStart=$('#alignmentStart');
+      if(emptyRange){emptyRange.min='1';emptyRange.max='1';emptyRange.value='1';emptyRange.disabled=true;}
+      if(emptyStart){emptyStart.min='1';emptyStart.max='1';emptyStart.value='1';emptyStart.disabled=true;}
+      if($('#alignmentWindowLabel'))$('#alignmentWindowLabel').textContent='0 / 0';
+      if($('#nextDisagreement'))$('#nextDisagreement').disabled=true;
+      $('#downloadConsensus').disabled=true;
+      const emptySequenceHeading=$('#consensusSeq')?.closest('.review-panel')?.querySelector('.panel-heading h3');
+      if(emptySequenceHeading)emptySequenceHeading.textContent='Candidate sequence';
+      const emptySequenceMetric=document.querySelector('.review-metrics > div > span');
+      if(emptySequenceMetric)emptySequenceMetric.textContent='Sequence bp';
+      const emptyAlignmentHeading=$('#readAlignmentPanel .panel-heading h3');
+      if(emptyAlignmentHeading)emptyAlignmentHeading.textContent='Multiple-read alignment';
+      const emptyAlignmentSubheading=$('#readAlignmentPanel .panel-heading p');
+      if(emptyAlignmentSubheading)emptyAlignmentSubheading.textContent='No candidate is active for the current primer selections.';
+      alignmentReads=[];
+      activeEvidence=[];
+      activeDisagreements=[];
+      activeReviewPositions=[];
+      const seq=$('#consensusSeq'); if(seq)seq.innerHTML='<span class="muted">No assembly candidate is compatible with the current read selections.</span>';
+      const aln=$('#readAlignment'); if(aln)aln.innerHTML='';
+      const trace=$('#traceReviewContent'); if(trace)trace.innerHTML='<p class="trace-note">No compatible candidate is available for chromatogram projection.</p>';
+      const tracePosition=$('#tracePositionLabel'); if(tracePosition)tracePosition.textContent='No active candidate';
+      selectedCandidate=null; selectedDownload.disabled=true; $('#assignCandidateTaxonomy').disabled=true; $('#candidateTaxonomyResult').innerHTML='';
+      const status=$('#alignmentStatus'); if(status)status.textContent='No compatible assembly candidate. Review the selected reads and overlap diagnostics.';
+      const inspector=$('#baseInspector'); if(inspector)inspector.textContent='No candidate sequence is currently available.';
+      const metricValues=document.querySelectorAll('.review-metrics > div > b');
+      if(metricValues[0])metricValues[0].textContent='—';
+      if(metricValues[1])metricValues[1].textContent='0';
+      if(metricValues[2])metricValues[2].textContent='0';
+      if(metricValues[3])metricValues[3].textContent='0';
+    }
+  }
+  choiceBody?.addEventListener('change',event=>{
+    const input=event.target.closest('input[data-primer]');
+    if(!input)return;
+    const primer=input.dataset.primer;
+    // Any change to the primer set invalidates the previous final choice.
+    // The newly compatible candidate is only a preview until explicitly selected.
+    selectedCandidate=null;
+    selectedDownload.disabled=true;
+    $('#assignCandidateTaxonomy').disabled=true;
+    $('#candidateTaxonomyResult').innerHTML='';
+    selectedStatus.textContent='Read selection changed; review the updated candidates and select one to retain.';
+    if(input.checked){
+      selectedReadByPrimer.set(primer,input.value);
+      choiceBody.querySelectorAll(`input[data-primer="${CSS.escape(primer)}"]`).forEach(other=>{if(other!==input)other.checked=false;});
+    }else if(selectedReadByPrimer.get(primer)===input.value){
+      selectedReadByPrimer.delete(primer);
+    }
+    applyPrimerReadChoices();
+  });
+  const selectedStatus=$('#candidateSelectionStatus');
  const selectedDownload=$('#downloadSelectedCandidate');
  function activateCandidateAlignment(candidate){
    activeConsensus=String(candidate.Sequence||'').toUpperCase();
+   const alignmentRange=$('#alignmentRange'), alignmentStart=$('#alignmentStart');
+   if(alignmentRange){alignmentRange.disabled=false;alignmentRange.max=String(Math.max(1,activeConsensus.length));}
+   if(alignmentStart){alignmentStart.disabled=false;alignmentStart.max=String(Math.max(1,activeConsensus.length));}
+   if($('#nextDisagreement'))$('#nextDisagreement').disabled=false;
+   const candidateReadCount=String(candidate.ReadIDs||'').split(';').filter(Boolean).length;
+   const sequenceHeading=$('#consensusSeq')?.closest('.review-panel')?.querySelector('.panel-heading h3');
+   if(sequenceHeading)sequenceHeading.textContent=candidateReadCount<=1?'Selected individual-read sequence':'Selected assembly consensus';
+   const sequenceMetric=document.querySelector('.review-metrics > div > span');
+   if(sequenceMetric)sequenceMetric.textContent=candidateReadCount<=1?'Selected read bp':'Consensus bp';
    alignmentReads=(r.candidate_read_alignments||{})[candidate.CandidateID]||[];
    // Recalculate evidence against the selected candidate, never reuse the
    // default assembly's position table for a different sequence. N/other
@@ -615,6 +759,11 @@ function renderResult(r){
      const observed=String(x.ObservedBases||'').split(';').filter(b=>b && b!=='-');
      return new Set(observed).size>1 && observed.length>1;
    });
+   const metricValues=document.querySelectorAll('.review-metrics > div > b');
+   if(metricValues[0])metricValues[0].textContent=activeConsensus.length.toLocaleString();
+   if(metricValues[1])metricValues[1].textContent=String(alignmentReads.length);
+   if(metricValues[2])metricValues[2].textContent=String(activeDisagreements.length);
+   if(metricValues[3])metricValues[3].textContent=String(activeEvidence.filter(x=>String(x.EvidenceClass||'').includes('SINGLE_READ')).length);
    const seqNode=$('#consensusSeq');
    if(seqNode)seqNode.innerHTML=[...activeConsensus].map((b,i)=>`<span class="base ${b==='N'?'ambiguous':''} ${String(activeEvidence[i]?.Disagreement).toLowerCase()==='yes'?'discordant':''}" data-active-pos="${i}" title="Position ${i+1}; ${esc(activeEvidence[i]?.ObservedBases||'')}; ${esc(activeEvidence[i]?.EvidenceClass||'')}">${b}</span>`).join('');
    $('#readAlignmentPanel .panel-heading h3').textContent=`Multiple-read alignment · ${candidate.CandidateID}`;
@@ -646,12 +795,27 @@ function renderResult(r){
        btn.closest('.candidate-card')?.classList.add('chosen');
        selectedStatus.textContent=`Selected ${candidate.CandidateID} · ${candidate.len.toLocaleString()} bp · ${candidate.QCClass}`;
        selectedDownload.disabled=false;
+       $('#assignCandidateTaxonomy').disabled=false;
+       $('#candidateTaxonomyResult').innerHTML='';
      }catch(error){
        selectedStatus.textContent=`Candidate selection failed: ${error?.message||String(error)}`;
        console.error('Sanger Studio candidate selection failed',error);
      }
    });
  }
+ const assignTaxonomyButton=$('#assignCandidateTaxonomy');
+ assignTaxonomyButton.onclick=async()=>{
+   if(!selectedCandidate)return;
+   const host=$('#candidateTaxonomyResult');
+   assignTaxonomyButton.disabled=true; assignTaxonomyButton.textContent='Assigning taxonomy…';
+   host.innerHTML='<p class="taxon-muted">Running VSEARCH against the configured reference using the exact selected candidate sequence…</p>';
+   try{
+     const result=await api('/api/assign-candidate-taxonomy',{sequence_id:r.sequence_id,candidate_id:selectedCandidate.CandidateID});
+     const hits=(result.hits||[]).slice(0,20);
+     host.innerHTML=`<h4>Taxonomy assigned to selected ${result.candidate_type==='INDIVIDUAL_READ'?'individual read':'assembly'}</h4><p><b>Assignment:</b> ${esc(result.taxonomy||'NA')} · <b>Rank:</b> ${esc(result.assigned_rank||'NA')} · <b>Status:</b> ${esc(result.status||'UNKNOWN')}</p><p><b>Best hit:</b> ${esc(result.best_hit||'—')} · <b>Identity:</b> ${result.best_identity==null?'—':Number(result.best_identity).toFixed(3)+'%'} · <b>Query coverage:</b> ${result.best_query_coverage==null?'—':Number(result.best_query_coverage).toFixed(2)+'%'} · <b>Target coverage:</b> ${result.best_target_coverage==null?'—':Number(result.best_target_coverage).toFixed(2)+'%'}</p><p><b>Qualified hits:</b> ${esc(result.qualified_hit_count)} · <b>Near-best hits:</b> ${esc(result.near_best_hit_count)} · <b>Support:</b> ${esc(result.support||'—')}</p><details><summary>Candidate reference hits (${hits.length}${(result.hits||[]).length>20?' shown of '+result.hits.length:''})</summary><div class="readscroll"><table class="reads qualityreads"><thead><tr><th>Reference</th><th>Taxonomy</th><th>Identity</th><th>Query coverage</th><th>Target coverage</th><th>Qualified</th><th>Near-best</th></tr></thead><tbody>${hits.map(h=>`<tr><td>${esc(h.TargetID)}</td><td>${esc(h.Taxonomy||'—')}</td><td>${esc(h.Identity)}%</td><td>${esc(h.QueryCoverage)}%</td><td>${esc(h.TargetCoverage)}%</td><td>${esc(h.Qualified)}</td><td>${esc(h.NearBest)}</td></tr>`).join('')||'<tr><td colspan="7">No reference hits.</td></tr>'}</tbody></table></div></details><p class="taxon-muted">This assignment applies to ${esc(result.candidate_id)} (${esc(result.sequence_length)} bp), not automatically to its component reads or the isolate as a whole.</p>`;
+   }catch(error){host.innerHTML=`<p class="error">Candidate taxonomy assignment failed: ${esc(error.message)}</p>`;}
+   finally{assignTaxonomyButton.disabled=!selectedCandidate;assignTaxonomyButton.textContent='Assign taxonomy to selected sequence';}
+ };
  selectedDownload.onclick=()=>{if(!selectedCandidate)return;const name=`${r.sequence_id}|${selectedCandidate.CandidateID}|${selectedCandidate.QCClass}`;dl(`${r.sequence_id}_${selectedCandidate.CandidateID}.fasta`,`>${name}\n${(selectedCandidate.Sequence.match(/.{1,70}/g)||[]).join('\n')}\n`,'text/x-fasta');selectedAssemblySequences[r.sequence_id]={candidate:selectedCandidate,sequence:selectedCandidate.Sequence};$('#downloadSelectedBatch').disabled=false;$('#downloadSelectedBatch').textContent=`Download selected isolates FASTA (${Object.keys(selectedAssemblySequences).length})`;};
  $('#downloadSelectedBatch').onclick=()=>{const records=Object.entries(selectedAssemblySequences).map(([id,v])=>`>${id}|${v.candidate.CandidateID}|${v.candidate.QCClass}\n${(v.sequence.match(/.{1,70}/g)||[]).join('\n')}`).join('\n');if(records)dl('SangerStudio_selected_assemblies.fasta',records+'\n','text/x-fasta');};
  renderActiveSequence();
@@ -679,6 +843,11 @@ function renderResult(r){
    $('#baseInspector').innerHTML=`<b>Position ${position+1} · ${esc(x.ConsensusBase||activeConsensus[position]||'')}</b> &nbsp; Supporting reads: ${esc(x.SupportingReads||'—')} &nbsp; Observed: ${esc(x.ObservedBases||'—')} &nbsp; <span>${esc(x.EvidenceClass||'')}</span>${coordText}`;
  }
  const traceColours={A:'#16a34a',C:'#2563eb',G:'#374151',T:'#dc2626'};
+ const traceComplement={A:'T',C:'G',G:'C',T:'A'};
+ function orientedTraceBase(base,direction){
+   const value=String(base||'').toUpperCase();
+   return String(direction||'').toLowerCase().startsWith('rev')?(traceComplement[value]||value):value;
+ }
  function trimmedPositionAt(read,position){
    const stored=Number((read.read_positions||[])[position]);
    if(Number.isFinite(stored)&&stored>0)return stored;
@@ -695,12 +864,105 @@ function renderResult(r){
  let traceOverlayMode=true;
  let traceAmplitudeMode='normalised';
  let traceSelectedReadIds=null;
+ function attachTraceHover(svg, series, rangeForX){
+   if(!svg||!series?.length)return;
+   const card=svg.closest('.trace-read-card')||svg.parentElement;
+   let readout=card.querySelector('.trace-hover-readout');
+   if(!readout){
+     readout=document.createElement('div');
+     readout.className='trace-hover-readout';
+     readout.setAttribute('aria-live','polite');
+     readout.textContent='Move the pointer across the chromatogram to inspect channel support.';
+     svg.insertAdjacentElement('afterend',readout);
+   }
+   const inspect=event=>{
+     try{
+       const rect=svg.getBoundingClientRect();
+       if(!rect.width)return;
+       const viewBox=svg.viewBox?.baseVal;
+       const vbWidth=viewBox?.width||1400;
+       const vbHeight=viewBox?.height||300;
+       const pointerX=Math.max(0,Math.min(vbWidth,(event.clientX-rect.left)/rect.width*vbWidth));
+       let cursor=svg.querySelector('[data-trace-hover-cursor="true"]');
+       if(!cursor){
+         cursor=document.createElementNS('http://www.w3.org/2000/svg','line');
+         cursor.setAttribute('data-trace-hover-cursor','true');
+         cursor.setAttribute('stroke','#0f172a');
+         cursor.setAttribute('stroke-width','2');
+         cursor.setAttribute('stroke-dasharray','3 3');
+         cursor.setAttribute('pointer-events','none');
+         cursor.setAttribute('y1','18');
+         cursor.setAttribute('y2',String(vbHeight-32));
+         svg.appendChild(cursor);
+       }
+       // SVG viewBoxes include left/right plot margins. Clamp the hover line
+       // into the plot and use that exact plot coordinate for both the cursor
+       // and sample mapping so the visual marker cannot disagree with readout.
+       const leftMargin=48, rightMargin=28;
+       const plotFraction=Math.max(0,Math.min(1,
+         ((event.clientX-rect.left)/rect.width*vbWidth-leftMargin)/
+         Math.max(1,vbWidth-leftMargin-rightMargin)
+       ));
+       const plotX=leftMargin+plotFraction*Math.max(1,vbWidth-leftMargin-rightMargin);
+       cursor.setAttribute('x1',String(plotX));
+       cursor.setAttribute('x2',String(plotX));
+       const lines=series.map(item=>{
+         const requested=rangeForX(plotFraction,item);
+         const sampleBin=Math.max(item.lo,Math.min(item.hi,Math.round(requested)));
+         const values=Object.fromEntries('ACGT'.split('').map(base=>{
+           const channel=item.channels?.[base];
+           return [base,Number(channel?.[sampleBin]??0)];
+         }));
+         const total=Object.values(values).reduce((a,b)=>a+b,0);
+         const dominant=Object.entries(values).sort((a,b)=>b[1]-a[1])[0];
+         const shares=Object.entries(values).map(([base,value])=>
+           `${base} ${(total?100*value/total:0).toFixed(1)}%`).join(' · ');
+         const alignedCalled=String(item.read?.aligned_sequence||'')[item.consensusPosition]||'—';
+         const rawIndex=Number(item.rawBaseIndex);
+         const rawCalled=orientedTraceBase(String(item.trace?.sequence||'')[rawIndex]||'—',item.read?.direction||item.trace?.direction);
+         const quality=Number(item.trace?.qualities?.[rawIndex]);
+         const secondary=orientedTraceBase(String(item.trace?.secondary_peak_bases?.[rawIndex]||''),item.read?.direction||item.trace?.direction);
+         const ratio=Number(item.trace?.secondary_peak_ratios?.[rawIndex]);
+         const binSize=Math.max(1,Number(item.binSize||1));
+         const rawSampleStart=sampleBin*binSize+1;
+         const rawSampleEnd=Math.min(Number(item.trace?.trace_length||rawSampleStart),rawSampleStart+binSize-1);
+         const peakSample=Number(item.trace?.peak_locations?.[rawIndex]);
+         const peakSignals=Object.fromEntries('ACGT'.split('').map(base=>[
+           base,Number(item.trace?.peak_channel_signals?.[String(item.read?.direction||item.trace?.direction||'').toLowerCase().startsWith('rev')?(traceComplement[base]||base):base]?.[rawIndex]??0)
+         ]));
+         const peakTotal=Object.values(peakSignals).reduce((a,b)=>a+b,0);
+         const peakShares=Object.entries(peakSignals).map(([base,value])=>
+           `${base} ${(peakTotal?100*value/peakTotal:0).toFixed(1)}%`).join(' · ');
+         return `<b>${esc(item.read?.read_id||'Read')}</b> · hovered trace bin ${sampleBin+1} (raw samples ${rawSampleStart}–${rawSampleEnd}; max-pooled display) · dominant channel ${dominant?.[0]||'—'} · ${shares}<br>Mapped AB1 peak ${Number.isFinite(peakSample)?peakSample+1:'—'} · raw AB1 call ${esc(rawCalled)} · aligned call ${esc(alignedCalled)} · oriented peak-channel support ${peakShares}${Number.isFinite(quality)?` · Q${quality}`:''}${secondary&&Number.isFinite(ratio)?` · secondary oriented channel ${esc(secondary)} (${ratio.toFixed(2)})`:''}`;
+       });
+       readout.innerHTML=lines.join('<br>');
+     }catch(error){
+       readout.textContent=`Unable to inspect this trace position: ${error?.message||String(error)}`;
+       console.warn('Sanger Studio chromatogram hover failed',error);
+     }
+   };
+   // Pointer events cover mouse, pen and touch-capable devices. Keep mousemove
+   // as a fallback for older browsers; the shared handler is idempotent.
+   svg.addEventListener('pointermove',inspect);
+   svg.addEventListener('mousemove',inspect);
+   svg.addEventListener('pointerleave',()=>{
+     const cursor=svg.querySelector('[data-trace-hover-cursor="true"]');
+     if(cursor)cursor.setAttribute('visibility','hidden');
+   });
+   svg.addEventListener('pointerenter',()=>{
+     const cursor=svg.querySelector('[data-trace-hover-cursor="true"]');
+     if(cursor)cursor.setAttribute('visibility','visible');
+   });
+   card.addEventListener('mouseleave',()=>{
+     readout.textContent='Move the pointer across the chromatogram to inspect channel support.';
+   });
+ }
  function renderTraceReview(position){
    const host=$('#traceReviewContent'); if(!host)return;
    $('#tracePositionLabel').textContent=`Consensus position ${position+1}`;
    const rows=alignmentReads.map(read=>{
      const rp=trimmedPositionAt(read,position);
-     const trace=(read.trace_review||{})[read.read_id];
+     const trace=(r.trace_review||{})[read.read_id];
      return rp>0?{read,rp,trace}:null;
    }).filter(Boolean);
    const usable=rows.filter(x=>x.trace&&x.trace.available&&(x.trace.channels||{}).A);
@@ -752,11 +1014,12 @@ function renderResult(r){
        const peak=Number(trace.peak_locations?.[rawBaseIndex]??-1);
        const binSize=Math.max(1,Number(trace.bin_size||1));
        const peakBin=peak>=0?Math.floor(peak/binSize):-1;
-       const channels=trace.channels||{};
+       const rawChannels=trace.channels||{};
+       const channels=Object.fromEntries('ACGT'.split('').map(base=>[base,rawChannels[isReverse?(traceComplement[base]||base):base]||[]]));
        const n=Math.max(...Array.from('ACGT').map(b=>(channels[b]||[]).length),1);
        const lo=span===null?0:Math.max(0,peakBin-span);
        const hi=span===null?n-1:Math.min(n-1,peakBin+span);
-       return {read,rp,trace,rawBaseIndex,peakBin,channels,n,lo,hi};
+       return {read,rp,trace,rawBaseIndex,peakBin,channels,n,lo,hi,binSize,consensusPosition:position};
      }).filter(x=>x.peakBin>=0);
      if(!prepared.length){
        host.innerHTML=controls+'<div class="trace-no-data">The selected reads do not have valid called-peak coordinates at this position.</div>';
@@ -784,7 +1047,9 @@ function renderResult(r){
        const centre=xFor(0);
        const tickOffsets=span===null?[-1000,-500,0,500,1000].filter(v=>v>=minOffset&&v<=maxOffset):[-span,-Math.round(span/2),0,Math.round(span/2),span].filter((v,i,a)=>a.indexOf(v)===i);
        const ticks=tickOffsets.map(v=>`<line x1="${xFor(v)}" y1="${top+gh}" x2="${xFor(v)}" y2="${top+gh+5}" stroke="#64748b"/><text x="${xFor(v)}" y="${height-8}" text-anchor="middle" font-size="11" fill="#64748b">${v===0?'Peak':v>0?'+'+v:v}</text>`).join('');
-       host.innerHTML=controls+`<article class="trace-read-card trace-overlay-card"><div class="row between"><h4>Supporting chromatograms · peak-aligned overlay</h4><span class="small">${prepared.length} traces</span></div><div class="trace-meta">${traceAmplitudeMode==='normalised'?'Each read is independently amplitude-normalised.':'Raw channel amplitudes are shown on a shared scale; differences between instruments/runs may affect amplitude.'} Traces are centred on their called peaks. The vertical dashed line marks the called base.</div><svg class="trace-svg trace-overlay-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="Peak-aligned overlay of ${prepared.length} supporting chromatograms"><line x1="${left}" y1="${top+gh}" x2="${width-right}" y2="${top+gh}" stroke="#cbd5e1"/>${paths.join('')}<line x1="${centre}" y1="${top}" x2="${centre}" y2="${top+gh}" stroke="#111827" stroke-width="1.6" stroke-dasharray="6 5"/>${ticks}</svg><div class="trace-legend"><span style="color:#16a34a">A</span><span style="color:#2563eb">C</span><span style="color:#374151">G</span><span style="color:#dc2626">T</span></div></article>`;
+       host.innerHTML=controls+`<article class="trace-read-card trace-overlay-card"><div class="row between"><h4>Supporting chromatograms · peak-aligned overlay</h4><span class="small">${prepared.length} traces</span></div><div class="trace-meta">${traceAmplitudeMode==='normalised'?'Each read is independently amplitude-normalised.':'Raw channel amplitudes are shown on a shared scale; differences between instruments/runs may affect amplitude.'} Reverse-read channels are complemented into assembly orientation. Traces are centred on the called peak; the dashed line marks that peak.</div><svg class="trace-svg trace-overlay-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="Peak-aligned overlay of ${prepared.length} supporting chromatograms"><line x1="${left}" y1="${top+gh}" x2="${width-right}" y2="${top+gh}" stroke="#cbd5e1"/>${paths.join('')}<line x1="${centre}" y1="${top}" x2="${centre}" y2="${top+gh}" stroke="#111827" stroke-width="1.6" stroke-dasharray="6 5"/>${ticks}</svg><div class="trace-legend"><span style="color:#16a34a">A</span><span style="color:#2563eb">C</span><span style="color:#374151">G</span><span style="color:#dc2626">T</span></div></article>`;
+       const overlaySvg=host.querySelector('svg.trace-svg');
+       attachTraceHover(overlaySvg,prepared,(fraction,item)=>item.peakBin+minOffset+fraction*(maxOffset-minOffset));
      }else{
        const individualRawMax=Math.max(1,...prepared.flatMap(x=>Array.from('ACGT').flatMap(b=>x.channels[b]||[])).map(Number).filter(Number.isFinite));
        const cards=prepared.map(({read,rp,trace,rawBaseIndex,peakBin,channels,n,lo,hi})=>{
@@ -798,6 +1063,10 @@ function renderResult(r){
          return `<article class="trace-read-card"><h4>${esc(read.read_id)} · ${esc(read.primer||'')} · ${esc(read.direction||'')}</h4><div class="trace-meta">Consensus ${position+1} → trimmed read ${rp} → raw base ${rawBaseIndex+1} · called ${esc(String(read.aligned_sequence||'')[position]||'—')} · ${Number.isFinite(quality)?'Q'+quality:'Q unavailable'} · ${Number.isFinite(ratio)?'Secondary peak '+(secondary||'—')+' · ratio '+ratio.toFixed(2):'Secondary peak evidence unavailable'}</div><svg class="trace-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="Chromatogram for ${esc(read.read_id)}"><line x1="${left}" y1="${top+gh}" x2="${width-right}" y2="${top+gh}" stroke="#cbd5e1"/>${paths}${marker}<text x="${left}" y="${height-7}" font-size="11" fill="#64748b">${span===null?'Trace start':'Peak −'+span+' samples'}</text><text x="${width-right}" y="${height-7}" text-anchor="end" font-size="11" fill="#64748b">${span===null?'Trace end':'Peak +'+span+' samples'}</text></svg></article>`;
        }).join('');
        host.innerHTML=controls+cards;
+       host.querySelectorAll('svg.trace-svg').forEach((svg,index)=>{
+         const item=prepared[index];
+         if(item)attachTraceHover(svg,[item],(fraction,x)=>x.lo+fraction*(x.hi-x.lo));
+       });
      }
    }
    $('#traceZoomSelect')?.addEventListener('change',e=>{traceZoomSamples=e.target.value==='all'?'all':Number(e.target.value);renderTraceReview(position);});
@@ -844,16 +1113,8 @@ function renderResult(r){
      showAlignmentPosition(target);
      updateBaseInspector(target);
    };
-   // Initialise the viewer from the first ranked candidate's explicit
-   // candidate/read projection. The legacy default read_alignment payload does
-   // not contain read_positions and therefore cannot drive chromatogram lookup.
-   if(ranked.length){
-     activateCandidateAlignment(ranked[0]);
-     document.querySelectorAll('.candidate-card')[0]?.classList.add('viewer-active');
-     $('#alignmentStatus').textContent=`Viewing ${ranked[0].CandidateID}: ${alignmentReads.length} candidate read(s) projected. Select a candidate below to change the sequence to retain.`;
-   }else{
-     showAlignmentPosition(0);
-   }
+   applyPrimerReadChoices();
+   if(!ranked.length)showAlignmentPosition(0);
  }
  renderTaxonomyResults(r);
  $('#images').innerHTML=r.artifacts.map(a=>`<figure><a href="${a.url}" target="_blank"><img loading="lazy" src="${a.url}" alt="${esc(a.label)}"></a><figcaption>${esc(a.label)}</figcaption></figure>`).join('');$('#reportLinks').innerHTML=r.files.map(f=>`<a href="${f.url}" target="_blank">${esc(f.label)}</a>`).join('');

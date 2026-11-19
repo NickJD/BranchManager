@@ -4201,6 +4201,7 @@ def cmd_performance_review(args):
                 novelty_metrics=outdir / 'assessment' / 'novelty_metrics.tsv',
                 run_manifest=outdir / 'run_manifest.json',
                 genome_assessment=genome_assessment,
+                database=original_db,
             )
             manifest.add_output(dashboard, role='performance_review_dashboard')
         except BaseException as exc:

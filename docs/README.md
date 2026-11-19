@@ -10,6 +10,10 @@ It brings together Sanger chromatogram processing, marker-sequence assembly and 
 
 > **Important:** A sequence with no close database match is not automatically novel. Poor read quality, short alignment coverage, mixed templates, contamination, missing references and unresolved taxonomy can all produce apparently unusual results. BranchManager keeps these evidence types separate and flags cases requiring review.
 
+## Interactive demos
+
+- [Sanger Studio demo](sanger-studio-demo/) — synthetic workflow walkthrough.
+
 ## Explore the interactive dashboard
 
 **[Open the BranchManager interactive dashboard demo](https://nickjd.github.io/BranchManager/demo/)**

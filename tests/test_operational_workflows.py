@@ -699,7 +699,7 @@ class OperationalWorkflowTests(unittest.TestCase):
                 staged.insert_sequences([('PARTIAL', 'CCCC')], dataset='Hungate')
                 raise RuntimeError('simulated Filing Cabinet failure')
 
-            with mock.patch('branchmanager.cli._cmd_filing_cabinet_impl', side_effect=fail_after_staged_write):
+            with mock.patch('branchmanager.cli_core._cmd_filing_cabinet_impl', side_effect=fail_after_staged_write):
                 with self.assertRaisesRegex(RuntimeError, 'simulated Filing Cabinet failure'):
                     cmd_filing_cabinet(args)
 
@@ -880,7 +880,7 @@ class OperationalWorkflowTests(unittest.TestCase):
     def test_office_workflow_commands_are_primary_cli_entries(self):
         parser = build_parser()
         cases = (
-            (['mailroom', '--read-dir', 'reads', '--metadata', 'supplier.csv', '--dataset', 'QUB_01', '-o', 'out'], 'mailroom'),
+            (['mailroom', '--read-dir', 'reads', '--manifest', 'manifest.csv', '--dataset', 'QUB_01', '-o', 'out'], 'mailroom'),
             (['interview', '--mailroom', 'mailroom_out', '-o', 'out'], 'interview'),
             (['filing-cabinet', '--fasta', 'b.fa', '--db', 'p.db', '--dataset', 'Hungate'], 'filing-cabinet'),
             (['performance-review', '--input', 'q.fa', '--db', 'p.db', '--dataset', 'QUB', '-o', 'out'], 'performance-review'),

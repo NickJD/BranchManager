@@ -16,9 +16,23 @@ fasta = types.ModuleType("branchmanager.utils.fasta")
 fasta.read_fasta = lambda *args, **kwargs: []
 fasta.reverse_complement = lambda seq: seq[::-1]
 fasta.write_fasta = lambda *args, **kwargs: None
+io_module = types.ModuleType("branchmanager.utils.io")
+io_module.open_text = lambda path, mode="r", **kwargs: open(path, mode, **kwargs)
+def _test_write_tsv(path, headers, rows):
+    import csv
+    with open(path, 'w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=headers, delimiter='\t', extrasaction='ignore')
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+io_module.write_tsv = _test_write_tsv
+text_module = types.ModuleType("branchmanager.utils.text")
+text_module.normalise_header = lambda value: str(value or "").strip().lower().replace(" ", "_")
 sys.modules.setdefault("branchmanager", branchmanager)
 sys.modules.setdefault("branchmanager.utils", utils)
 sys.modules.setdefault("branchmanager.utils.fasta", fasta)
+sys.modules.setdefault("branchmanager.utils.io", io_module)
+sys.modules.setdefault("branchmanager.utils.text", text_module)
 
 spec = importlib.util.spec_from_file_location("paper_trail_taxonomy_test", SOURCE)
 module = importlib.util.module_from_spec(spec)
@@ -44,21 +58,24 @@ def test_near_best_hits_agreeing_at_genus_resolve_genus():
     result = module._resolve_near_best_taxonomy([
         hit("ref1", 99.90, "d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Clostridiaceae;g__Sarcina;s__Sarcina perfringens"),
         hit("ref2", 99.75, "d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Clostridiaceae;g__Sarcina;s__Sarcina sp."),
+        hit("ref3", 99.70, "d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Clostridiaceae;g__Sarcina;s__Sarcina intestinalis"),
     ], parse_taxonomy)
     assert result["assigned_rank"] in {"g", "s"}
     assert "g__Sarcina" in result["taxonomy"]
-    assert result["status"] == "RESOLVED"
-    assert len(result["near_best_hits"]) == 2
+    assert result["status"] == "PROVISIONAL"
+    assert len(result["near_best_hits"]) == 3
 
 
 def test_near_best_hits_disagreeing_at_genus_fall_back_to_family():
     result = module._resolve_near_best_taxonomy([
         hit("ref1", 99.90, "d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Clostridiaceae;g__Sarcina"),
-        hit("ref2", 99.70, "d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Clostridiaceae;g__OtherGenus"),
+        hit("ref2", 99.80, "d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Clostridiaceae;g__Sarcina"),
+        hit("ref3", 99.70, "d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Clostridiaceae;g__OtherGenus"),
+        hit("ref4", 99.60, "d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Clostridiaceae;g__OtherGenus"),
     ], parse_taxonomy)
     assert result["assigned_rank"] == "f"
     assert result["taxonomy"].endswith("f__Clostridiaceae")
-    assert result["status"] == "RESOLVED"
+    assert result["status"] == "PROVISIONAL"
 
 
 def test_near_best_hits_without_shared_family_do_not_force_a_genus():
@@ -73,9 +90,11 @@ def test_near_best_hits_without_shared_family_do_not_force_a_genus():
 def test_distant_lower_identity_hit_does_not_override_best_genus():
     result = module._resolve_near_best_taxonomy([
         hit("ref1", 99.90, "d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Clostridiaceae;g__Sarcina"),
-        hit("ref2", 99.20, "d__Bacteria;p__Bacillota;c__Negativicutes;o__Veillonellales;f__Veillonellaceae;g__Veillonella"),
+        hit("ref1b", 99.85, "d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Clostridiaceae;g__Sarcina"),
+        hit("ref1c", 99.80, "d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Clostridiaceae;g__Sarcina"),
+        hit("ref2", 99.00, "d__Bacteria;p__Bacillota;c__Negativicutes;o__Veillonellales;f__Veillonellaceae;g__Veillonella"),
     ], parse_taxonomy)
-    assert len(result["near_best_hits"]) == 1
+    assert len(result["near_best_hits"]) == 3
     assert "g__Sarcina" in result["taxonomy"]
 
 
@@ -184,8 +203,10 @@ def test_screen_function_runs_multi_hit_search_and_writes_audit_files(tmp_path, 
     taxonomy_map = {
         "ref_a": "d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Clostridiaceae;g__Sarcina",
         "ref_a2": "d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Clostridiaceae;g__Sarcina",
+        "ref_a3": "d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Clostridiaceae;g__Sarcina",
         "ref_b": "d__Bacteria;p__Bacillota;c__Negativicutes;o__Veillonellales;f__Veillonellaceae;g__Veillonella",
         "ref_b2": "d__Bacteria;p__Bacillota;c__Negativicutes;o__Veillonellales;f__Veillonellaceae;g__Veillonella",
+        "ref_b3": "d__Bacteria;p__Bacillota;c__Negativicutes;o__Veillonellales;f__Veillonellaceae;g__Veillonella",
     }
 
     def parse_match(parts):
@@ -217,8 +238,10 @@ def test_screen_function_runs_multi_hit_search_and_writes_audit_files(tmp_path, 
     raw_lines = [
         "q0\tref_a\t99.80\t1000\t2\t0\t1\t1000\t1\t1500\t1000\t1500\t100.00\t66.67",
         "q0\tref_a2\t99.70\t1000\t3\t0\t1\t1000\t1\t1500\t1000\t1500\t100.00\t66.67",
+        "q0\tref_a3\t99.65\t1000\t4\t0\t1\t1000\t1\t1500\t1000\t1500\t100.00\t66.67",
         "q1\tref_b\t99.80\t1000\t2\t0\t1\t1000\t1\t1500\t1000\t1500\t100.00\t66.67",
         "q1\tref_b2\t99.70\t1000\t3\t0\t1\t1000\t1\t1500\t1000\t1500\t100.00\t66.67",
+        "q1\tref_b3\t99.65\t1000\t4\t0\t1\t1000\t1\t1500\t1000\t1500\t100.00\t66.67",
     ]
 
     def fake_run(command, capture_output, text, check):
@@ -243,7 +266,7 @@ def test_screen_function_runs_multi_hit_search_and_writes_audit_files(tmp_path, 
 
     search_command = commands[0]
     assert search_command[search_command.index("--maxaccepts") + 1] == "20"
-    assert search_command[search_command.index("--maxrejects") + 1] == "32"
+    assert search_command[search_command.index("--maxrejects") + 1] == "256"
     assert search_command[search_command.index("--maxhits") + 1] == "20"
     assert results["isolate_1"]["status"] == "CONFLICT"
     assert Path(report_path).is_file()
@@ -254,7 +277,7 @@ def test_screen_function_runs_multi_hit_search_and_writes_audit_files(tmp_path, 
     with open(screen_dir / "taxonomy_screen_policy.tsv") as handle:
         policy = next(csv.DictReader(handle, delimiter="\t"))
     assert policy["MaxAccepts"] == "20"
-    assert policy["MaxRejects"] == "32"
+    assert policy["MaxRejects"] == "256"
     assert policy["MaxHits"] == "20"
     with open(screen_dir / "taxonomy.tsv") as handle:
         rows = list(csv.DictReader(handle, delimiter="\t"))

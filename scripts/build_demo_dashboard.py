@@ -9,8 +9,10 @@ passes those fixtures to the same reporting function used by BranchManager.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -27,6 +29,7 @@ REQUIRED_INPUTS = (
     "assessment/pangenome_hierarchy.tsv",
     "assessment/novelty_metrics.tsv",
     "assessment/genome_collection_assessment.tsv",
+    "assessment/registered_catalogue.tsv",
     "run_manifest.json",
 )
 REQUIRED_TAXONOMY = (
@@ -130,6 +133,58 @@ def _validate_dashboard(html_path: Path) -> dict[str, int]:
     return {"records": len(records), "html_bytes": html_path.stat().st_size}
 
 
+def _create_demo_catalogue_database(demo_root: Path, database_path: Path) -> None:
+    """Create a disposable SQLite catalogue overlay from synthetic demo TSV rows."""
+    catalogue_path = demo_root / "assessment" / "registered_catalogue.tsv"
+    genome_path = demo_root / "assessment" / "genome_collection_assessment.tsv"
+    with sqlite3.connect(database_path) as conn:
+        conn.executescript(
+            "CREATE TABLE sequences (id TEXT PRIMARY KEY, dataset TEXT, baseline_tier TEXT);"
+            "CREATE TABLE sequencing_metadata (id TEXT PRIMARY KEY, selected_for_sequencing INTEGER, "
+            "selected_for_wgs INTEGER, operational_status TEXT);"
+            "CREATE TABLE taxonomy (id TEXT, taxonomy TEXT, confidence REAL);"
+            "CREATE TABLE genome_records (sequence_id TEXT, genome_id TEXT, genome_status TEXT, "
+            "genome_qc_pass TEXT, completeness REAL, contamination REAL, gtdb_taxonomy TEXT, "
+            "genome_path TEXT, notes TEXT);"
+        )
+        assessed_path = demo_root / "assessment" / "selection_summary.tsv"
+        genome_rows = list(csv.DictReader(genome_path.open(encoding="utf-8", newline=""), delimiter="\t"))
+        sequenced_ids = {row.get("sequence_id", "") for row in genome_rows if row.get("sequence_id")}
+        selected_rows = list(csv.DictReader(assessed_path.open(encoding="utf-8", newline=""), delimiter="\t"))
+        for row in selected_rows:
+            sequence_id = row.get("SequenceID", "")
+            selected = row.get("SequencingSetRole", "").upper() in {"PRIMARY", "BACKUP"}
+            taxonomy = row.get("GTDBTaxonomy", "")
+            conn.execute("INSERT INTO sequences VALUES (?, ?, ?)",
+                       (sequence_id, row.get("PartnerID", ""), row.get("BaselineEvidenceClass", "")))
+            conn.execute("INSERT INTO sequencing_metadata VALUES (?, ?, ?, ?)",
+                       (sequence_id, int(selected), int(sequence_id in sequenced_ids),
+                        "SAB_APPROVED" if selected else ""))
+            if taxonomy:
+                conn.execute("INSERT INTO taxonomy VALUES (?, ?, ?)", (sequence_id, taxonomy, 1.0))
+        with catalogue_path.open(encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle, delimiter="\t"):
+                sequence_id = row["sequence_id"]
+                conn.execute("INSERT INTO sequences VALUES (?, ?, ?)",
+                           (sequence_id, row["partner_id"], row.get("baseline_tier", "")))
+                conn.execute("INSERT INTO sequencing_metadata VALUES (?, ?, ?, ?)",
+                           (sequence_id, int(row.get("selected_for_sequencing", "0") or 0),
+                            int(row.get("selected_for_wgs", "0") or 0), row.get("operational_status", "")))
+                taxonomy = row.get("taxonomy", "").strip()
+                if taxonomy:
+                    conn.execute("INSERT INTO taxonomy VALUES (?, ?, ?)", (sequence_id, taxonomy, 1.0))
+        with genome_path.open(encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle, delimiter="\t"):
+                conn.execute(
+                    "INSERT INTO genome_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (row.get("sequence_id", ""), row.get("genome_id", ""), row.get("genome_status", ""),
+                     row.get("genome_qc_pass", ""), row.get("completeness") or None,
+                     row.get("contamination") or None, row.get("gtdb_taxonomy", ""),
+                     row.get("genome_path", ""), row.get("notes", "")),
+                )
+
+
+
 def build_dashboard(
     demo_root: Path = DEMO_ROOT,
     output_dir: Path | None = None,
@@ -172,17 +227,21 @@ def build_dashboard(
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
     assessment = demo_root / "assessment"
-    html_path = Path(
-        write_performance_review_dashboard(
-            assessment / "selection_summary.tsv",
-            output_dir,
-            sequence_assessment=assessment / "sequence_assessment.tsv",
-            pangenome_hierarchy=assessment / "pangenome_hierarchy.tsv",
-            novelty_metrics=assessment / "novelty_metrics.tsv",
-            run_manifest=manifest_path,
-            genome_assessment=assessment / "genome_collection_assessment.tsv",
+    with tempfile.TemporaryDirectory(prefix="branchmanager-demo-catalogue-") as database_tmp:
+        database_path = Path(database_tmp) / "demo_catalogue.sqlite"
+        _create_demo_catalogue_database(demo_root, database_path)
+        html_path = Path(
+            write_performance_review_dashboard(
+                assessment / "selection_summary.tsv",
+                output_dir,
+                sequence_assessment=assessment / "sequence_assessment.tsv",
+                pangenome_hierarchy=assessment / "pangenome_hierarchy.tsv",
+                novelty_metrics=assessment / "novelty_metrics.tsv",
+                run_manifest=manifest_path,
+                genome_assessment=assessment / "genome_collection_assessment.tsv",
+                database=database_path,
+            )
         )
-    )
     stats = _validate_dashboard(html_path)
     print(
         f"Dashboard generated: {html_path}\n"

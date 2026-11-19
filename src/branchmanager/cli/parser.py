@@ -621,7 +621,7 @@ def build_parser():
         action='store_true', default=False,
         help='Allow AB1 reads missing PCON quality scores to pass with warnings. By default they fail QC.')
     paper_trail_parser.add_argument('--min-overlap', dest='min_overlap', type=int, default=paper_trail_policy.min_overlap,
-        help='Minimum overlap length for assembling multiple primer reads (default: 80 bp).')
+        help='Minimum overlap length for assembling multiple primer reads (default: 40 bp).')
     paper_trail_parser.add_argument('--min-overlap-identity', dest='min_overlap_identity', type=float, default=paper_trail_policy.min_overlap_identity,
         help='Minimum overlap identity for assembly, 0-1 (default: 0.98).')
     paper_trail_parser.add_argument('--assemble', dest='assemble',
@@ -660,7 +660,7 @@ def build_parser():
     )
     for _name, _module, _help in (
         ('primers-to-manifest', _tool_manifest,
-         "Tool: convert a partner 'Primer file mapping' Excel sheet into an AB1 manifest.csv (with ID sanitation)."),
+         "Tool: convert a partner 'Primer file mapping' Excel sheet into an attempt-aware AB1 manifest.csv with source provenance and ID sanitation."),
         ('metadata-to-diversity', _tool_diversity,
          'Tool: extract diversity-metadata columns from a partner Excel template into a TSV.'),
         ('benchmark-selection', _tool_benchmark,

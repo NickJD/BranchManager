@@ -1,0 +1,37 @@
+sequence_id	partner_id	baseline_tier	selected_for_sequencing	selected_for_wgs	operational_status	taxonomy
+DEMO_CATALOGUE_001	North Farm		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Erysipelotrichaceae;g__Winkia
+DEMO_CATALOGUE_002	North Farm		1	0	SAB_APPROVED	d__Bacteria;p__Bacteroidota;c__Clostridia;o__Eubacteriales;f__Prevotellaceae;g__Prevotella
+DEMO_CATALOGUE_003	North Farm		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Lachnospiraceae;g__Butyrivibrio
+DEMO_CATALOGUE_004	North Farm		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Oscillospiraceae;g__Ruminococcus;s__Ruminococcus_sp_demo_1
+DEMO_CATALOGUE_005	North Farm		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Erysipelotrichaceae;g__Winkia
+DEMO_CATALOGUE_006	North Farm		0	0		d__Bacteria;p__Bacteroidota;c__Clostridia;o__Eubacteriales;f__Prevotellaceae;g__Prevotella
+DEMO_CATALOGUE_007	North Farm		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Lachnospiraceae;g__Butyrivibrio
+DEMO_CATALOGUE_008	North Farm		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Oscillospiraceae;g__Ruminococcus;s__Ruminococcus_sp_demo_2
+DEMO_CATALOGUE_009	North Farm		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Erysipelotrichaceae;g__Winkia
+DEMO_CATALOGUE_010	Rumen Research Unit		0	0		d__Bacteria;p__Bacteroidota;c__Clostridia;o__Eubacteriales;f__Prevotellaceae;g__Prevotella
+DEMO_CATALOGUE_011	Rumen Research Unit		1	0	SAB_APPROVED	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Lachnospiraceae;g__Butyrivibrio
+DEMO_CATALOGUE_012	Rumen Research Unit		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Oscillospiraceae;g__Ruminococcus;s__Ruminococcus_sp_demo_3
+DEMO_CATALOGUE_013	Rumen Research Unit		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Erysipelotrichaceae;g__Winkia
+DEMO_CATALOGUE_014	Rumen Research Unit		0	0		d__Bacteria;p__Bacteroidota;c__Clostridia;o__Eubacteriales;f__Prevotellaceae;g__Prevotella
+DEMO_CATALOGUE_015	Rumen Research Unit		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Lachnospiraceae;g__Butyrivibrio
+DEMO_CATALOGUE_016	Rumen Research Unit		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Oscillospiraceae;g__Ruminococcus;s__Ruminococcus_sp_demo_4
+DEMO_CATALOGUE_017	Rumen Research Unit		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Erysipelotrichaceae;g__Winkia
+DEMO_CATALOGUE_018	Rumen Research Unit		0	0		d__Bacteria;p__Bacteroidota;c__Clostridia;o__Eubacteriales;f__Prevotellaceae;g__Prevotella
+DEMO_CATALOGUE_019	Field Station		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Lachnospiraceae;g__Butyrivibrio
+DEMO_CATALOGUE_020	Field Station		1	0	SAB_APPROVED	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Oscillospiraceae;g__Ruminococcus;s__Ruminococcus_sp_demo_5
+DEMO_CATALOGUE_021	Field Station		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Erysipelotrichaceae;g__Winkia
+DEMO_CATALOGUE_022	Field Station		0	0		d__Bacteria;p__Bacteroidota;c__Clostridia;o__Eubacteriales;f__Prevotellaceae;g__Prevotella
+DEMO_CATALOGUE_023	Field Station		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Lachnospiraceae;g__Butyrivibrio
+DEMO_CATALOGUE_024	Field Station		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Oscillospiraceae;g__Ruminococcus;s__Ruminococcus_sp_demo_6
+DEMO_CATALOGUE_025	Field Station		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Erysipelotrichaceae;g__Winkia
+DEMO_CATALOGUE_026	Field Station		0	0		d__Bacteria;p__Bacteroidota;c__Clostridia;o__Eubacteriales;f__Prevotellaceae;g__Prevotella
+DEMO_CATALOGUE_027	Field Station		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Lachnospiraceae;g__Butyrivibrio
+DEMO_CATALOGUE_028	Culture Collection		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Oscillospiraceae;g__Ruminococcus;s__Ruminococcus_sp_demo_1
+DEMO_CATALOGUE_029	Culture Collection		1	0	SAB_APPROVED	d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Erysipelotrichaceae;g__Winkia
+DEMO_CATALOGUE_030	Culture Collection		0	0		d__Bacteria;p__Bacteroidota;c__Clostridia;o__Eubacteriales;f__Prevotellaceae;g__Prevotella
+DEMO_CATALOGUE_031	Culture Collection		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Lachnospiraceae;g__Butyrivibrio
+DEMO_CATALOGUE_032	Culture Collection		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Oscillospiraceae;g__Ruminococcus;s__Ruminococcus_sp_demo_2
+DEMO_CATALOGUE_033	Culture Collection		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Erysipelotrichaceae;g__Winkia
+DEMO_CATALOGUE_034	Culture Collection		0	0		d__Bacteria;p__Bacteroidota;c__Clostridia;o__Eubacteriales;f__Prevotellaceae;g__Prevotella
+DEMO_CATALOGUE_035	Culture Collection		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Lachnospiraceae;g__Butyrivibrio
+DEMO_CATALOGUE_036	Culture Collection		0	0		d__Bacteria;p__Bacillota;c__Clostridia;o__Eubacteriales;f__Oscillospiraceae;g__Ruminococcus;s__Ruminococcus_sp_demo_3
