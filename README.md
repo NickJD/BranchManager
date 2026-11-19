@@ -172,6 +172,12 @@ archives can contain nested directories; Sanger Studio searches them for
 
 For a full guide, see [Sanger Studio](docs/sanger-studio.md).
 
+## What's new in v1.2.0
+
+BranchManager v1.2.0 improves Sanger Studio resequencing and read-selection workflows, chromatogram interpretation, cohort assessment and dashboard reporting. It also strengthens GTDB-based pangenome safeguards and introduces tools for ground-truth validation and workflow drift detection.
+
+See the [v1.2.0 release notes](docs/releases/v1.2.0.md) for details.
+
 ### Run the preflight checks
 
 Before a production analysis, check the installation and project inputs:
