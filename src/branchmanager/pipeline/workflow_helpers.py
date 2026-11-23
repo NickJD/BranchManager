@@ -3,10 +3,13 @@ from __future__ import annotations
 from branchmanager.pipeline.evidence_policy import evidence_quality as _shared_evidence_quality
 import gzip
 import json
+import logging
 import os
 import csv
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
 
 from branchmanager.taxonomy_io import iter_taxonomy_assignment_rows
 from branchmanager.taxonomy import (
@@ -52,7 +55,10 @@ def _assignment_source_is_fasta(assignments_path: str, source_fasta_path: Option
                     continue
                 return stripped.startswith('>')
     except Exception:
-        logger.debug('Could not read file %s to check if it is a FASTA', assignments_path)
+        logging.getLogger(__name__).debug(
+            'Could not read file %s to check if it is a FASTA',
+            assignments_path
+        )
         return False
     return False
 
@@ -1579,10 +1585,11 @@ def _marker_review_display(row: dict) -> str:
 def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str = 'GTDB'):
     """Write the SAB-facing shortlist of proposed genome-sequencing candidates.
 
-    Only positive or provisional recommendations are included. Isolates already
-    sequenced/committed, explicitly excluded as baseline-redundant, below the
-    recommendation threshold, or lacking a marker sequence remain in the full
-    sequence_assessment.tsv audit but are not presented as SAB candidates.
+    Include all marker-assessed isolates except completely failed QC, isolates
+    already genome-sequenced, and isolates already selected/committed for genome
+    sequencing. Redundant isolates and lower-priority recommendations remain visible
+    to the SAB so the shortlist is a complete decision set rather than only
+    positive recommendations.
 
     The summary deliberately exposes the key biological and taxonomic context
     needed for a decision; detailed classifier and novelty evidence remains in
@@ -1608,20 +1615,28 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
         'RecommendationReason',
         'SABDecision',
     ]
-    # These categories represent an actual proposal or a provisional candidate
-    # requiring discussion. Explicit exclusions, already completed commitments,
-    # no-marker resequencing cases and lower-priority/no-added-value cases are
-    # retained in the comprehensive assessment, not the SAB decision shortlist.
-    sab_candidate_decisions = {
-        'PRIORITISE - SET PRIMARY',
-        'RESERVE - SET BACKUP',
-        'STRONG CANDIDATE',
-        'STRONG CANDIDATE - STRAIN DIVERSITY',
-        'SECONDARY - STRAIN DIVERSITY',
-        'SECONDARY CANDIDATE',
-        'REVIEW BEFORE SELECTION',
-        'REVIEW - PANGENOME BOUNDARY',
-    }
+    # Exclude only records with completely failed marker QC, an existing genome,
+    # or a current sequencing commitment. Redundancy is evidence for the SAB, not
+    # a reason to hide an isolate from its decision table.
+    def is_excluded(row, support):
+        qc = str(row.get('marker_qc_class') or '').strip().upper()
+        if qc in {'FAIL_QC', 'FAILED_QC', 'QC_FAIL', 'COMPLETELY_FAILED_QC'}:
+            return True
+        no_sequence = str(row.get('no_marker_sequence') or '').strip().lower() in {'true', '1', 'yes'}
+        if no_sequence:
+            return True
+        decision = str(support.get('decision') or '').strip().upper()
+        if decision == 'ALREADY SEQUENCED':
+            return True
+        if decision == 'ALREADY SELECTED - GENOME PENDING':
+            return True
+        if str(row.get('genome_already_sequenced') or row.get('GenomeAlreadySequenced') or '').strip().lower() in {'true', '1', 'yes'}:
+            return True
+        if str(row.get('already_selected_for_genome_sequencing') or row.get('AlreadySelectedForGenomeSequencing') or '').strip().lower() in {'true', '1', 'yes'}:
+            return True
+        role = str(row.get('sequencing_set_role') or '').strip().upper()
+        return role in {'PRIMARY', 'BACKUP', 'DIVERSITY_CANDIDATE', 'ALTERNATE', 'COMMITTED', 'SELECTED'}
+
     decision_order = {
         'PRIORITISE - SET PRIMARY': 0,
         'RESERVE - SET BACKUP': 1,
@@ -1642,7 +1657,7 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
     prepared = []
     for row in rows:
         support = build_selection_decision(row)
-        if support['decision'] not in sab_candidate_decisions:
+        if is_excluded(row, support):
             continue
         prepared.append((support, row))
     prepared.sort(key=lambda item: (

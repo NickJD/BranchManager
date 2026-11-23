@@ -88,7 +88,6 @@ def value(flag):
     return sys.argv[sys.argv.index(flag) + 1]
 query = Path(value("--usearch_global"))
 userout = Path(value("--userout"))
-notmatched = Path(value("--notmatched"))
 queries = []
 for line in query.read_text().splitlines():
     if line.startswith(">"):
@@ -96,7 +95,6 @@ for line in query.read_text().splitlines():
 with userout.open("w") as out:
     for q in queries:
         out.write(f"{q}\\tREF1\\t99.5\\t1490\\t100.0\\t98.8\\t3\\t0\\t+\\n")
-notmatched.write_text("")
 ''')
     reference = tmp_path / "gtdb_ssu.fna"
     reference.write_text(
@@ -163,7 +161,6 @@ queries = [line[1:].split()[0] for line in Path(value("--usearch_global")).read_
 with Path(value("--userout")).open("w") as out:
     for q in queries:
         out.write(f"{q}\tREF1\t99.5\t1490\t100.0\t98.8\t3\t0\t+\n")
-Path(value("--notmatched")).write_text("")
 ''')
     reference = tmp_path / "reference.fna"
     reference.write_text(

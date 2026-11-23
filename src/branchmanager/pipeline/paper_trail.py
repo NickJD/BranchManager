@@ -43,7 +43,7 @@ class PaperTrailQCPolicy:
     max_mixed_peak_percent: float = 15.0
     mixed_peak_min_quality: int = 20
     quality_difference: int = 10
-    min_overlap: int = 80
+    min_overlap: int = 40
     min_overlap_identity: float = 0.98
 
 
@@ -171,6 +171,8 @@ PROCESSING_MODE_COLUMNS = (
 PROCESSING_TAG_COLUMNS = ('tag', 'tags', 'flag', 'flags')
 ROW_METADATA_COLUMNS = set(SEQUENCE_ID_COLUMNS) | {
     'primer', 'primer_name', 'direction', 'orientation', 'read', 'read_direction',
+    'attempt_id', 'attempt_group', 'source_path', 'source_file', 'source_sha256',
+    'spreadsheet_filename', 'mapping_column', 'mapping_row',
 } | set(PROCESSING_MODE_COLUMNS) | set(PROCESSING_TAG_COLUMNS)
 
 
@@ -183,6 +185,9 @@ class SangerRead:
     source_file: str
     raw_sequence: str
     raw_qualities: list[int]
+    attempt_id: str = ''
+    attempt_group: str = ''
+    source_sha256: str = ''
     quality_available: bool = True
     quality_source: str = 'provided'
     trimmed_sequence: str = ''
@@ -374,6 +379,8 @@ def _read_ab1_details(path: str | Path) -> dict[str, object]:
             'quality_status': quality_status,
             'trace_available': False,
             'trace_order': '',
+            'trace_order_valid': False,
+            'trace_order_source': '',
             'peak_locations': [],
             'trace_channels': {},
             'secondary_peak_ratios': [0.0] * len(sequence),
@@ -390,15 +397,30 @@ def _read_ab1_details(path: str | Path) -> dict[str, object]:
 
     raw = record.annotations.get('abif_raw', {}) or {}
     peak_locations = _integer_list(raw.get('PLOC2') or raw.get('PLOC1'))
-    order = _decode_abif_text(raw.get('FWO_1') or raw.get('FWO_2') or 'GATC').upper()
-    if len(order) != 4 or set(order) != {'A', 'C', 'G', 'T'}:
-        order = 'GATC'
+    # FWO_1 defines the dye/channel order for DATA9..DATA12 in this ABIF
+    # record. Never silently substitute a conventional order: doing so can
+    # relabel real fluorescence and create false chromatogram evidence.
+    order_value = raw.get('FWO_1') or raw.get('FWO_2')
+    order = _decode_abif_text(order_value).upper()
+    order_valid = len(order) == 4 and set(order) == {'A', 'C', 'G', 'T'}
     channels = {}
-    for base, tag in zip(order, ('DATA9', 'DATA10', 'DATA11', 'DATA12')):
-        values = _integer_list(raw.get(tag))
-        if values:
-            channels[base] = values
-    trace_available = bool(peak_locations and len(channels) == 4)
+    if order_valid:
+        for base, tag in zip(order, ('DATA9', 'DATA10', 'DATA11', 'DATA12')):
+            values = _integer_list(raw.get(tag))
+            if values:
+                channels[base] = values
+    # Trace evidence is only valid when every base call has a corresponding
+    # peak location and all peak indices fall inside the decoded dye arrays.
+    # Partial/malformed PLOC arrays must not be presented as complete trace data.
+    channel_lengths = [len(channels.get(base, [])) for base in 'ACGT']
+    trace_arrays_compatible = (
+        len(channels) == 4
+        and len(set(channel_lengths)) == 1
+        and channel_lengths[0] > 0
+        and len(peak_locations) >= len(sequence)
+        and all(0 <= int(peak) < channel_lengths[0] for peak in peak_locations[:len(sequence)])
+    )
+    trace_available = bool(order_valid and trace_arrays_compatible)
     if trace_available:
         ratios, secondary = _trace_peak_evidence(sequence, peak_locations, channels)
     else:
@@ -409,7 +431,9 @@ def _read_ab1_details(path: str | Path) -> dict[str, object]:
         'quality_available': quality_available,
         'quality_status': quality_status,
         'trace_available': trace_available,
-        'trace_order': order,
+        'trace_order': order if order_valid else '',
+        'trace_order_valid': order_valid,
+        'trace_order_source': 'FWO_1' if raw.get('FWO_1') else ('FWO_2' if raw.get('FWO_2') else ''),
         'peak_locations': peak_locations,
         'trace_channels': channels,
         'secondary_peak_ratios': ratios,
@@ -759,6 +783,10 @@ def _load_sample_map(
                 'sequence_id': sequence_id or inferred_sequence_id,
                 'primer': primer,
                 'direction': direction,
+                'attempt_id': _row_value(row, 'attempt_id'),
+                'attempt_group': _row_value(row, 'attempt_group'),
+                'source_path': _row_value(row, 'source_path'),
+                'source_sha256': _row_value(row, 'source_sha256'),
             }
             if row_mode:
                 entry['processing_mode'] = row_mode
@@ -1109,6 +1137,32 @@ def merge_pair_gapped(*args, **kwargs):
     return merge_pair(*args, **kwargs)
 
 
+def _prefer_best_read_per_primer(reads: list[SangerRead]) -> tuple[list[SangerRead], list[str]]:
+    """Keep the best QC-passing resequencing read for each identical primer.
+
+    Different primers remain eligible for assembly. Repeated reads for the same
+    primer are alternatives, not independent amplicon evidence, and must not be
+    merged together as though they were complementary reads.
+    """
+    best_by_primer = {}
+    for read in reads:
+        primer = str(read.primer or '').strip()
+        # Only collapse a recognised, explicit primer identity. Filename-derived
+        # sequencing IDs can contain numeric tokens that resemble primer labels;
+        # treating those as equivalent primers could discard complementary reads.
+        if re.fullmatch(r'(?:\d{2,4}[FR]|ITS[12]|18S|28S|DS[12])', primer, flags=re.IGNORECASE):
+            key = primer.casefold()
+        else:
+            key = f'__unresolved__:{read.read_id}'
+        current = best_by_primer.get(key)
+        if current is None or _read_selection_key(read) > _read_selection_key(current):
+            best_by_primer[key] = read
+    selected_ids = {read.read_id for read in best_by_primer.values()}
+    selected = [read for read in reads if read.read_id in selected_ids]
+    excluded = [read.read_id for read in reads if read.read_id not in selected_ids]
+    return selected, excluded
+
+
 def assemble_read_group(
     reads: list[SangerRead],
     *,
@@ -1145,6 +1199,7 @@ def assemble_read_group(
         }
 
     usable = sorted(usable, key=lambda read: _read_selection_key(read), reverse=True)
+    usable, _superseded_resequence_ids = _prefer_best_read_per_primer(usable)
     usable_by_id = {read.read_id: read for read in usable}
 
     if len(usable) == 1:
@@ -1335,6 +1390,56 @@ def _read_quality_key(read: SangerRead) -> tuple[int, float, float, int, str]:
     """Backward-compatible alias for the shared read-selection ranking."""
     return _read_selection_key(read)
 
+
+
+def _individual_read_candidate_rows(
+    sequence_id: str,
+    reads: Iterable[SangerRead],
+    start_number: int = 0,
+) -> tuple[list[dict[str, object]], list[tuple[str, str]]]:
+    """Create explicit single-read fallback candidates without implying assembly.
+
+    A fallback is generated for every readable attempt. The Studio later
+    filters these by the user's one-read-per-primer choices and shows them
+    only when no compatible multi-primer assembly exists.
+    """
+    rows: list[dict[str, object]] = []
+    fasta_records: list[tuple[str, str]] = []
+    for number, read in enumerate(
+        sorted(reads, key=lambda item: (str(item.primer or '').casefold(), item.read_id)),
+        start=start_number + 1,
+    ):
+        sequence = str(read.oriented_sequence or '').upper()
+        if not sequence:
+            continue
+        candidate_id = f'{sequence_id}__single_read_{number:02d}'
+        failed = read.status != 'kept' or read.qc_class == 'FAIL_QC'
+        reason = ';'.join(read.qc_reasons or []) or read.warning or (
+            'Read-level QC failed; explicit manual override required.' if failed else
+            'Individual read fallback; no multi-primer assembly is represented by this sequence.'
+        )
+        rows.append({
+            'SequenceID': sequence_id,
+            'CandidateID': candidate_id,
+            'CandidateType': 'INDIVIDUAL_READ',
+            'ReadIDs': read.read_id,
+            'UsedReadIDs': read.read_id,
+            'ReadCount': 1,
+            'ReadQC': f'{read.read_id}:{read.status}',
+            'IncludesFailedRead': 'yes' if failed else 'no',
+            'UsedReads': 1,
+            'OutputLength': len(sequence),
+            'OverlapLength': '',
+            'OverlapIdentity': '',
+            'Conflicts': 0,
+            'AmbiguousConflicts': 0,
+            'UnmergedReads': read.read_id,
+            'QCClass': read.qc_class,
+            'Recommendation': 'REVIEW' if failed else 'REVIEW_SINGLE_READ',
+            'Reasons': reason,
+        })
+        fasta_records.append((candidate_id, sequence))
+    return rows, fasta_records
 
 def _fallback_read_options(reads: Iterable[SangerRead]) -> list[dict[str, object]]:
     """Return the per-read QC-passing candidates available for manual fallback."""
@@ -3178,8 +3283,24 @@ def run_paper_trail(
     raw_records = []
     trimmed_records = []
 
+    seen_read_ids: set[str] = set()
     for path in files:
         for record_id, sequence, qualities, quality_available, quality_source, trace_details in _read_records_from_file(path):
+            # Read IDs normally use the input filename stem. Two submissions can
+            # legitimately contain the same basename (e.g. a resequenced primer),
+            # so disambiguate collisions before grouping, writing FASTA files or
+            # generating placement/candidate tables. The source path remains the
+            # authoritative metadata key and is retained on the SangerRead.
+            original_record_id = str(record_id)
+            if original_record_id in seen_read_ids:
+                source_tag = re.sub(r'[^A-Za-z0-9]+', '_', path.parent.name).strip('_') or 'submission'
+                candidate_id = f'{original_record_id}__{source_tag}'
+                suffix = 2
+                while candidate_id in seen_read_ids:
+                    candidate_id = f'{original_record_id}__{source_tag}_{suffix:02d}'
+                    suffix += 1
+                record_id = candidate_id
+            seen_read_ids.add(str(record_id))
             stem_prefix = path.stem.split('_', 1)[0]
             record_prefix = str(record_id).split('_', 1)[0]
             key_candidates = [str(path), path.name, path.stem, record_id, stem_prefix, record_prefix]
@@ -3203,6 +3324,9 @@ def run_paper_trail(
                 source_file=str(path),
                 raw_sequence=sequence,
                 raw_qualities=qualities,
+                attempt_id=str(meta.get('attempt_id') or ''),
+                attempt_group=str(meta.get('attempt_group') or ''),
+                source_sha256=str(meta.get('source_sha256') or ''),
                 quality_available=quality_available,
                 quality_source=quality_source,
                 processing_mode=meta_mode or default_mode,
@@ -3344,7 +3468,7 @@ def run_paper_trail(
 
     with open(read_qc_tsv, 'w') as handle:
         handle.write(
-            'ReadID\tSequenceID\tPrimer\tDirection\tSourceFile\tRawLength\tTrimmedLength\t'
+            'ReadID\tSequenceID\tPrimer\tDirection\tSourceFile\tAttemptID\tAttemptGroup\tSourceSHA256\tRawLength\tTrimmedLength\t'
             'MaskedLength\tTrimStart\tTrimEnd\tLeftTrimmedBases\tRightTrimmedBases\t'
             'MeanRawQuality\tMeanTrimmedQuality\tMeanMaskedQuality\t'
             'RawExpectedErrors\tTrimmedExpectedErrors\tMaskedExpectedErrors\t'
@@ -3364,7 +3488,8 @@ def run_paper_trail(
             handle.write(
                 f'{_clean_field(read.read_id)}\t{_clean_field(read.sequence_id)}\t'
                 f'{_clean_field(read.primer)}\t{_clean_field(read.direction)}\t{_clean_field(read.source_file)}\t'
-                f'{len(read.raw_sequence)}\t{len(read.trimmed_sequence)}\t{len(read.masked_sequence)}\t'
+                f'{_clean_field(read.attempt_id)}\t{_clean_field(read.attempt_group)}\t'
+                f'{_clean_field(read.source_sha256)}\t{len(read.raw_sequence)}\t{len(read.trimmed_sequence)}\t{len(read.masked_sequence)}\t'
                 f'{read.trim_start}\t{read.trim_end}\t{left_trimmed}\t{right_trimmed}\t'
                 f'{raw_mean:.2f}\t{trim_mean:.2f}\t{masked_mean:.2f}\t'
                 f'{_expected_errors(read.raw_qualities, read.raw_sequence):.4f}\t'
@@ -3392,6 +3517,12 @@ def run_paper_trail(
             usable = sorted((r for r in group if r.status == 'kept' and r.oriented_sequence), key=lambda r: r.read_id)
             for i, left in enumerate(usable):
                 for right in usable[i + 1:]:
+                    # Repeated reads of the same primer are resequencing
+                    # alternatives, not complementary amplicon reads. They are
+                    # compared in the per-primer review stage, never as assembly
+                    # overlaps.
+                    if left.primer and right.primer and str(left.primer).strip().casefold() == str(right.primer).strip().casefold():
+                        continue
                     evidence = diagnose_overlap(left.oriented_sequence, right.oriented_sequence,
                                                 min_overlap=min_overlap, min_identity=min_overlap_identity)
                     handle.write(
@@ -3638,68 +3769,87 @@ def run_paper_trail(
             recommendation_rows.append(row)
 
 
-    # Generate independently selectable combinations from all reads with an
-    # oriented sequence. QC-failed reads are included as explicit review-only
-    # candidates so a user can inspect a potentially recoverable pair; they are
-    # never silently promoted into the default assembly.
+    # Generate assembly candidates from one read per primer only. Repeated
+    # reads for a primer are alternatives and are explored in the primer-read
+    # selection stage; they must never appear together in an assembly subset.
     candidate_rows: list[dict[str, object]] = []
     candidate_fasta_records: list[tuple[str, str]] = []
     for sequence_id, group in sorted(groups.items()):
         eligible = [read for read in group if read.oriented_sequence]
+        by_primer: dict[str, list[SangerRead]] = {}
+        for read in eligible:
+            primer_key = str(read.primer or '').strip().casefold()
+            # Unresolved primer labels are kept separate rather than collapsed.
+            if not primer_key:
+                primer_key = f'__unresolved__:{read.read_id}'
+            by_primer.setdefault(primer_key, []).append(read)
+        primer_groups = [by_primer[key] for key in sorted(by_primer)]
         candidate_number = 0
-        for size in range(2, len(eligible) + 1):
-            for subset in itertools.combinations(eligible, size):
-                candidate_number += 1
-                candidate_id = f'{sequence_id}__candidate_{candidate_number:02d}'
-                candidate_group = copy.deepcopy(list(subset))
-                candidate_consensus, candidate_stats = assemble_read_group(
-                    candidate_group,
-                    min_overlap=min_overlap,
-                    min_identity=min_overlap_identity,
-                    quality_difference=quality_difference,
-                )
-                if not candidate_consensus:
-                    continue
-                candidate_qc = _classify_output_qc(
-                    candidate_consensus,
-                    list(candidate_stats.get('qualities') or []),
-                    candidate_stats,
-                    candidate_group,
-                    final_min_length=final_min_length,
-                    min_mean_quality=float(min_mean_quality),
-                    max_output_expected_errors=float(max_output_expected_errors),
-                    warn_n_percent=float(warn_n_percent),
-                    max_n_percent=float(max_n_percent),
-                    max_conflict_density=float(max_conflict_density),
-                    max_ambiguous_overlap_conflicts_without_review=int(max_ambiguous_overlap_conflicts_without_review),
-                    processing_mode='assemble',
-                    mode_warning='',
-                )
-                used = [str(x) for x in candidate_stats.get('used_read_ids', [])]
-                all_ids = [read.read_id for read in subset]
-                candidate_rows.append({
-                    'SequenceID': sequence_id,
-                    'CandidateID': candidate_id,
-                    'ReadIDs': ';'.join(all_ids),
-                    'UsedReadIDs': ';'.join(used),
-                    'ReadCount': len(subset),
-                    'ReadQC': ';'.join(f'{read.read_id}:{read.status}' for read in subset),
-                    'IncludesFailedRead': 'yes' if any(read.status != 'kept' for read in subset) else 'no',
-                    'UsedReads': candidate_stats.get('used_reads', 0),
-                    'OutputLength': len(candidate_consensus),
-                    'OverlapLength': candidate_stats.get('overlap_length', 0),
-                    'OverlapIdentity': candidate_stats.get('overlap_identity', ''),
-                    'Conflicts': candidate_stats.get('conflicts', 0),
-                    'AmbiguousConflicts': candidate_stats.get('ambiguous_conflicts', ''),
-                    'UnmergedReads': candidate_stats.get('unmerged_reads', ''),
-                    'QCClass': candidate_qc.get('qc_class', 'FAIL_QC'),
-                    'Recommendation': candidate_qc.get('recommendation', 'RESEQUENCE'),
-                    'Reasons': _join_reasons(candidate_qc.get('reasons', [])),
-                })
-                candidate_fasta_records.append((candidate_id, candidate_consensus))
+        # Enumerate every combination of distinct primer groups, selecting
+        # exactly one attempt from each included primer.
+        for size in range(2, len(primer_groups) + 1):
+            for selected_groups in itertools.combinations(primer_groups, size):
+                for subset in itertools.product(*selected_groups):
+                    candidate_number += 1
+                    candidate_id = f'{sequence_id}__candidate_{candidate_number:02d}'
+                    candidate_group = copy.deepcopy(list(subset))
+                    candidate_consensus, candidate_stats = assemble_read_group(
+                        candidate_group,
+                        min_overlap=min_overlap,
+                        min_identity=min_overlap_identity,
+                        quality_difference=quality_difference,
+                    )
+                    if not candidate_consensus:
+                        continue
+                    candidate_qc = _classify_output_qc(
+                        candidate_consensus,
+                        list(candidate_stats.get('qualities') or []),
+                        candidate_stats,
+                        candidate_group,
+                        final_min_length=final_min_length,
+                        min_mean_quality=float(min_mean_quality),
+                        max_output_expected_errors=float(max_output_expected_errors),
+                        warn_n_percent=float(warn_n_percent),
+                        max_n_percent=float(max_n_percent),
+                        max_conflict_density=float(max_conflict_density),
+                        max_ambiguous_overlap_conflicts_without_review=int(max_ambiguous_overlap_conflicts_without_review),
+                        processing_mode='assemble',
+                        mode_warning='',
+                    )
+                    used = [str(x) for x in candidate_stats.get('used_read_ids', [])]
+                    all_ids = [read.read_id for read in subset]
+                    candidate_rows.append({
+                        'SequenceID': sequence_id,
+                        'CandidateID': candidate_id,
+                        'CandidateType': 'ASSEMBLY',
+                        'ReadIDs': ';'.join(all_ids),
+                        'UsedReadIDs': ';'.join(used),
+                        'ReadCount': len(subset),
+                        'ReadQC': ';'.join(f'{read.read_id}:{read.status}' for read in subset),
+                        'IncludesFailedRead': 'yes' if any(read.status != 'kept' for read in subset) else 'no',
+                        'UsedReads': candidate_stats.get('used_reads', 0),
+                        'OutputLength': len(candidate_consensus),
+                        'OverlapLength': candidate_stats.get('overlap_length', 0),
+                        'OverlapIdentity': candidate_stats.get('overlap_identity', ''),
+                        'Conflicts': candidate_stats.get('conflicts', 0),
+                        'AmbiguousConflicts': candidate_stats.get('ambiguous_conflicts', ''),
+                        'UnmergedReads': candidate_stats.get('unmerged_reads', ''),
+                        'QCClass': candidate_qc.get('qc_class', 'FAIL_QC'),
+                        'Recommendation': candidate_qc.get('recommendation', 'RESEQUENCE'),
+                        'Reasons': _join_reasons(candidate_qc.get('reasons', [])),
+                    })
+                    candidate_fasta_records.append((candidate_id, candidate_consensus))
+
+        # Keep individual-read fallbacks available for the case where the
+        # user's chosen primer attempts cannot form an acceptable assembly.
+        single_rows, single_fasta = _individual_read_candidate_rows(
+            sequence_id, eligible, start_number=candidate_number,
+        )
+        candidate_rows.extend(single_rows)
+        candidate_fasta_records.extend(single_fasta)
 
     with open(assembly_candidates_tsv, 'w') as handle:
-        fields = ['SequenceID', 'CandidateID', 'ReadIDs', 'UsedReadIDs', 'ReadCount',
+        fields = ['SequenceID', 'CandidateID', 'CandidateType', 'ReadIDs', 'UsedReadIDs', 'ReadCount',
                   'ReadQC', 'IncludesFailedRead', 'UsedReads', 'OutputLength', 'OverlapLength', 'OverlapIdentity',
                   'Conflicts', 'AmbiguousConflicts', 'UnmergedReads', 'QCClass',
                   'Recommendation', 'Reasons']

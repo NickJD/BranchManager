@@ -182,6 +182,10 @@ def validate_submission(
     selection_by_id = {}
     metadata_line_by_id = {}
     metadata_signature_by_id = {}
+    # Partner aliases are secondary identifiers only. Resolve them to canonical
+    # project sequence IDs before validating or normalising sample-map rows.
+    partner_alias_to_id = {}
+    ambiguous_partner_aliases = set()
     expected_partner = str(expected_partner_id or '').strip()
     submission_dataset = str(dataset or '').strip()
 
@@ -215,6 +219,16 @@ def validate_submission(
         partner_by_id[sequence_id] = partner
         genome_by_id[sequence_id] = raw_genome
         selection_by_id[sequence_id] = raw_selection
+        own_id = _row_value(row, 'partner_own_ids', 'partner_own_id', 'partner-owned id', 'partner own id')
+        for alias in re.split(r'[;,|]+', own_id or ''):
+            alias = alias.strip()
+            if not alias or alias == sequence_id:
+                continue
+            prior = partner_alias_to_id.get(alias)
+            if prior and prior != sequence_id:
+                ambiguous_partner_aliases.add(alias)
+            else:
+                partner_alias_to_id[alias] = sequence_id
         if not partner:
             problems.append({'severity': 'ERROR', 'line': line_number, 'sequence_id': sequence_id, 'code': 'MISSING_PARTNER_ID', 'detail': 'partner acronym is required'})
         if not raw_genome:
@@ -274,6 +288,10 @@ def validate_submission(
         if not sequence_id:
             problems.append({'severity': 'ERROR', 'line': line_number, 'sequence_id': '', 'code': 'MISSING_SEQUENCE_ID', 'detail': 'sequence/isolate ID is required'})
             continue
+        if sequence_id in ambiguous_partner_aliases:
+            problems.append({'severity': 'ERROR', 'line': line_number, 'sequence_id': sequence_id, 'code': 'AMBIGUOUS_PARTNER_ALIAS', 'detail': 'partner alias maps to more than one canonical project ID'})
+            continue
+        sequence_id = partner_alias_to_id.get(sequence_id, sequence_id)
         seen_ids.add(sequence_id)
         mode = _row_processing_mode(row) or 'assemble'
         row_partner = _row_value(row, *PARTNER_COLUMNS)

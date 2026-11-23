@@ -49,7 +49,10 @@ class PartnerTaxonomyValidationTests(unittest.TestCase):
             self.assertEqual(row['expected_domain'], 'Bacteria')
             self.assertEqual(row['expected_taxon'], '')
             self.assertEqual(row['project_metadata']['partner_taxon_raw'], 'bacterial')
-            self.assertFalse(row['selection_provided'])
+            self.assertFalse(row['selected_for_sequencing'])
+            self.assertFalse(row['selected_for_wgs'])
+            self.assertNotIn('selection_provided', row)
+            self.assertEqual(row['expected_domain'], 'Bacteria')
 
     def test_generic_bacterial_taxon_does_not_reject_specific_bacterial_assignment(self):
         with tempfile.TemporaryDirectory() as tmp:

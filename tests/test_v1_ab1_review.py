@@ -141,3 +141,33 @@ def test_failed_marker_without_consensus_cannot_be_rescued(tmp_path):
     tsv.write_text('sequence_id\tdecision\treviewer\tnotes\nN1\tAPPROVE_FAIL_QC\tNJ\tplease\n')
     results = apply_marker_review_decisions(db, tsv)
     assert results[0]['result'] == 'ERROR'
+
+
+
+def test_assembly_treats_resequencing_reads_for_same_primer_as_alternatives():
+    reads = [
+        pt.SangerRead(
+            read_id='Iso_907R_attempt01', sequence_id='Iso', primer='907R',
+            direction='reverse', source_file='attempt1/Iso_907R.ab1',
+            raw_sequence='A' * 400, raw_qualities=[25] * 400,
+            oriented_sequence='A' * 400, oriented_qualities=[25] * 400,
+            status='kept',
+        ),
+        pt.SangerRead(
+            read_id='Iso_907R_attempt02', sequence_id='Iso', primer='907R',
+            direction='reverse', source_file='attempt2/Iso_907R.ab1',
+            raw_sequence='A' * 500, raw_qualities=[35] * 500,
+            oriented_sequence='A' * 500, oriented_qualities=[35] * 500,
+            status='kept',
+        ),
+        pt.SangerRead(
+            read_id='Iso_27F', sequence_id='Iso', primer='27F',
+            direction='forward', source_file='attempt1/Iso_27F.ab1',
+            raw_sequence='C' * 450, raw_qualities=[30] * 450,
+            oriented_sequence='C' * 450, oriented_qualities=[30] * 450,
+            status='kept',
+        ),
+    ]
+    selected, excluded = pt._prefer_best_read_per_primer(reads)
+    assert {read.read_id for read in selected} == {'Iso_907R_attempt02', 'Iso_27F'}
+    assert excluded == ['Iso_907R_attempt01']

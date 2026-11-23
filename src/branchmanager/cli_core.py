@@ -2540,11 +2540,22 @@ def _cmd_performance_review_impl(args):
                         print(f'  {incoming_file}')
                 else:
                     print(f'[DB] No AB1 paths were found in read_qc.tsv for {existing_id}.')
-                try:
-                    response = input(f'Treat this as a resequenced marker and re-examine isolate {existing_id}? [y/N] ').strip().lower()
-                except EOFError:
-                    response = ''
-                approved = response in {'y', 'yes'}
+                replacement_policy = str(getattr(args, 'replacement_policy', 'prompt') or 'prompt').lower()
+                if replacement_policy == 'approve_qc_pass':
+                    approved = True
+                    response = 'yes (policy: approve_qc_pass)'
+                elif replacement_policy == 'approve_all':
+                    approved = True
+                    response = 'yes (policy: approve_all)'
+                elif replacement_policy == 'decline':
+                    approved = False
+                    response = 'no (policy: decline)'
+                else:
+                    try:
+                        response = input(f'Treat this as a resequenced marker and re-examine isolate {existing_id}? [y/N] ').strip().lower()
+                    except EOFError:
+                        response = ''
+                    approved = response in {'y', 'yes'}
                 decision_row = {
                     'sequence_id': existing_id,
                     'incoming_ab1_files': ';'.join(incoming_files),
@@ -2590,13 +2601,18 @@ def _cmd_performance_review_impl(args):
                             f'[DB] Incoming marker for {existing_id} has lower QC '
                             f'({qc_class}) than the stored marker ({previous_qc_class}).'
                         )
-                        try:
-                            qc_response = input(
-                                f'Use the lower-QC incoming marker for {existing_id}? [y/N] ',
-                            ).strip().lower()
-                        except EOFError:
-                            qc_response = ''
-                        approved = qc_response in {'y', 'yes'}
+                        replacement_policy = str(getattr(args, 'replacement_policy', 'prompt') or 'prompt').lower()
+                        if replacement_policy == 'approve_all':
+                            approved = True
+                            qc_response = 'yes (policy: approve_all)'
+                        else:
+                            try:
+                                qc_response = input(
+                                    f'Use the lower-QC incoming marker for {existing_id}? [y/N] ',
+                                ).strip().lower()
+                            except EOFError:
+                                qc_response = ''
+                            approved = qc_response in {'y', 'yes'}
                         decision_row['qc_review_decision'] = (
                             'USER_APPROVED_LOWER_QC_REPLACEMENT'
                             if approved else 'USER_DECLINED_LOWER_QC_REPLACEMENT'
@@ -4201,6 +4217,7 @@ def cmd_performance_review(args):
                 novelty_metrics=outdir / 'assessment' / 'novelty_metrics.tsv',
                 run_manifest=outdir / 'run_manifest.json',
                 genome_assessment=genome_assessment,
+                database=original_db,
             )
             manifest.add_output(dashboard, role='performance_review_dashboard')
         except BaseException as exc:
@@ -5383,6 +5400,348 @@ def _cmd_project_import(args, *, genomes: bool):
     print(f'[{command_label}] {len(rows) - rejected} row(s) imported; {rejected} rejected.\n  Report: {report}')
 
 
+def cmd_continue_project(args):
+    """Create an immutable project version, reconcile new evidence, reassess, and publish."""
+    import fcntl
+    import shutil
+    import sqlite3
+    from datetime import datetime, timezone
+    from branchmanager.continuation import (
+        backup_sqlite, create_version_dir, copy_assessment_snapshot, sha256_file,
+        latest_performance_review_manifest, inherit_performance_review_args,
+        export_candidate_marker_fasta, write_version_manifest,
+    )
+    from branchmanager.project_state import (
+        import_partner_catalogue, write_partner_catalogue_import_report,
+        import_partner_workbook, write_partner_workbook_import_report,
+    )
+    from branchmanager.genome_evidence_import import import_precomputed_genome_results
+    from branchmanager.utils.fasta import read_fasta
+
+
+
+    original = Path(args.db).expanduser().resolve()
+    if not original.is_file():
+        raise SystemExit(f'[continue-project] Project database does not exist: {original}')
+    if (getattr(args, 'marker_qc', None) or getattr(args, 'marker_review', None)) and not getattr(args, 'marker_fasta', None):
+        raise SystemExit('[continue-project] --marker-qc and --marker-review require --marker-fasta.')
+    version_root = Path(args.version_root).expanduser().resolve() if args.version_root else original.parent / f'{original.stem}_versions'
+    version_dir = create_version_dir(version_root)
+    started_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    old_db_snapshot = backup_sqlite(original, version_dir / 'previous_project.sqlite')
+    previous_manifest = latest_performance_review_manifest(original)
+    previous_assessment_copy = copy_assessment_snapshot(previous_manifest, version_dir)
+    continuation_dir = version_dir / 'continuation'
+    continuation_dir.mkdir(parents=True, exist_ok=True)
+    assessment_dir = version_dir / 'assessment'
+    marker_update_dir = version_dir / 'marker_update_assessment'
+    staged_db = version_dir / '.staged_project.sqlite'
+    lock_path = original.with_name(original.name + '.lock')
+    manifest = RunManifest(continuation_dir, 'continue_project')
+    for source, role in (
+        (original, 'project_database_before'),
+        (args.partner_catalogue, 'cumulative_partner_catalogue'),
+        (args.genome_results, 'precomputed_genome_results'),
+        (getattr(args, 'partner_workbook', None), 'partner_metadata_workbook_or_csv'),
+        (getattr(args, 'marker_fasta', None), 'incoming_marker_fasta'),
+        (getattr(args, 'marker_qc', None), 'incoming_marker_qc'),
+        (getattr(args, 'marker_review', None), 'incoming_marker_review'),
+        (getattr(args, 'taxa_assignments', None), 'incoming_taxonomy_assignments'),
+    ):
+        if source:
+            manifest.add_input(source, role=role)
+    manifest.add_output(old_db_snapshot, role='immutable_previous_database_snapshot')
+    if previous_assessment_copy:
+        manifest.add_output(previous_assessment_copy, role='immutable_previous_assessment_snapshot')
+
+    def _review_namespace(input_fasta, outdir, database_path, dataset, *, incoming=False):
+        if previous_manifest:
+            recovered, _old_data = inherit_performance_review_args(previous_manifest)
+        else:
+            from branchmanager.cli.parser import build_parser
+            required_ref = getattr(args, 'ref', None)
+            if not required_ref:
+                raise RuntimeError(
+                    'No previous Performance Review manifest was found. Supply --ref to initialise continuation assessment settings.'
+                )
+            recovered = build_parser().parse_args([
+                'performance-review', '--input', str(input_fasta), '--db', str(database_path),
+                '--out', str(outdir), '--dataset', str(dataset), '--ref', str(required_ref),
+            ])
+        recovered.db = str(database_path)
+        recovered.input = str(input_fasta)
+        recovered.out = str(outdir)
+        recovered.dataset = str(dataset)
+        recovered.partner_metadata = str(args.partner_catalogue)
+        recovered.command = 'performance-review'
+        recovered.marker_source_type = getattr(args, 'marker_source_type', 'auto') if incoming else 'PARTNER_FASTA'
+        recovered.marker_qc = getattr(args, 'marker_qc', None) if incoming else None
+        recovered.marker_review = getattr(args, 'marker_review', None) if incoming else None
+        recovered.taxa_assignments = getattr(args, 'taxa_assignments', None) if incoming else None
+        recovered.replacement_policy = getattr(args, 'replacement_policy', 'prompt') if incoming else 'decline'
+        recovered.previous_review = str(previous_assessment_copy or getattr(recovered, 'previous_review', '') or '')
+        # Explicit overrides take precedence over recovered historical settings.
+        for attr in ('ref', 'taxa', 'main_ref', 'mwl', 'mwl_sheet', 'threads',
+                     'baseline_fasta', 'baseline_taxa_assignments', 'chimera_ref', 'anchors',
+                     'sequence_domain'):
+            value = getattr(args, attr, None)
+            if value is not None:
+                setattr(recovered, attr, value)
+        if getattr(args, 'ref', None) and not getattr(args, 'taxa', None):
+            # A changed primary reference must not silently reuse the old taxonomy table.
+            recovered.taxa = None
+            recovered.taxa_assignments = None
+        if getattr(args, 'alt_ref', None) is not None:
+            recovered.alt_ref = args.alt_ref
+            recovered.alt_taxa = args.alt_taxa or []
+            recovered.alt_ref_name = args.alt_ref_name or []
+        elif getattr(args, 'alt_taxa', None) is not None or getattr(args, 'alt_ref_name', None) is not None:
+            raise RuntimeError('--alt-taxa and --alt-ref-name overrides must be supplied with --alt-ref so positional reference pairing remains consistent.')
+        recovered.accept_unverified_marker_qc = bool(getattr(args, 'accept_unverified_marker_qc', False)) if incoming else False
+        recovered.unverified_override_authorizer = getattr(args, 'unverified_override_authorizer', '') if incoming else ''
+        recovered.unverified_override_reason = getattr(args, 'unverified_override_reason', '') if incoming else ''
+        if incoming and recovered.accept_unverified_marker_qc:
+            if not str(recovered.unverified_override_authorizer or '').strip() or not str(recovered.unverified_override_reason or '').strip():
+                raise RuntimeError('--accept-unverified-marker-qc requires --unverified-override-authorizer and --unverified-override-reason.')
+        if not getattr(recovered, 'ref', None) or not Path(str(recovered.ref)).is_file():
+            raise RuntimeError(
+                f'Primary reference FASTA is missing or unavailable ({getattr(recovered, "ref", None)!r}). '
+                'Supply a valid --ref path.'
+            )
+        for path_attr in ('taxa', 'mwl', 'baseline_fasta', 'baseline_taxa_assignments', 'chimera_ref', 'anchors'):
+            value = getattr(recovered, path_attr, None)
+            if value and not Path(str(value)).is_file():
+                if path_attr in {'taxa', 'mwl', 'baseline_fasta', 'baseline_taxa_assignments', 'chimera_ref', 'anchors'}:
+                    raise RuntimeError(
+                        f'Inherited Performance Review input is unavailable: {path_attr}={value!r}. '
+                        f'Override it with the corresponding continue-project option or update the source files.'
+                    )
+        return recovered
+
+
+    # The previous Performance Review settings are recoverable from the run manifest
+    # and its recorded command line; missing historical files are surfaced rather
+    # than silently changing the scientific configuration.
+    previous_manifest = previous_manifest
+    with open(lock_path, 'a+') as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            staged_db.unlink(missing_ok=True)
+            current_locked_snapshot = version_dir / '.current_locked_check.sqlite'
+            backup_sqlite(original, current_locked_snapshot)
+            if sha256_file(current_locked_snapshot) != sha256_file(old_db_snapshot):
+                raise RuntimeError(
+                    'The project database changed after the pre-continuation snapshot was created. '
+                    'No changes were published; rerun continue-project to create a consistent version.'
+                )
+            backup_sqlite(old_db_snapshot, staged_db)
+            current_locked_snapshot.unlink(missing_ok=True)
+            db = Database(str(staged_db))
+            db.initialise()
+            manifest.add_stage('data_reconciliation', 'RUNNING', detail='cumulative catalogue, partner metadata, and genome evidence')
+            catalogue_rows = import_partner_catalogue(db, args.partner_catalogue)
+            catalogue_report = write_partner_catalogue_import_report(
+                continuation_dir / 'partner_catalogue_continue_report.tsv', catalogue_rows,
+            )
+            manifest.add_output(catalogue_report, role='partner_catalogue_reconciliation_report')
+            workbook_rows = []
+            if args.partner_workbook:
+                workbook_rows = import_partner_workbook(
+                    db, args.partner_workbook, sheet_name=args.partner_workbook_sheet,
+                    dataset=args.partner_workbook_dataset,
+                )
+                workbook_report = write_partner_workbook_import_report(
+                    continuation_dir / 'partner_workbook_continue_report.tsv', workbook_rows,
+                )
+                manifest.add_output(workbook_report, role='partner_workbook_import_report')
+            genome_summary = import_precomputed_genome_results(
+                db, args.genome_results, dry_run=False,
+            )
+            manifest.add_stage('data_reconciliation', 'COMPLETE', detail='cumulative metadata and genome results reconciled')
+
+            # If new marker sequences were supplied, process them through the existing
+            # Performance Review marker/QC/resequencing pathway first. A subsequent full
+            # cumulative review is then run over the active markers in the DB.
+            marker_ingest_summary = None
+            if args.marker_fasta:
+                incoming_records = list(read_fasta(args.marker_fasta))
+                if not incoming_records:
+                    raise RuntimeError('--marker-fasta was supplied but contains no FASTA records.')
+                ingest_args = _review_namespace(
+                    args.marker_fasta, marker_update_dir, staged_db, args.marker_dataset, incoming=True,
+                )
+                ingest_args.replacement_policy = args.replacement_policy
+                manifest.add_stage('incoming_marker_review', 'RUNNING', detail=f'{len(incoming_records)} incoming marker record(s)')
+                cmd_performance_review(ingest_args)
+                marker_ingest_summary = {
+                    'records_supplied': len(incoming_records),
+                    'assessment_directory': str(marker_update_dir),
+                    'replacement_policy': args.replacement_policy,
+                }
+                manifest.add_stage('incoming_marker_review', 'COMPLETE', detail='incoming markers QC-checked and reconciled')
+
+            cumulative_fasta = export_candidate_marker_fasta(db, version_dir / 'cumulative_candidate_markers.fasta')
+            manifest.add_output(cumulative_fasta, role='cumulative_marker_fasta_for_assessment')
+            assessment_args = _review_namespace(
+                cumulative_fasta, assessment_dir, staged_db,
+                f'Continue_{version_dir.name}', incoming=False,
+            )
+            assessment_args.replacement_policy = 'decline'
+            manifest.add_stage('cumulative_assessment', 'RUNNING', detail='full project reassessment using cumulative active candidate markers')
+            cmd_performance_review(assessment_args)
+            manifest.add_stage('cumulative_assessment', 'COMPLETE', detail='full cumulative Performance Review completed')
+
+            with sqlite3.connect(str(staged_db)) as conn:
+                integrity = conn.execute('PRAGMA integrity_check').fetchone()[0]
+            if integrity != 'ok':
+                raise RuntimeError(f'Continued staged database failed SQLite integrity_check: {integrity}')
+            final_db_snapshot = backup_sqlite(staged_db, version_dir / 'project.sqlite')
+            manifest.add_output(final_db_snapshot, role='versioned_project_database')
+            assessment_required = [
+                assessment_dir / 'assessment' / 'sequence_assessment.tsv',
+                assessment_dir / 'assessment' / 'selection_summary.tsv',
+                assessment_dir / 'assessment' / 'novelty_metrics.tsv',
+                assessment_dir / 'assessment' / 'pangenome_hierarchy.tsv',
+                assessment_dir / 'performance_review_dashboard.html',
+            ]
+            missing_assessment_outputs = [str(path) for path in assessment_required if not path.is_file()]
+            if missing_assessment_outputs:
+                raise RuntimeError('Cumulative assessment did not produce required outputs: ' + '; '.join(missing_assessment_outputs))
+
+            summary = {
+                'version': version_dir.name,
+                'previous_version_database': str(old_db_snapshot),
+                'new_version_database': str(final_db_snapshot),
+                'partner_catalogue_rows': len(catalogue_rows),
+                'catalogue_inserted': sum(row.get('result') == 'INSERTED' for row in catalogue_rows),
+                'catalogue_updated': sum(row.get('result') == 'UPDATED' for row in catalogue_rows),
+                'partner_workbook_rows': len(workbook_rows),
+                'genome_results': genome_summary,
+                'incoming_marker_review': marker_ingest_summary,
+                'assessment': 'COMPLETE',
+                'dry_run': bool(args.dry_run),
+                'database_integrity': integrity,
+            }
+            summary_path = continuation_dir / 'continue_project_summary.json'
+            summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+            manifest.add_output(summary_path, role='continue_project_summary')
+            manifest.add_stage('validation', 'COMPLETE', detail='required assessment outputs and SQLite integrity validated')
+            manifest.finish('COMPLETE')
+            db.record_project_run(
+                f'continue-project:{version_dir.name}', 'continue_project', 'COMPLETE',
+                manifest_path=str(manifest.json_path), started_at=manifest.data['started_at'],
+                completed_at=manifest.data['completed_at'],
+            )
+
+            # Publication is deferred until the version and requested outputs are written.
+            requested_out = Path(args.out).expanduser().resolve() / version_dir.name
+            requested_out.mkdir(parents=True, exist_ok=True)
+            for report_name in ('partner_catalogue_continue_report.tsv', 'partner_workbook_continue_report.tsv', 'continue_project_summary.json'):
+                source_report = continuation_dir / report_name
+                if source_report.is_file():
+                    shutil.copy2(source_report, requested_out / report_name)
+            # Provide principal assessment outputs in -o for convenience; the
+            # version directory retains the complete, immutable assessment tree.
+            for relative in (
+                Path('assessment/sequence_assessment.tsv'),
+                Path('assessment/selection_summary.tsv'),
+                Path('assessment/novelty_metrics.tsv'),
+                Path('assessment/pangenome_hierarchy.tsv'),
+                Path('assessment/sequencing_sets.tsv'),
+                Path('assessment/genome_collection_assessment.tsv'),
+                Path('performance_review_dashboard.html'),
+            ):
+                source_report = assessment_dir / relative
+                if source_report.is_file():
+                    target_report = requested_out / relative
+                    target_report.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_report, target_report)
+            if marker_update_dir.is_dir():
+                shutil.copytree(marker_update_dir, requested_out / 'marker_update_assessment', dirs_exist_ok=True)
+            # Record convenience copies in the continuation run manifest as well.
+            for output_path in (
+                requested_out / 'partner_catalogue_continue_report.tsv',
+                requested_out / 'partner_workbook_continue_report.tsv',
+                requested_out / 'continue_project_summary.json',
+                requested_out / 'assessment' / 'sequence_assessment.tsv',
+                requested_out / 'assessment' / 'selection_summary.tsv',
+                requested_out / 'assessment' / 'novelty_metrics.tsv',
+                requested_out / 'assessment' / 'pangenome_hierarchy.tsv',
+                requested_out / 'assessment' / 'sequencing_sets.tsv',
+                requested_out / 'assessment' / 'genome_collection_assessment.tsv',
+                requested_out / 'performance_review_dashboard.html',
+            ):
+                if output_path.is_file():
+                    manifest.add_output(output_path, role='convenience_output', required=False)
+            version_manifest = {
+                'schema_version': 1,
+                'version': version_dir.name,
+                'created_at': started_at,
+                'status': 'READY_TO_PUBLISH' if not args.dry_run else 'DRY_RUN_COMPLETE',
+                'published': False,
+                'database_path': str(original),
+                'output_directory': str(requested_out),
+                'previous_database_snapshot': str(old_db_snapshot),
+                'new_database_snapshot': str(final_db_snapshot),
+                'previous_performance_review_manifest': str(previous_manifest or ''),
+                'previous_assessment_snapshot': str(previous_assessment_copy or ''),
+                'continuation_inputs': {
+                    'partner_catalogue': str(Path(args.partner_catalogue).resolve()),
+                    'genome_results': str(Path(args.genome_results).resolve()),
+                    'partner_workbook': str(Path(args.partner_workbook).resolve()) if args.partner_workbook else '',
+                    'marker_fasta': str(Path(args.marker_fasta).resolve()) if args.marker_fasta else '',
+                    'marker_qc': str(Path(args.marker_qc).resolve()) if args.marker_qc else '',
+                    'marker_review': str(Path(args.marker_review).resolve()) if args.marker_review else '',
+                },
+                'summary': summary,
+            }
+            write_version_manifest(version_dir / 'version_manifest.json', version_manifest)
+            manifest.add_output(version_dir / 'version_manifest.json', role='version_manifest')
+            if (continuation_dir / 'run_manifest.json').is_file():
+                try:
+                    shutil.copy2(continuation_dir / 'run_manifest.json', requested_out / 'run_manifest.json')
+                except OSError as copy_error:
+                    logging.getLogger(__name__).warning('[continue-project] Run manifest copy failed: %s', copy_error)
+            # All assessments, snapshots, reports, and manifests are ready. Publish
+            # the staged database atomically as the final project-state operation.
+            if not args.dry_run:
+                publish_tmp = original.with_name(original.name + '.publishing')
+                publish_tmp.unlink(missing_ok=True)
+                backup_sqlite(staged_db, publish_tmp)
+                os.replace(publish_tmp, original)
+                version_manifest['status'] = 'COMPLETE'
+                version_manifest['published'] = True
+                try:
+                    latest_payload = {'version': version_dir.name, 'database': str(original), 'published_at': started_at}
+                    latest_tmp = version_root / '.latest.json.tmp'
+                    latest_tmp.write_text(json.dumps(latest_payload, indent=2) + '\n', encoding='utf-8')
+                    os.replace(latest_tmp, version_root / 'latest.json')
+                    write_version_manifest(version_dir / 'version_manifest.json', version_manifest)
+                    manifest.add_output(version_dir / 'version_manifest.json', role='version_manifest')
+                    manifest.add_output(original, role='published_project_database')
+                    shutil.copy2(continuation_dir / 'run_manifest.json', requested_out / 'run_manifest.json')
+                except Exception as update_error:
+                    logging.getLogger(__name__).warning(
+                        '[continue-project] DB published; latest pointer or version manifest update failed: %s',
+                        update_error,
+                    )
+            print(json.dumps(summary, indent=2))
+        except BaseException as exc:
+            # Keep the failed version directory for diagnostics; original DB is untouched.
+            manifest.finish('FAILED', error=exc)
+            failure_payload = {
+                'schema_version': 1, 'version': version_dir.name, 'created_at': started_at,
+                'status': 'FAILED', 'published': False, 'database_path': str(original),
+                'previous_database_snapshot': str(old_db_snapshot),
+                'error': f'{type(exc).__name__}: {exc}',
+            }
+            write_version_manifest(version_dir / 'version_manifest.json', failure_payload)
+            raise
+        finally:
+            staged_db.unlink(missing_ok=True)
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
 def cmd_add_external_genomes(args):
     """Add genome evidence acquired outside BranchManager's selection cycle."""
     import fcntl
@@ -5529,7 +5888,7 @@ def cmd_import_partner_workbook(args):
                 conflicts = sum(row.get('result') == 'CONFLICT' for row in results)
                 rejected = sum(row.get('result') == 'REJECTED' for row in results)
                 mode_label = 'genome-only partner registration'
-                detail = (f'{len(results)} workbook row(s); {inserted} new isolate(s); '
+                detail = (f'{len(results)} isolate row(s); {inserted} new isolate(s); '
                           f'{conflicts} conflict(s); {rejected} rejected')
             else:
                 results = import_partner_workbook(
@@ -6251,6 +6610,120 @@ def _cohort_manual_read_selections(decisions_path: str | Path | None) -> dict[st
     return selections
 
 
+def _cohort_discover_review_decisions(root: Path) -> Path | None:
+    """Find review decisions, preferring the latest previous cohort template.
+
+    Explicit release-level decisions files remain authoritative. If none are found,
+    discover prior cohort templates in the same version store and select the newest
+    template that contains at least one completed decision. Blank templates are not
+    useful decision sources.
+    """
+    explicit = set()
+    for ancestor in (root, *root.parents):
+        review_dir = ancestor / 'inputs' / 'reviews'
+        if review_dir.is_dir():
+            explicit.update(p.resolve() for p in review_dir.glob('cohort_marker_review_decisions*.tsv')
+                          if p.is_file())
+    if len(explicit) > 1:
+        names = '\n  '.join(str(p) for p in sorted(explicit))
+        raise SystemExit(
+            '[assistant-cohort] Multiple review-decision TSVs were discovered; pass --marker-review '
+            'to select one explicitly:\n  ' + names
+        )
+    if explicit:
+        return next(iter(explicit))
+
+    # Cohort outputs are commonly stored under versions/<timestamp>/cohort. Search
+    # sibling versions but never the current output itself; choose the newest prior
+    # populated template. The template's decisions are restored by canonical ID.
+    versions_dir = next((ancestor for ancestor in (root, *root.parents)
+                       if ancestor.name == 'versions'), None)
+    if versions_dir is None or not versions_dir.is_dir():
+        return None
+    current_version = root.parent.name if root.parent.name not in {'cohort', 'assistant'} else ''
+    candidates = []
+    for version_dir in versions_dir.iterdir():
+        if not version_dir.is_dir() or version_dir.name == current_version:
+            continue
+        template = version_dir / 'cohort' / '00_cohort_preparation' / 'cohort_marker_review_template.tsv'
+        if not template.is_file():
+            continue
+        rows = _cohort_read_rows(template)
+        if any(str(row.get('decision') or '').strip() for row in rows):
+            candidates.append((version_dir.name, template.resolve()))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[-1][1]
+
+
+def _cohort_reconcile_review_decisions(source_path: Path | None, template_path: Path, prep_root: Path) -> dict:
+    """Audit incremental decision carry-forward using canonical sequence IDs.
+
+    Prior decisions need only overlap the new template; newly added isolates are
+    expected and blank decisions are not reconciliation failures. Existing decisions
+    must be carried unchanged for overlapping IDs.
+    """
+    from collections import Counter
+
+    def read_review(path):
+        rows = _cohort_read_rows(path)
+        ids = [str(row.get('sequence_id') or '').strip() for row in rows]
+        decisions = {sid: str(row.get('decision') or '').strip() for sid, row in zip(ids, rows)}
+        errors = []
+        if any(not sid for sid in ids):
+            errors.append('blank_sequence_id')
+        duplicate_ids = sorted(sid for sid, count in Counter(ids).items() if sid and count > 1)
+        if duplicate_ids:
+            errors.append('duplicate_sequence_id')
+        return set(ids), decisions, duplicate_ids, errors
+
+    report = {'status': 'NO_SOURCE', 'source': str(source_path) if source_path else '',
+              'prepared_template': str(template_path), 'carried_decisions': [],
+              'new_template_ids': [], 'source_ids_not_in_template': [],
+              'missing_from_template': [], 'unexpected_in_template': [],
+              'decision_mismatches': [], 'source_duplicate_ids': [],
+              'template_duplicate_ids': [], 'source_errors': [], 'template_errors': []}
+    template_ids, template_decisions, template_dupes, template_errors = read_review(template_path)
+    if source_path is not None:
+        source_ids, source_decisions, source_dupes, source_errors = read_review(source_path)
+        overlap = source_ids & template_ids
+        report.update({
+            'carried_decisions': sorted(sid for sid in overlap if source_decisions[sid]),
+            'new_template_ids': sorted(template_ids - source_ids),
+            'source_ids_not_in_template': sorted(source_ids - template_ids),
+            'missing_from_template': sorted(source_ids - template_ids),
+            'unexpected_in_template': sorted(template_ids - source_ids),
+            'decision_mismatches': sorted([
+                {'sequence_id': sid, 'source_decision': source_decisions[sid],
+                 'template_decision': template_decisions[sid]}
+                for sid in overlap if source_decisions[sid]
+                and source_decisions[sid] != template_decisions[sid]
+            ], key=lambda item: item['sequence_id']),
+            'source_duplicate_ids': source_dupes, 'template_duplicate_ids': template_dupes,
+            'source_errors': source_errors, 'template_errors': template_errors,
+        })
+        passed = not any(report[key] for key in ('decision_mismatches', 'source_duplicate_ids',
+                                                 'template_duplicate_ids', 'source_errors', 'template_errors'))
+        report['status'] = 'PASS' if passed else 'FAIL'
+    rows = []
+    for key in ('new_template_ids', 'source_ids_not_in_template', 'source_duplicate_ids',
+                'template_duplicate_ids', 'source_errors', 'template_errors'):
+        for value in report[key]:
+            rows.append({'issue': key, 'sequence_id': value if isinstance(value, str) else '', 'details': ''})
+    for mismatch in report['decision_mismatches']:
+        rows.append({'issue': 'decision_mismatch', 'sequence_id': mismatch['sequence_id'],
+                    'details': f"source={mismatch['source_decision']}\ttemplate={mismatch['template_decision']}"})
+    tsv_path = prep_root / 'cohort_review_reconciliation.tsv'
+    _cohort_write_rows(tsv_path, ['issue', 'sequence_id', 'details'], rows)
+    json_path = prep_root / 'cohort_review_reconciliation.json'
+    json_path.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+    print(f'[assistant-cohort] Review decision reconciliation: {report["status"]} ({json_path})')
+    if report['status'] == 'FAIL':
+        raise SystemExit('[assistant-cohort] Review decisions do not reconcile; inspect cohort_review_reconciliation.tsv/json.')
+    return report
+
+
 def _cohort_restore_review_state(
     review_rows: list[dict],
     template_path: Path,
@@ -6624,17 +7097,29 @@ def _cohort_prepare(args, root: Path, batches: list[dict]) -> Path:
                 allowed = 'REJECT|RESEQUENCE'
             row['allowed_decisions'] = allowed
         template_path = prep_root / 'cohort_marker_review_template.tsv'
+        review_decisions_source = getattr(args, 'marker_review', None)
+        if not review_decisions_source:
+            discovered = _cohort_discover_review_decisions(root)
+            if discovered is not None:
+                review_decisions_source = str(discovered)
+                print(f'[assistant-cohort] Automatically discovered review decisions: {discovered}')
         restored_decisions = _cohort_restore_review_state(
-            review_rows, template_path, getattr(args, 'marker_review', None),
+            review_rows, template_path, review_decisions_source,
         )
         restored_read_selections = sum(
             str(row.get('read_selection_source') or '').upper() == 'MANUAL'
             and bool(str(row.get('selected_read_id') or '').strip())
             for row in review_rows
         )
-        if getattr(args, 'marker_review', None):
-            manifest.add_input(args.marker_review, role='previous_cohort_review_decisions')
+        if review_decisions_source:
+            manifest.add_input(review_decisions_source, role='previous_cohort_review_decisions')
         _cohort_write_rows(template_path, _COHORT_REVIEW_FIELDS, review_rows)
+        reconciliation = _cohort_reconcile_review_decisions(
+            Path(review_decisions_source).resolve() if review_decisions_source else None,
+            template_path, prep_root,
+        )
+        manifest.add_output(prep_root / 'cohort_review_reconciliation.tsv', role='cohort_review_reconciliation_tsv')
+        manifest.add_output(prep_root / 'cohort_review_reconciliation.json', role='cohort_review_reconciliation_json')
         if restored_decisions:
             print(f'[assistant-cohort] Restored {restored_decisions} existing manual review decision(s) into the regenerated template.')
         if restored_read_selections:
@@ -7136,6 +7621,48 @@ def _cohort_assess(args, root: Path) -> None:
         if records:
             manifest.add_output(joint_root / 'run_manifest.json', role='joint_assistant_manifest')
             manifest.add_output(joint_root / '03_performance_review_hiring_panel' / 'assessment' / 'selection_summary.tsv', role='joint_selection_summary')
+            # Cohort assessment is run inside the joint Assistant subdirectory. In a
+            # release context, publish its user-facing assessment artefacts into the
+            # release-level folders as well, so downstream release tooling has a
+            # stable location independent of the cohort implementation layout.
+            nested_review = joint_root / '03_performance_review_hiring_panel'
+            release_context = getattr(args, 'release_context', None)
+            if release_context:
+                release_context_path = Path(release_context).expanduser()
+                if release_context_path.is_absolute() and (release_context_path / 'release_manifest.json').is_file():
+                    release_dir = release_context_path.resolve()
+                else:
+                    from branchmanager.release_manager import ReleaseManager
+                    project_root_hint = None
+                    config_hint = getattr(args, 'config', None)
+                    if config_hint:
+                        try:
+                            project_root_hint = load_project_config(config_hint).get('project_directory')
+                        except Exception:
+                            pass
+                    project_root_hint = project_root_hint or os.getcwd()
+                    release_dir = ReleaseManager(project_root_hint).resolve_release(str(release_context))
+                nested_assessment = nested_review / 'assessment'
+                release_assessment = release_dir / 'assessment'
+                if nested_assessment.is_dir():
+                    import shutil
+                    shutil.copytree(nested_assessment, release_assessment, dirs_exist_ok=True)
+                nested_dashboard = nested_review / 'performance_review_dashboard.html'
+                if nested_dashboard.is_file():
+                    release_dashboard = release_dir / 'dashboard'
+                    release_dashboard.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(nested_dashboard, release_dashboard / nested_dashboard.name)
+                # Only mark these stages complete when the promoted artefacts exist.
+                if (release_assessment / 'sequence_assessment.tsv').is_file() and (release_assessment / 'selection_summary.tsv').is_file():
+                    try:
+                        from branchmanager.release_manager import ReleaseManager
+                        project_root = json.loads((release_dir / 'release_manifest.json').read_text()).get('project_root')
+                        release_manager = ReleaseManager(project_root)
+                        release_manager.update_workflow_status(release_dir, 'assessment', 'COMPLETE', event='cohort_assessment_promoted', details={'source': str(nested_assessment)})
+                        if (release_dir / 'dashboard' / nested_dashboard.name).is_file():
+                            release_manager.update_workflow_status(release_dir, 'dashboard', 'COMPLETE', event='cohort_dashboard_promoted', details={'source': str(nested_dashboard)})
+                    except Exception as promotion_error:
+                        raise RuntimeError(f'Could not update release assessment/dashboard status after promotion: {promotion_error}')
         status = 'COMPLETE_WITH_WARNINGS' if failure_reasons else 'COMPLETE'
         manifest.add_stage('assistant_cohort', status,
                            detail=f'{len(batch_ids)} isolate(s), {len(records)} marker(s) assessed, '
@@ -7732,11 +8259,136 @@ def cmd_regenerate_assessment(args):
 def main(argv=None):
     from branchmanager.cli.parser import build_parser
     parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command in {'project', 'release'}:
+        from branchmanager.release_manager import ReleaseManager
+        manager = ReleaseManager(args.root if args.command == 'project' else args.project_root)
+        if args.command == 'project':
+            if args.project_action == 'init':
+                manifest = manager.init_project(args.name, config_source=args.config_source, releases_dir=args.releases_dir, overwrite=args.overwrite)
+                print(f"Project initialised: {manifest['project_root']}\nConfig: {manifest['config']}\nRelease store: {manifest['releases_root']}")
+            elif args.project_action == 'info':
+                manifest = manager.load_project()
+                print(json.dumps(manifest, indent=2))
+            elif args.project_action == 'list-releases':
+                rows = manager.list_releases()
+                if not rows: print('No releases found.')
+                for row in rows: print(f"{row['release_id']}\t{row['status']}\t{row.get('created_at') or '-'}\t{row['path']}")
+            elif args.project_action == 'validate':
+                manifest = manager.load_project(); issues=[]
+                config = Path(manifest.get('config', 'project_config.json'))
+                if not config.is_absolute(): config = manager.project_root / config
+                if not config.is_file(): issues.append(f"Config file missing: {config}")
+                try:
+                    from branchmanager.project_config import load_project_config as _load_project_config
+                    if config.is_file(): _load_project_config(config)
+                except Exception as exc: issues.append(f"Config validation failed: {exc}")
+                print(json.dumps({'project_root':str(manager.project_root),'valid':not issues,'issues':issues},indent=2))
+                return 1 if issues else 0
+        elif args.command == 'release':
+            if args.release_action == 'adopt':
+                m=manager.adopt_release(args.release_id,config_snapshot=not args.no_config_snapshot)
+                print(f"Release adopted: {m['release_id']}\nRelease directory: {m['release_dir']}\nDatabase: {m['database']}\nStatus: {m['status']}\nExisting contents preserved.")
+            elif args.release_action == 'create':
+                m=manager.create_release(args.release_id,parent_release=args.parent_release,copy_database=args.copy_database,config_snapshot=not args.no_config_snapshot)
+                print(f"Release created: {m['release_id']}\nRelease directory: {m['release_dir']}\nDatabase: {m['database']}\nStatus: {m['status']}")
+            elif args.release_action == 'info':
+                print(json.dumps(manager.get_release_manifest(args.release),indent=2))
+            elif args.release_action == 'validate':
+                result=manager.validate_release(args.release); print(json.dumps(result,indent=2)); return 0 if result['valid'] else 1
+            elif args.release_action == 'status':
+                m=manager.update_status(args.release,args.status_value,workflow=args.workflow,event='manual_status_update',details={'note':args.note} if args.note else {})
+                print(f"Updated {m['release_id']} status: {m['status']}")
+        return 0
+    release_workflow_key = {
+        'filing-cabinet': 'filing_cabinet', 'performance-review': 'assessment',
+        'quarterly-review': 'assessment', 'assistant': 'cohort', 'dashboard': 'dashboard',
+        'regenerate-assessment': 'assessment', 'records-update': 'genome_import',
+        'import-genome-results': 'genome_import', 'import-genome-evidence': 'genome_import',
+        'import-genome-16s': 'genome_import', 'add-external-genomes': 'genome_import',
+        'add-maldi-identifications': 'genome_import', 'import-partner-workbook': 'registration',
+        'marker-review-apply': 'cohort', 'register-marker-evidence': 'cohort',
+        'marker-evidence-migrate': 'cohort', 'continue-project': 'continuation',
+    }.get(args.command)
     selected_config = config_path_from_argv(argv)
+    args = parser.parse_args(argv)
+    release_context = getattr(args, 'release_context', None)
+    release_manager = None
+    release_dir = None
+    release_manifest = None
+    if release_context:
+        from branchmanager.release_manager import ReleaseManager
+        release_path = Path(release_context).expanduser()
+        if release_path.is_absolute() or release_path.exists():
+            release_manifest_path = release_path.resolve() / 'release_manifest.json'
+            if not release_manifest_path.is_file():
+                parser.error(f'--release does not point to a BranchManager release: {release_context}')
+            release_manifest = json.loads(release_manifest_path.read_text(encoding='utf-8'))
+            project_root = release_manifest.get('project_root')
+            if not project_root:
+                parser.error(f'Release manifest has no project_root: {release_manifest_path}')
+            release_manager = ReleaseManager(project_root)
+            try: release_dir = release_manager.resolve_release(release_path)
+            except Exception as exc: parser.error(str(exc))
+        else:
+            # Release IDs are resolved against the project root from --config or cwd.
+            project_root = None
+            if selected_config:
+                try: project_root = load_project_config(selected_config).get('project_directory')
+                except Exception: pass
+            project_root = project_root or os.getcwd()
+            release_manager = ReleaseManager(project_root)
+            try: release_dir = release_manager.resolve_release(release_context)
+            except Exception as exc: parser.error(str(exc))
+        release_manifest = release_manager.get_release_manifest(release_dir)
+        if not selected_config and release_manifest.get('config_snapshot'):
+            selected_config = str(release_dir / release_manifest['config_snapshot'])
     if selected_config:
         project_config = load_project_config(selected_config)
         apply_project_config_defaults(parser, project_config)
     args = parser.parse_args(argv)
+    if release_dir:
+        release_db = Path(release_manifest.get('database', release_dir / 'project.sqlite')).expanduser().resolve()
+        if not release_db.is_relative_to(release_dir.resolve()):
+            parser.error(f'Release database path escapes release directory: {release_db}')
+        if hasattr(args, 'db'):
+            raw_argv_db = list(sys.argv[1:] if argv is None else argv)
+            explicit_db = any(x == '--db' or x.startswith('--db=') for x in raw_argv_db)
+            if explicit_db and args.db and Path(args.db).expanduser().resolve() != release_db:
+                parser.error(f'--db conflicts with selected release database ({release_db}); use a different release or omit --db')
+            args.db = str(release_db)
+        if hasattr(args, 'out'):
+            raw_argv = list(sys.argv[1:] if argv is None else argv)
+            explicit_out = any(x in {'--out','-o'} or x.startswith('--out=') for x in raw_argv)
+            if not explicit_out:
+                if args.command == 'filing-cabinet': args.out = str(release_dir / 'filing_cabinet')
+                elif args.command == 'performance-review': args.out = str(release_dir / 'assessment')
+                elif args.command == 'assistant': args.out = str(release_dir)
+                elif args.command == 'quarterly-review': args.out = str(release_dir / 'assessment')
+                elif args.command == 'continue-project': args.out = str(release_dir / 'continuation')
+                elif args.command == 'regenerate-assessment': pass
+                else: args.out = str(release_dir)
+            if args.command == 'continue-project' and hasattr(args, 'version_root'):
+                if not getattr(args, 'version_root', None):
+                    args.version_root = str(release_dir / 'continuation_versions')
+                version_root_path = Path(args.version_root).expanduser().resolve()
+                if not version_root_path.is_relative_to(release_dir.resolve()):
+                    parser.error(f'--version-root must remain inside the selected release: {version_root_path}')
+                args.version_root = str(version_root_path)
+            if args.out:
+                out_path = Path(args.out).expanduser().resolve()
+                if not out_path.is_relative_to(release_dir.resolve()):
+                    parser.error(f'Output path must remain inside the selected release: {out_path}')
+                args.out = str(out_path)
+        # Release-level provenance/status updates are conservative: do not mark a
+        # workflow COMPLETE here; individual command success is handled below.
+        release_manager.update_status(release_dir, 'IN_PROGRESS', workflow=release_workflow_key, event='workflow_invoked',
+            details={'command': args.command, 'argv': list(sys.argv[1:] if argv is None else argv)})
+        release_manager.record_workflow_event(release_dir, workflow=release_workflow_key or args.command, command=args.command,
+            argv=list(sys.argv[1:] if argv is None else argv), status='STARTED', event='workflow_started')
+    # Preserve the original required-database contract for non-release runs.
+    if hasattr(args, 'db') and not getattr(args, 'db', None) and not release_dir:
+        parser.error(f'{args.command} requires --db, or use --release to supply a release database')
     if args.command in {'ground-truth', 'validate'}:
         from branchmanager.validation import run_cli as _run_validation_cli
         result = _run_validation_cli(args)
@@ -7755,8 +8407,14 @@ def main(argv=None):
             parser.error('--cohort-prepare-only requires --cohort-manifest')
         if getattr(args, 'cohort_resume', None) and not args.out:
             args.out = args.cohort_resume
-        if not args.dataset:
+        cohort_prepare_only = (
+            bool(getattr(args, 'cohort_prepare_only', False))
+            and bool(getattr(args, 'cohort_manifest', None))
+        )
+        if not args.dataset and not cohort_prepare_only:
             parser.error('assistant requires --dataset or a dataset in --config')
+        if not args.ref and not cohort_prepare_only:
+            parser.error('assistant requires --ref or a reference in --config')
         if not args.out:
             parser.error('assistant requires --out or an output_directory in --config')
     if args.command == 'quarterly-review' and args.genome_budget is None:
@@ -7765,80 +8423,109 @@ def main(argv=None):
         args.configured_baselines = project_config.get('baselines', [])
         if not args.configured_baselines and (not args.fasta or not args.dataset):
             parser.error('filing-cabinet requires --fasta and --dataset, or a project config with a baselines list')
-    if args.command == 'filing-cabinet':
-        if getattr(args, 'configured_baselines', None):
-            cmd_filing_cabinet_configured_baselines(args)
+    # Execute legacy workflow dispatch unchanged, while recording release-level
+    # workflow completion/failure around the dispatch. SystemExit is preserved.
+    release_dispatch_succeeded = False
+    try:
+        if args.command == 'filing-cabinet':
+            if getattr(args, 'configured_baselines', None):
+                cmd_filing_cabinet_configured_baselines(args)
+            else:
+                cmd_filing_cabinet(args)
+        elif args.command == 'performance-review':
+            cmd_performance_review(args)
+        elif args.command == 'quarterly-review':
+            cmd_quarterly_review(args)
+        elif args.command == 'label-maker':
+            cmd_label_maker(args)
+        elif args.command == 'org-chart':
+            cmd_org_chart(args)
+        elif args.command == 'background-check':
+            cmd_background_check(args)
+        elif args.command == 'paper-trail':
+            cmd_paper_trail(args)
+        elif args.command == 'sanger-studio':
+            from branchmanager.sanger_studio import serve
+            serve(port=args.port, open_browser=not args.no_browser)
+        elif args.command == 'mailroom':
+            cmd_mailroom(args)
+        elif args.command == 'interview':
+            cmd_interview(args)
+        elif args.command == 'onboarding':
+            cmd_onboarding(args)
+        elif args.command == 'pacbio-16s-import':
+            cmd_pacbio_16s_import(args)
+        elif args.command == 'status-meeting':
+            _cmd_project_import(args, genomes=False)
+        elif args.command == 'records-update':
+            _cmd_project_import(args, genomes=True)
+        elif args.command == 'continue-project':
+            cmd_continue_project(args)
+        elif args.command == 'add-external-genomes':
+            cmd_add_external_genomes(args)
+        elif args.command == 'add-maldi-identifications':
+            cmd_add_maldi_identifications(args)
+        elif args.command == 'marker-evidence-migrate':
+            cmd_marker_evidence_migrate(args)
+        elif args.command == 'register-marker-evidence':
+            cmd_register_marker_evidence(args)
+        elif args.command == 'import-genome-16s':
+            cmd_import_genome_16s(args)
+        elif args.command == 'import-genome-evidence':
+            cmd_import_genome_evidence(args)
+        elif args.command == 'import-genome-results':
+            cmd_import_genome_results(args)
+        elif args.command == 'marker-review-apply':
+            cmd_marker_review_apply(args)
+        elif args.command == 'import-partner-workbook':
+            cmd_import_partner_workbook(args)
+        elif args.command == 'exit-interview':
+            cmd_exit_interview(args)
+        elif args.command == 'annual-report':
+            cmd_annual_report(args)
+        elif args.command == 'it-desk':
+            cmd_it_desk(args)
+        elif args.command == 'dashboard':
+            cmd_dashboard(args)
+        elif args.command == 'regenerate-assessment':
+            cmd_regenerate_assessment(args)
+        elif args.command == 'assistant':
+            cmd_assistant(args)
+        elif getattr(args, '_tool', None) is not None:
+            tool = args._tool
+            if tool.__name__.endswith('id_sanitation'):
+                sys.exit(tool.run(args))
+            elif tool.__name__.endswith('benchmark_selection'):
+                tool.run_cli(args, args._tool_parser)
+            else:
+                result = tool.run_cli(args)
+                if isinstance(result, int) and result:
+                    sys.exit(result)
         else:
-            cmd_filing_cabinet(args)
-    elif args.command == 'performance-review':
-        cmd_performance_review(args)
-    elif args.command == 'quarterly-review':
-        cmd_quarterly_review(args)
-    elif args.command == 'label-maker':
-        cmd_label_maker(args)
-    elif args.command == 'org-chart':
-        cmd_org_chart(args)
-    elif args.command == 'background-check':
-        cmd_background_check(args)
-    elif args.command == 'paper-trail':
-        cmd_paper_trail(args)
-    elif args.command == 'sanger-studio':
-        from branchmanager.sanger_studio import serve
-        serve(port=args.port, open_browser=not args.no_browser)
-    elif args.command == 'mailroom':
-        cmd_mailroom(args)
-    elif args.command == 'interview':
-        cmd_interview(args)
-    elif args.command == 'onboarding':
-        cmd_onboarding(args)
-    elif args.command == 'pacbio-16s-import':
-        cmd_pacbio_16s_import(args)
-    elif args.command == 'status-meeting':
-        _cmd_project_import(args, genomes=False)
-    elif args.command == 'records-update':
-        _cmd_project_import(args, genomes=True)
-    elif args.command == 'add-external-genomes':
-        cmd_add_external_genomes(args)
-    elif args.command == 'add-maldi-identifications':
-        cmd_add_maldi_identifications(args)
-    elif args.command == 'marker-evidence-migrate':
-        cmd_marker_evidence_migrate(args)
-    elif args.command == 'register-marker-evidence':
-        cmd_register_marker_evidence(args)
-    elif args.command == 'import-genome-16s':
-        cmd_import_genome_16s(args)
-    elif args.command == 'import-genome-evidence':
-        cmd_import_genome_evidence(args)
-    elif args.command == 'import-genome-results':
-        cmd_import_genome_results(args)
-    elif args.command == 'marker-review-apply':
-        cmd_marker_review_apply(args)
-    elif args.command == 'import-partner-workbook':
-        cmd_import_partner_workbook(args)
-    elif args.command == 'exit-interview':
-        cmd_exit_interview(args)
-    elif args.command == 'annual-report':
-        cmd_annual_report(args)
-    elif args.command == 'it-desk':
-        cmd_it_desk(args)
-    elif args.command == 'dashboard':
-        cmd_dashboard(args)
-    elif args.command == 'regenerate-assessment':
-        cmd_regenerate_assessment(args)
-    elif args.command == 'assistant':
-        cmd_assistant(args)
-    elif getattr(args, '_tool', None) is not None:
-        tool = args._tool
-        if tool.__name__.endswith('id_sanitation'):
-            sys.exit(tool.run(args))
-        elif tool.__name__.endswith('benchmark_selection'):
-            tool.run_cli(args, args._tool_parser)
-        else:
-            result = tool.run_cli(args)
-            if isinstance(result, int) and result:
-                sys.exit(result)
+            parser.print_help()
+        release_dispatch_succeeded = True
+    except BaseException as exc:
+        if release_dir and release_manager:
+            try:
+                release_manager.record_workflow_event(release_dir, workflow=release_workflow_key or args.command, command=args.command,
+                    argv=list(sys.argv[1:] if argv is None else argv), status='FAILED', event='workflow_failed', error=repr(exc))
+                release_manager.update_status(release_dir, 'FAILED', workflow=release_workflow_key,
+                    event='workflow_failed', details={'command': args.command, 'error': repr(exc)})
+            except Exception:
+                logging.exception('Failed to update release manifest after workflow failure')
+        raise
     else:
-        parser.print_help()
+        if release_dir and release_manager and release_workflow_key and release_dispatch_succeeded:
+            release_manager.record_workflow_event(release_dir, workflow=release_workflow_key or args.command, command=args.command,
+                argv=list(sys.argv[1:] if argv is None else argv), status='COMPLETE', event='workflow_completed')
+            release_manager.update_status(release_dir, 'IN_PROGRESS',
+                event='workflow_completed', details={'command': args.command, 'argv': list(sys.argv[1:] if argv is None else argv)})
+            if release_workflow_key:
+                release_manager.update_workflow_status(release_dir, release_workflow_key, 'COMPLETE', event='workflow_status_completed', details={'command': args.command})
+        if release_dir and release_manager:
+            release_manager.update_status(release_dir, 'IN_PROGRESS', event='workflow_returned_success',
+                details={'command': args.command})
+
 
 
 if __name__ == '__main__':

@@ -486,3 +486,14 @@ See [LICENSE](LICENSE).
 
 -   Repository: https://github.com/NickJD/BranchManager
 -   Issues: https://github.com/NickJD/BranchManager/issues
+
+
+## Cohort-resume assessment and release publication
+
+`assistant --cohort-resume` performs the joint marker assessment; it is not merely a review-decision import. The joint Performance Review is written under `cohort/01_joint_assistant/03_performance_review_hiring_panel/`. In release mode, BranchManager copies the assessment tables into the release-level `assessment/` directory and the dashboard into `dashboard/`, then records assessment/dashboard workflow completion. This promotion is required because release-level consumers must not depend on the cohort-internal directory layout.
+
+A release is not READY just because the SQLite database passes validation. A READY transition requires successful validation, assessment and dashboard workflow states marked COMPLETE, and non-empty `assessment/sequence_assessment.tsv`, `assessment/selection_summary.tsv`, and `dashboard/performance_review_dashboard.html`.
+
+## Project-wide current bundle
+
+A successful READY transition automatically replaces the project-wide current bundle at `Releases/BranchManager_Project/current/`. It contains the current release's SQLite database, full assessment outputs (including neighbourhood/support files), dashboard directory, and `current_release.json` provenance metadata. The historical release remains preserved under `versions/<release_id>/`. Publication is staged; READY is rolled back if publication fails.

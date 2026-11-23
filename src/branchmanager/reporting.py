@@ -115,13 +115,14 @@ def write_genome_collection_assessment(db, output_path: str | Path) -> str:
     return str(path)
 
 
-def _read_dashboard_database(database_path: str | Path) -> tuple[dict, list[dict], dict]:
+def _read_dashboard_database(database_path: str | Path) -> tuple[dict, list[dict], dict, list[dict]]:
     """Read current sequencing decisions and genome records without mutating SQLite."""
     path = Path(database_path).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f'Project database does not exist: {path}')
     states: dict[str, dict] = {}
     genomes: list[dict] = []
+    registered: list[dict] = []
     identity = {'schema_version': 'unknown', 'sha256': '', 'path': str(path)}
     digest = hashlib.sha256()
     with path.open('rb') as handle:
@@ -137,19 +138,50 @@ def _read_dashboard_database(database_path: str | Path) -> tuple[dict, list[dict
             if version is not None:
                 identity['schema_version'] = str(version)
         if 'sequencing_metadata' in tables:
+            metadata_columns = {row[1] for row in conn.execute('PRAGMA table_info(sequencing_metadata)')}
+            own_id_expr = 'project_metadata_json' if 'project_metadata_json' in metadata_columns else 'NULL'
             for row in conn.execute(
-                'SELECT id, selected_for_sequencing, selected_for_wgs, operational_status '
+                f'SELECT id, selected_for_sequencing, selected_for_wgs, operational_status, {own_id_expr} AS project_metadata_json '
                 'FROM sequencing_metadata'
             ):
+                try:
+                    project_metadata = json.loads(row['project_metadata_json'] or '{}')
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    project_metadata = {}
                 states[str(row['id'])] = {
                     'selected': bool(row['selected_for_sequencing']),
                     'sequenced': bool(row['selected_for_wgs']),
                     'status': str(row['operational_status'] or ''),
+                    'partner_own_id': str(project_metadata.get('partner_own_id') or project_metadata.get('partner_own_ids') or ''),
                 }
         if 'isolate_status' in tables:
             for row in conn.execute('SELECT sequence_id, status FROM isolate_status'):
                 state = states.setdefault(str(row['sequence_id']), {'selected': False, 'sequenced': False, 'status': ''})
                 state['status'] = str(row['status'] or state.get('status', ''))
+        if 'sequences' in tables:
+            seq_cols = {row[1] for row in conn.execute('PRAGMA table_info(sequences)')}
+            dataset_expr = 'COALESCE(s.dataset, "")' if 'dataset' in seq_cols else '""'
+            tier_expr = 'COALESCE(s.baseline_tier, "")' if 'baseline_tier' in seq_cols else '""'
+            for row in conn.execute(f'SELECT s.id, {dataset_expr}, {tier_expr} FROM sequences s ORDER BY s.id'):
+                sequence_id, dataset, tier = row
+                taxon = ''
+                if 'taxonomy' in tables:
+                    try:
+                        taxrow = conn.execute(
+                            'SELECT taxonomy FROM taxonomy WHERE id=? ORDER BY confidence DESC LIMIT 1',
+                            (sequence_id,),
+                        ).fetchone()
+                        taxon = str(taxrow[0] or '') if taxrow else ''
+                    except sqlite3.Error:
+                        taxon = ''
+                meta = states.get(str(sequence_id), {})
+                registered.append({
+                    'sequence_id': str(sequence_id or ''), 'partner_id': str(dataset or ''),
+                    'baseline_tier': str(tier or ''), 'taxonomy': taxon,
+                    'partner_own_id': str(meta.get('partner_own_id') or ''),
+                    'selected': bool(meta.get('selected')), 'sequenced': bool(meta.get('sequenced')),
+                    'status': str(meta.get('status') or ''),
+                })
         if 'genome_records' in tables:
             query = (
                 "SELECT g.sequence_id, COALESCE(s.dataset,''), g.genome_id, g.genome_status, "
@@ -161,6 +193,7 @@ def _read_dashboard_database(database_path: str | Path) -> tuple[dict, list[dict
                 sequence_id = str(row[0] or '')
                 genomes.append({
                     'sequence_id': sequence_id, 'partner_id': str(row[1] or ''),
+                    'partner_own_id': str(states.get(sequence_id, {}).get('partner_own_id') or ''),
                     'genome_id': str(row[2] or ''), 'genome_status': str(row[3] or ''),
                     'genome_qc_pass': row[4], 'completeness': row[5], 'contamination': row[6],
                     'gtdb_taxonomy': str(row[7] or ''), 'genome_path': str(row[8] or ''),
@@ -168,6 +201,12 @@ def _read_dashboard_database(database_path: str | Path) -> tuple[dict, list[dict
                 })
                 state = states.setdefault(sequence_id, {'selected': False, 'sequenced': False, 'status': ''})
                 state['sequenced'] = True
+    # The registered inventory is constructed before genome_records are read, so
+    # reconcile genome-backed sequencing flags into it after the genome query.
+    genome_sequence_ids = {str(row.get('sequence_id') or '') for row in genomes if row.get('sequence_id')}
+    for registered_row in registered:
+        if registered_row['sequence_id'] in genome_sequence_ids:
+            registered_row['sequenced'] = True
     for state in states.values():
         if state.get('status') == 'SAB_APPROVED':
             state['selected'] = True
@@ -175,7 +214,7 @@ def _read_dashboard_database(database_path: str | Path) -> tuple[dict, list[dict
             state['selected'] = False
         if state.get('sequenced'):
             state['selected'] = bool(state.get('selected'))
-    return states, genomes, identity
+    return states, genomes, identity, registered
 
 def write_performance_review_dashboard(
     selection_summary: str | Path,
@@ -198,8 +237,8 @@ def write_performance_review_dashboard(
     manifest_path = Path(run_manifest) if run_manifest else output_dir / 'run_manifest.json'
 
     selection_rows = _read_tsv_rows(selection_path)
-    database_states, database_genome_rows, database_identity = (
-        _read_dashboard_database(database) if database else ({}, [], {})
+    database_states, database_genome_rows, database_identity, database_registered_rows = (
+        _read_dashboard_database(database) if database else ({}, [], {}, [])
     )
     assessment_rows = _read_tsv_rows(assessment_path)
     pangenome_rows = _read_tsv_rows(pangenome_path)
@@ -289,13 +328,40 @@ def write_performance_review_dashboard(
             for row in rows if str(row.get('ID', '')).strip()
         }
     records = []
-    for source in selection_rows:
-        sequence_id = str(source.get('SequenceID', '')).strip()
-        if not sequence_id:
-            continue
-        evidence = assessment_by_id.get(sequence_id, {})
-        partner = str(source.get('PartnerID', 'Unknown') or 'Unknown')
-        recommendation = str(source.get('Recommendation', 'Not classified') or 'Not classified')
+    # The selection summary is a decision shortlist, not the complete assessed
+    # cohort. Build dashboard analytical records from every assessment row, then
+    # overlay decision-facing fields from the summary where a row is present.
+    selection_by_id = {
+        str(row.get('SequenceID', '')).strip(): row
+        for row in selection_rows if str(row.get('SequenceID', '')).strip()
+    }
+    recommendation_by_role = {
+        'BASELINE_REDUNDANT': 'EXCLUDE - BASELINE REDUNDANT',
+        'PRIMARY': 'PRIORITISE - SET PRIMARY',
+        'DIVERSITY_CANDIDATE': 'SECONDARY - STRAIN DIVERSITY',
+        'REVIEW_EVIDENCE': 'REVIEW BEFORE SELECTION',
+        'COMMITTED': 'RESERVE - SET BACKUP',
+        'BACKUP': 'RESERVE - SET BACKUP',
+        'ALTERNATE': 'SECONDARY CANDIDATE',
+        'PANGENOME_BOUNDARY_REVIEW': 'REVIEW - PANGENOME BOUNDARY',
+        'SEQUENCED': 'ALREADY SEQUENCED',
+    }
+    assessment_source_by_id = {
+        str(row.get('ID', row.get('SequenceID', ''))).strip(): row
+        for row in assessment_rows
+        if str(row.get('ID', row.get('SequenceID', ''))).strip()
+    }
+    all_assessment_ids = list(dict.fromkeys(
+        list(assessment_source_by_id) + list(selection_by_id)
+    ))
+    for sequence_id in all_assessment_ids:
+        assessment_source = assessment_source_by_id.get(sequence_id, {})
+        evidence = assessment_source
+        source = dict(assessment_source)
+        source.update(selection_by_id.get(sequence_id, {}))
+        partner = str(source.get('PartnerID', evidence.get('PartnerID', 'Unknown')) or 'Unknown')
+        role = str(evidence.get('SequencingSetRole', '') or '').strip().upper()
+        recommendation = str(source.get('Recommendation', '') or recommendation_by_role.get(role, 'Not classified'))
         qc = str(source.get('MarkerQC', evidence.get('MarkerQCClass', 'Not available')) or 'Not available')
         taxonomy = []
         for label, prefix in databases:
@@ -485,9 +551,82 @@ def write_performance_review_dashboard(
                 record['sequencing_role'] = 'COMMITTED'
                 record['genome_coverage'] = 'Selected for sequencing; genome pending'
 
+    # Full partner catalogue is independent of marker-cohort selection. Preserve the
+    # assessed rows as the analytical record set, but build an all-isolate explorer
+    # and partner totals from the complete registered sequences table.
+    assessed_ids = {row['id'] for row in records}
+    registered_by_id = {row['sequence_id']: row for row in database_registered_rows if row.get('sequence_id')}
+    for record in records:
+        registered = registered_by_id.get(record['id'], {})
+        record['partner_own_id'] = str(registered.get('partner_own_id') or '')
+    explorer_records = list(records)
+    for registered in database_registered_rows:
+        rid = registered['sequence_id']
+        if not rid or rid in assessed_ids:
+            continue
+        lineage = str(registered.get('taxonomy') or '')
+        explorer_records.append({
+            'id': rid, 'partner': registered.get('partner_id') or 'Unknown',
+            'partner_own_id': str(registered.get('partner_own_id') or ''),
+            'recommendation': ('ALREADY SEQUENCED' if registered.get('sequenced') else 'ALREADY SELECTED - GENOME PENDING' if registered.get('selected') else 'NOT IN MARKER ASSESSMENT'), 'sequencing_role': ('SEQUENCED' if registered.get('sequenced') else 'COMMITTED' if registered.get('selected') else 'REGISTERED ISOLATE'),
+            'marker_qc': 'NOT ASSESSED', 'marker_review': 'Not applicable',
+            'evidence_quality': 'Not assessed', 'partner_taxon': '',
+            'already_selected_for_genome_sequencing': bool(registered.get('selected')),
+            'genome_already_sequenced': bool(registered.get('sequenced')),
+            'sab_decision': registered.get('status') or '', 'gtdb_taxonomy': lineage,
+            'cultured_gap': '', 'baseline_class': registered.get('baseline_tier') or '',
+            'baseline_nearest_identity': None, 'baseline_nearest_hit': '',
+            'project_nearest_identity': None, 'project_nearest_hit': '',
+            'cultured_match_details': [], 'project_match_details': {},
+            'project_identity_warning': False, 'project_identity_warning_reason': '',
+            'project_close_neighbours': None, 'pangenome_rank': '', 'pangenome_taxon': '',
+            'pangenome_gap': None, 'pangenome_target': None,
+            'recommendation_reason': 'Registered in the project database; no marker assessment is available.',
+            'species_context': '', 'genome_coverage': 'Genome available' if registered.get('sequenced') else ('Selected for sequencing; genome pending' if registered.get('selected') else 'Genome not recorded'),
+            'local_tree_figure': '', 'taxonomy': ([{
+                'database': 'Project database taxonomy', 'status': 'REGISTERED' if lineage else 'NOT AVAILABLE',
+                'taxon': _dashboard_taxon(lineage), 'lineage': lineage, 'identity': None,
+                'query_coverage': None, 'reference_coverage': None, 'rank': '', 'explanation': '',
+            }] if lineage else []), 'novelty': [], 'genome_nearest_hit': '',
+            'genome_nearest_identity': None, 'genome_matches_97': None,
+            'genome_matches_95': None, 'genome_representation_interpretation': '',
+            'assessment_present': False,
+        })
+    for record in records:
+        record['assessment_present'] = True
+
+
     counts = Counter(row['recommendation'] for row in records)
     qc_counts = Counter(row['marker_qc'] for row in records)
     partner_counts = Counter(row['partner'] for row in records)
+    if database_registered_rows:
+        partner_counts = Counter(row.get('partner_id') or 'Unknown' for row in database_registered_rows)
+    # Full partner inventory, with mutually-exclusive lifecycle categories.
+    assessed_record_by_id = {row['id']: row for row in records if row.get('id')}
+    partner_lifecycle_counts = {}
+    for registered in database_registered_rows:
+        partner = str(registered.get('partner_id') or 'Unknown')
+        bucket = partner_lifecycle_counts.setdefault(partner, {
+            'total': 0, 'sequenced': 0, 'selected_pending': 0,
+            'awaiting_sab': 0, 'remaining': 0,
+        })
+        bucket['total'] += 1
+        rid = str(registered.get('sequence_id') or '')
+        assessed = assessed_record_by_id.get(rid)
+        if registered.get('sequenced'):
+            bucket['sequenced'] += 1
+        elif registered.get('selected'):
+            bucket['selected_pending'] += 1
+        elif assessed and not str(registered.get('status') or '').strip() and str(assessed.get('marker_qc', '')).strip().upper() not in {'FAIL_QC', 'FAILED_QC', 'QC_FAIL'}:
+            bucket['awaiting_sab'] += 1
+        else:
+            bucket['remaining'] += 1
+    # Partition invariant: the lifecycle categories always account for every
+    # registered isolate, without overlap or omission.
+    for partner, bucket in partner_lifecycle_counts.items():
+        partition = bucket['sequenced'] + bucket['selected_pending'] + bucket['awaiting_sab'] + bucket['remaining']
+        if partition != bucket['total']:
+            raise AssertionError(f'Partner lifecycle partition failed for {partner}: {partition} != {bucket["total"]}')
     evidence_counts = Counter(row['evidence_quality'] or 'Not available' for row in records)
     taxonomy_counts = {
         db_label: Counter(
@@ -677,6 +816,7 @@ def write_performance_review_dashboard(
         genome_records.append({
             'id': str(row.get('sequence_id', '') or ''),
             'partner': str(row.get('partner_id', '') or ''),
+            'partner_own_id': str(row.get('partner_own_id', '') or ''),
             'genome_id': str(row.get('genome_id', '') or ''),
             'status': str(row.get('genome_status', '') or ''),
             'qc': str(row.get('genome_qc_pass', '') or ''),
@@ -718,6 +858,7 @@ def write_performance_review_dashboard(
                 taxonomy = ''
             members.append({
                 'id': member_id, 'kind': kind, 'partner': partner,
+                'partner_own_id': str(registered_by_id.get(member_id, {}).get('partner_own_id') or ''),
                 'recommendation': recommendation, 'genome_id': genome_id,
                 'qc': qc, 'taxonomy': taxonomy,
                 'candidate': member_id in set(group.get('candidate_ids', [])),
@@ -725,6 +866,33 @@ def write_performance_review_dashboard(
             })
         group['members'] = members
         group['member_count'] = len(members)
+
+    # Add registered catalogue members to existing pangenome groups by exact
+    # rank/taxon matches in their stored lineage. Do not change assessed-candidate
+    # counts or genome commitment totals with these display-only memberships.
+    rank_prefix = {'DOMAIN':'d', 'PHYLUM':'p', 'CLASS':'c', 'ORDER':'o', 'FAMILY':'f', 'GENUS':'g', 'SPECIES':'s'}
+    for group in pangenome:
+        prefix = rank_prefix.get(group['rank'])
+        if not prefix:
+            continue
+        expected = f'{prefix}__{group["taxon"]}'.casefold()
+        member_ids = {member['id'] for member in group.get('members', [])}
+        for registered in database_registered_rows:
+            lineage = str(registered.get('taxonomy') or '').casefold()
+            if registered['sequence_id'] in member_ids or expected not in lineage:
+                continue
+            genome = genome_by_id.get(registered['sequence_id'], {})
+            group['members'].append({
+                'id': registered['sequence_id'], 'kind': 'Registered catalogue isolate',
+                'partner': registered.get('partner_id') or 'Not recorded',
+                'partner_own_id': str(registered.get('partner_own_id') or ''),
+                'recommendation': 'NOT IN MARKER ASSESSMENT',
+                'genome_id': genome.get('genome_id', ''),
+                'qc': 'Genome QC passed' if str(genome.get('qc', '')).lower() in {'1','true','yes','pass'} else 'Not assessed',
+                'taxonomy': lineage, 'candidate': False, 'committed': bool(registered.get('selected') or registered.get('sequenced')),
+            })
+            member_ids.add(registered['sequence_id'])
+        group['member_count'] = len(group['members'])
 
     # The dashboard lives in the report directory; resolve the manifest from
     # the assessment directory beside selection_summary, not from the process
@@ -751,6 +919,7 @@ def write_performance_review_dashboard(
 
     data = {
         'records': records,
+        'explorer_records': explorer_records,
         'genome_records': genome_records,
         'tree_rows': tree_rows,
         'pangenome': pangenome,
@@ -758,14 +927,19 @@ def write_performance_review_dashboard(
         'novelty_source_rows': len(novelty_rows),
         'counts': {
             'total': len(records),
+            'registered_total': len(database_registered_rows) if database_registered_rows else len(records),
+            'partner_catalogue_available': bool(database_registered_rows),
+            'registered_selected': sum(bool(row.get('selected')) for row in database_registered_rows),
+            'registered_sequenced': sum(bool(row.get('sequenced')) for row in database_registered_rows),
             'recommendations': dict(counts),
             'qc': dict(qc_counts),
             'partners': dict(partner_counts),
+            'partner_lifecycle': partner_lifecycle_counts,
             'evidence': dict(evidence_counts),
             'taxonomy': {key: dict(value) for key, value in taxonomy_counts.items()},
             'already_sequenced': int(counts.get('ALREADY SEQUENCED', 0)),
             'selected_pending': int(counts.get('ALREADY SELECTED - GENOME PENDING', 0)),
-            'genome_only_records': len(genome_records),
+            'genome_only_records': len({row['id'] for row in genome_records if row.get('id') and row['id'] not in assessed_ids}),
             'genome_qc_pass': sum(
                 str(row.get('genome_qc_pass', '')).strip().casefold() in {'1', 'true', 'yes', 'pass'}
                 for row in genome_rows
@@ -795,16 +969,16 @@ def write_performance_review_dashboard(
 </style></head><body><main class="shell">
 <header class="top"><div><div class="brand">BranchManager · Rumen Gateway</div><h1>Isolate assessment overview</h1><div class="sub" id="runSubtitle">Performance review · Interactive report</div></div><div class="status" id="runStatus">Assessment status</div></header>
 <nav class="nav" aria-label="Report sections"><div class="navbrand">BranchManager<br><span style="font-weight:500;color:var(--muted);letter-spacing:0">Assessment report</span></div><a href="#overview" class="active">Overview</a><a href="#quality">Marker quality</a><a href="#taxonomy">Taxonomic evidence</a><a href="#novelty">Novelty explorer</a><a href="#coverage">Pangenome coverage</a><a href="#genomes">Genome collection</a><a href="#phylogeny">Phylogeny</a><a href="#explorer">Isolate explorer</a><a href="#sources">Methods & files</a></nav>
-<section id="overview"><div class="grid metrics" id="metrics"></div><div class="grid two section"><div class="panel"><h3>Sequencing recommendations</h3><div id="recommendationChart" class="barlist"></div><p class="hint">These are selection recommendations, not marker quality classifications.</p></div><div class="panel"><h3>Sequences by partner</h3><div id="partnerChart" class="barlist"></div><p class="hint">Counts are based on records in the selection summary.</p></div></div><div class="callout section" id="overviewText"></div></section>
+<section id="overview"><div class="grid metrics" id="metrics"></div><div class="grid two section"><div class="panel"><h3>Sequencing recommendations</h3><div id="recommendationChart" class="barlist"></div><p class="hint">These are selection recommendations, not marker quality classifications.</p></div><div class="panel"><h3>Partner isolate inventory</h3><div id="partnerChart" class="barlist"></div><p class="hint">Full registered partner totals, not just marker sequences assessed.</p><div class="tablewrap" style="margin-top:12px"><table><thead><tr><th>Partner</th><th>Total</th><th>Sequenced</th><th>Selected · pending</th><th>QC assessed · awaiting SAB</th><th>Remaining</th></tr></thead><tbody id="partnerLifecycleBody"></tbody></table></div></div></div><div class="callout section" id="overviewText"></div></section>
 <section class="section" id="quality"><div class="section-head"><div><h2>Marker quality</h2><div class="hint">Quality-control status is separate from the genome sequencing recommendation.</div></div></div><div class="grid two"><div class="panel"><h3>Marker QC classifications</h3><div id="qcChart" class="barlist"></div></div><div class="panel"><h3>Evidence quality</h3><div id="evidenceChart" class="barlist"></div><p class="hint">Evidence quality is the assessment's own category; it is not a probability of correct identification.</p></div></div><div class="callout section"><strong>How to read this:</strong><p>“Pass with warnings” means the marker was retained with qualifications. “Fail QC” means it did not meet the normal marker quality requirements. Any manual review or override should be examined in the underlying evidence before a sequencing decision is made.</p></div></section>
 <section class="section" id="taxonomy"><div class="section-head"><div><h2>Taxonomic evidence</h2><div class="hint">Assignments from each reference database are shown independently.</div></div></div><div class="panel"><div id="taxonomyChart" class="barlist"></div><div class="legend"><span><i class="dot"></i>Confident</span><span><i class="dot" style="background:#c18a2e"></i>Contested / provisional</span><span><i class="dot" style="background:#b85b54"></i>Low similarity / unresolved</span></div></div><div class="callout section"><strong>Important interpretation:</strong><p>A high sequence identity does not automatically guarantee an unambiguous taxonomic assignment. Query coverage describes how much of the submitted sequence aligns; reference coverage describes how much of the reference sequence is covered. Conflicting near-best reference assignments can result in a contested classification even when the alignment is long and highly similar.</p></div></section>
 
-<section class="section" id="novelty"><div class="section-head"><div><h2>Novelty explorer</h2><div class="hint">Compare each marker against the cultured baselines, wider partner collection and external reference set. These are sequence-similarity comparisons, not species novelty claims.</div></div><button class="btn" id="noveltyExport">Export novelty results</button></div><div class="grid metrics" id="noveltyMetrics"></div><div class="callout"><strong>How to interpret these comparisons:</strong><p>Nearest identity is the highest sequence identity found in that comparison set. The ≥99%, ≥97% and ≥95% counts describe the number of reported neighbours meeting those operational similarity cut-offs. They are not formal species boundaries. A low identity to a cultured baseline can coexist with a high identity to an external reference; that means the isolate may be poorly represented in the cultured collection while having a close external reference match.</p></div><div class="panel"><div class="filters"><input id="noveltySearch" placeholder="Search isolate, partner, closest hit or taxonomy"><select id="noveltyPartner"><option value="">All partners</option></select><select id="noveltyComparison"><option value="CulturedProject">Combined cultured collection</option><option value="Hungate">Hungate baseline</option><option value="SecondaryBaseline">Secondary cultured baseline</option><option value="Project">Partner project markers</option><option value="Reference">GTDB reference genomes</option></select><select id="noveltySort"><option value="identity_asc">Lowest nearest identity first</option><option value="identity_desc">Highest nearest identity first</option><option value="matches_desc">Most ≥97% neighbours first</option><option value="score_desc">Highest novelty score first</option><option value="id_asc">Isolate ID</option></select><select id="noveltyPageSize"><option>25</option><option selected>50</option><option>100</option><option>250</option></select></div><div class="hint" id="noveltyCount"></div><div class="tablewrap"><table><thead><tr><th>Isolate</th><th>Partner</th><th>Nearest hit</th><th>Identity</th><th>≥99%</th><th>≥97%</th><th>≥95%</th><th>Crowding</th><th>Priority</th><th>Details</th></tr></thead><tbody id="noveltyBody"></tbody></table></div><div class="pager" id="noveltyPager"></div></div><div class="panel" id="noveltyDetail" style="display:none;margin-top:14px"><div class="section-head"><div><h3 id="noveltyDetailTitle">Isolate comparison</h3><div class="hint" id="noveltyDetailSubtitle"></div></div><button class="btn" id="closeNoveltyDetail">Close</button></div><div class="tablewrap"><table><thead><tr><th>Comparison set</th><th>Nearest hit</th><th>Identity</th><th>Query coverage</th><th>≥99%</th><th>≥97%</th><th>≥95%</th><th>Crowding</th><th>Priority</th></tr></thead><tbody id="noveltyDetailBody"></tbody></table></div><div class="hint" id="noveltyGenomeContext"></div></div></section>
-<section class="section" id="genomes"><div class="section-head"><div><h2>Genome collection assessment</h2><div class="hint">Genome-only and marker-associated assemblies are assessed independently of marker QC.</div></div></div><div class="grid metrics" id="genomeMetrics"></div><div class="panel"><div class="tablewrap"><table><thead><tr><th>Isolate</th><th>Partner</th><th>Genome</th><th>Genome quality status</th><th>Completeness</th><th>Contamination</th><th>GTDB taxonomy</th></tr></thead><tbody id="genomeBody"></tbody></table></div></div></section>
+<section class="section" id="novelty"><div class="section-head"><div><h2>Novelty explorer</h2><div class="hint">Compare each marker against the cultured baselines, wider partner collection and external reference set. These are sequence-similarity comparisons, not species novelty claims.</div></div><button class="btn" id="noveltyExport">Export novelty results</button></div><div class="grid metrics" id="noveltyMetrics"></div><div class="callout"><strong>How to interpret these comparisons:</strong><p>Nearest identity is the highest sequence identity found in that comparison set. The ≥99%, ≥97% and ≥95% counts describe the number of reported neighbours meeting those operational similarity cut-offs. They are not formal species boundaries. A low identity to a cultured baseline can coexist with a high identity to an external reference; that means the isolate may be poorly represented in the cultured collection while having a close external reference match.</p></div><div class="panel"><div class="filters"><input id="noveltySearch" placeholder="Search isolate, partner, closest hit or taxonomy"><select id="noveltyPartner"><option value="">All partners</option></select><select id="noveltyComparison"><option value="CulturedProject">Combined cultured collection</option><option value="Hungate">Hungate baseline</option><option value="SecondaryBaseline">Secondary cultured baseline</option><option value="Project">Partner project markers</option><option value="Reference">GTDB reference genomes</option></select><select id="noveltySort"><option value="identity_asc">Lowest nearest identity first</option><option value="identity_desc">Highest nearest identity first</option><option value="matches_desc">Most ≥97% neighbours first</option><option value="score_desc">Highest novelty score first</option><option value="id_asc">Isolate ID</option></select><select id="noveltyPageSize"><option>25</option><option selected>50</option><option>100</option><option>250</option></select></div><div class="hint" id="noveltyCount"></div><div class="tablewrap"><table><thead><tr><th>Project ID</th><th>Partner isolate ID</th><th>Partner</th><th>Nearest hit</th><th>Identity</th><th>≥99%</th><th>≥97%</th><th>≥95%</th><th>Crowding</th><th>Priority</th><th>Details</th></tr></thead><tbody id="noveltyBody"></tbody></table></div><div class="pager" id="noveltyPager"></div></div><div class="panel" id="noveltyDetail" style="display:none;margin-top:14px"><div class="section-head"><div><h3 id="noveltyDetailTitle">Isolate comparison</h3><div class="hint" id="noveltyDetailSubtitle"></div></div><button class="btn" id="closeNoveltyDetail">Close</button></div><div class="tablewrap"><table><thead><tr><th>Comparison set</th><th>Nearest hit</th><th>Identity</th><th>Query coverage</th><th>≥99%</th><th>≥97%</th><th>≥95%</th><th>Crowding</th><th>Priority</th></tr></thead><tbody id="noveltyDetailBody"></tbody></table></div><div class="hint" id="noveltyGenomeContext"></div></div></section>
+<section class="section" id="genomes"><div class="section-head"><div><h2>Genome collection assessment</h2><div class="hint">Genome-only and marker-associated assemblies are assessed independently of marker QC.</div></div></div><div class="grid metrics" id="genomeMetrics"></div><div class="panel"><div class="tablewrap"><table><thead><tr><th>Project ID</th><th>Partner isolate ID</th><th>Partner</th><th>Genome</th><th>Genome quality status</th><th>Completeness</th><th>Contamination</th><th>GTDB taxonomy</th></tr></thead><tbody id="genomeBody"></tbody></table></div></div></section>
 <section class="section" id="coverage"><div class="section-head"><div><h2>Pangenome coverage</h2><div class="hint">Assessed isolates are unique marker records in the group. Genome commitments are taken from the assessment hierarchy; open a row to distinguish existing genome records from selected isolates awaiting sequencing. A blank target means the group is not eligible for a formal target.</div></div><a class="btn" href="assessment/pangenome_hierarchy.tsv">Full hierarchy TSV</a></div><div class="grid metrics" id="pangenomeMetrics"></div><div class="panel"><div class="filters"><input id="pangenomeSearch" placeholder="Search rank, taxon or eligibility reason"><select id="rankFilter"><option value="">All ranks</option></select></div><div class="hint" id="pangenomeCount"></div><div class="tablewrap"><table><thead><tr><th>Rank</th><th>Taxon</th><th>Assessed isolates</th><th>Genome commitments</th><th>Target</th><th>Remaining gap</th><th>Target assessable?</th><th>Why a target is or is not available</th></tr></thead><tbody id="pangenomeBody"></tbody></table><div class="pager" id="pangenomePager"></div></div></div></section>
 <section class="section" id="phylogeny"><div class="section-head"><div><h2>Phylogeny and clade neighbourhoods</h2><div class="hint">Local clade figures generated by the assessment; select a figure to inspect it at full size.</div></div></div><div class="gallery" id="treeGallery"></div></section>
-<section class="section" id="explorer"><div class="section-head"><div><h2>Isolate explorer</h2><div class="hint">Search and filter the assessed sequences, then select a row for its evidence summary.</div></div><button class="btn" id="exportBtn">Export filtered CSV</button></div><div class="filters"><input id="search" placeholder="Search isolate, taxonomy or recommendation"><select id="partnerFilter"><option value="">All partners</option></select><select id="recommendationFilter"><option value="">All recommendations</option></select><select id="qcFilter"><option value="">All marker QC</option></select><select id="pageSize"><option>25</option><option selected>50</option><option>100</option><option>250</option></select><button class="btn" id="clearFilters">Clear filters</button></div><div class="hint" id="resultCount"></div><div class="tablewrap"><table><thead><tr><th>Isolate</th><th>Partner</th><th>Marker QC</th><th>Recommendation</th><th>GTDB assignment</th><th>Closest cultured identity</th><th>Closest project identity</th></tr></thead><tbody id="isolateBody"></tbody></table></div><div class="pager" id="isolatePager"></div></section>
-<section class="section" id="sources"><div class="section-head"><div><h2>Methods, provenance and source files</h2><div class="hint">The dashboard summarises existing assessment outputs; it does not rerun analyses.</div></div></div><div class="panel"><div id="runDetails" class="detailgrid"></div><div class="smalllinks"><a href="assessment/selection_summary.tsv">Selection summary TSV</a><a href="assessment/sequence_assessment.tsv">Full sequence assessment TSV</a><a href="assessment/novelty_metrics.tsv">Novelty metrics TSV</a><a href="assessment/pangenome_hierarchy.tsv">Pangenome hierarchy TSV</a><a href="assessment/genome_collection_assessment.tsv">Genome collection TSV</a><a href="taxonomy/all_databases.tsv">All-database taxonomy TSV</a><a href="run_manifest.json">Run manifest</a></div></div></section>
+<section class="section" id="explorer"><div class="section-head"><div><h2>Isolate explorer</h2><div class="hint">Search and filter the assessed sequences, then select a row for its evidence summary.</div></div><button class="btn" id="exportBtn">Export filtered CSV</button></div><div class="filters"><input id="search" placeholder="Search isolate, taxonomy or recommendation"><select id="partnerFilter"><option value="">All partners</option></select><select id="recommendationFilter"><option value="">All recommendations</option></select><select id="qcFilter"><option value="">All marker QC</option></select><select id="pageSize"><option>25</option><option selected>50</option><option>100</option><option>250</option></select><button class="btn" id="clearFilters">Clear filters</button></div><div class="hint" id="resultCount"></div><div class="tablewrap"><table><thead><tr><th>Project ID</th><th>Partner isolate ID</th><th>Partner</th><th>Marker QC</th><th>Recommendation</th><th>GTDB assignment</th><th>Closest cultured identity</th><th>Closest project identity</th></tr></thead><tbody id="isolateBody"></tbody></table></div><div class="pager" id="isolatePager"></div></section>
+<section class="section" id="sources"><div class="section-head"><div><h2>Methods, provenance and source files</h2><div class="hint">The dashboard summarises existing assessment outputs; it does not rerun analyses.</div></div></div><div class="panel"><div id="runDetails" class="detailgrid"></div><div class="smalllinks"><a href="assessment/selection_summary.tsv">Selection summary TSV</a><a href="assessment/registered_catalogue.tsv">Registered catalogue fixture TSV</a><a href="assessment/sequence_assessment.tsv">Full sequence assessment TSV</a><a href="assessment/novelty_metrics.tsv">Novelty metrics TSV</a><a href="assessment/pangenome_hierarchy.tsv">Pangenome hierarchy TSV</a><a href="assessment/genome_collection_assessment.tsv">Genome collection TSV</a><a href="taxonomy/all_databases.tsv">All-database taxonomy TSV</a><a href="run_manifest.json">Run manifest</a></div></div></section>
 <footer class="foot">Generated by BranchManager. This report is decision support, not a substitute for reviewing the underlying evidence. Taxonomic and novelty statements are limited to the configured reference collections, thresholds and analyses used in this run.</footer>
 </main><button class="to-top" id="toTop" aria-label="Back to top" title="Back to top">↑ <span>Top</span></button><div class="detail" id="detail" role="dialog" aria-modal="true"><div class="drawer"><div class="drawerhead"><div><div class="brand">Individual isolate evidence</div><h2 id="detailTitle"></h2><div id="detailSubtitle" class="hint"></div></div><button class="btn" id="closeDetail">Close ✕</button></div><div id="detailContent"></div></div></div><div class="detail" id="pangenomeDetail" role="dialog" aria-modal="true"><div class="drawer"><div class="drawerhead"><div><div class="brand">Pangenome group membership</div><h2 id="pangenomeDetailTitle"></h2><div id="pangenomeDetailSubtitle" class="hint"></div></div><button class="btn" id="closePangenomeDetail">Close ✕</button></div><div id="pangenomeDetailContent"></div></div></div>
 <script id="dashboard-data" type="application/json">__DATA__</script>
@@ -823,11 +997,12 @@ function pager(id,page,pages,total,onPage){
  el.querySelectorAll('button[data-page]').forEach(b=>b.addEventListener('click',()=>onPage(Number(b.dataset.page))));
 }
 
-const genomeRows=D.genome_records||[];const qcPass=x=>['yes','1','true','pass'].includes(String(x.qc??'').trim().toLowerCase());const genomeQCLabel=x=>{const v=String(x.qc??'').trim().toLowerCase();if(['yes','1','true','pass'].includes(v))return 'Pass';if(['no','0','false','fail'].includes(v))return 'Does not pass';return x.status||'Not assessed'};const gqc=genomeRows.filter(qcPass).length;const gcomp=genomeRows.filter(x=>x.completeness!=null);$('genomeMetrics').innerHTML=[['Genome records',genomeRows.length],['QC passed',gqc],['Mean completeness',gcomp.length?fmt(gcomp.reduce((a,x)=>a+x.completeness,0)/gcomp.length)+'%':'—'],['Genome-only partners',[...new Set(genomeRows.map(x=>x.partner))].join(', ')||'—']].map(x=>`<div class="metric"><div class="metric-value">${esc(x[1])}</div><div class="metric-label">${esc(x[0])}</div></div>`).join('');$('genomeBody').innerHTML=genomeRows.map(x=>`<tr><td>${esc(x.id)}</td><td>${esc(x.partner)}</td><td>${esc(x.genome_id)}</td><td>${pill(genomeQCLabel(x))}</td><td>${pct(x.completeness)}</td><td>${pct(x.contamination)}</td><td title="${esc(x.lineage)}">${esc(x.taxonomy)}</td></tr>`).join('');const trees=D.tree_rows||[];$('treeGallery').innerHTML=trees.length?trees.map(x=>`<a class="panel tree-card" href="${esc(x.href)}" target="_blank"><img loading="lazy" src="${esc(x.figure)}" alt="${esc(x.label)}"><strong>${esc(x.label)}</strong><span class="hint">${esc(x.clade)} ${esc(x.members)}</span></a>`).join(''):'<p class="muted">No clade/neighbourhood figures were found.</p>';const total=D.counts.total; $('runSubtitle').textContent=`Performance review · ${total.toLocaleString()} assessed marker sequences${D.run.completed_at?' · completed '+D.run.completed_at.replace('T',' ').replace('Z',' UTC'):''}`;$('runStatus').textContent=`${D.run.status||'Status not recorded'}${D.run.version?' · v'+D.run.version:''}`;
-const metrics=[['Marker isolates assessed',total,'Partner marker sequences in this assessment'],['Already sequenced',D.counts.already_sequenced||0,'Marker isolates with an existing genome'],['Selected · genome pending',D.counts.selected_pending||0,'Selected for sequencing; genome not yet recorded'],['Genome-only partner isolates',D.counts.genome_only_records||0,'Registered genome records without a marker-cohort entry'],['High-confidence marker QC',D.counts.qc.PASS_HIGH_CONFIDENCE||0,'Passed without significant QC warnings'],['Marker QC needs attention',(D.counts.qc.PASS_WITH_WARNINGS||0)+(D.counts.qc.FAIL_QC||0),'Warnings or QC failures'],['Partner collections',Object.keys(D.counts.partners).length,'Contributing marker collections'],['Genome QC passed',D.counts.genome_qc_pass||0,'Registered genomes passing the recorded QC flag']];$('metrics').innerHTML=metrics.map(x=>`<div class="card metric"><strong>${Number(x[1]).toLocaleString()}</strong><span>${esc(x[0])}</span><div class="hint">${esc(x[2])}</div></div>`).join('');
+const genomeRows=D.genome_records||[];const qcPass=x=>['yes','1','true','pass'].includes(String(x.qc??'').trim().toLowerCase());const genomeQCLabel=x=>{const v=String(x.qc??'').trim().toLowerCase();if(['yes','1','true','pass'].includes(v))return 'Pass';if(['no','0','false','fail'].includes(v))return 'Does not pass';return x.status||'Not assessed'};const gqc=genomeRows.filter(qcPass).length;const gcomp=genomeRows.filter(x=>x.completeness!=null);$('genomeMetrics').innerHTML=[['Genome records',genomeRows.length],['QC passed',gqc],['Mean completeness',gcomp.length?fmt(gcomp.reduce((a,x)=>a+x.completeness,0)/gcomp.length)+'%':'—'],['Genome-only partners',[...new Set(genomeRows.map(x=>x.partner))].join(', ')||'—']].map(x=>`<div class="metric"><div class="metric-value">${esc(x[1])}</div><div class="metric-label">${esc(x[0])}</div></div>`).join('');$('genomeBody').innerHTML=genomeRows.map(x=>`<tr><td>${esc(x.id)}</td><td>${esc(x.partner_own_id||'—')}</td><td>${esc(x.partner)}</td><td>${esc(x.genome_id)}</td><td>${pill(genomeQCLabel(x))}</td><td>${pct(x.completeness)}</td><td>${pct(x.contamination)}</td><td title="${esc(x.lineage)}">${esc(x.taxonomy)}</td></tr>`).join('');const trees=D.tree_rows||[];$('treeGallery').innerHTML=trees.length?trees.map(x=>`<a class="panel tree-card" href="${esc(x.href)}" target="_blank"><img loading="lazy" src="${esc(x.figure)}" alt="${esc(x.label)}"><strong>${esc(x.label)}</strong><span class="hint">${esc(x.clade)} ${esc(x.members)}</span></a>`).join(''):'<p class="muted">No clade/neighbourhood figures were found.</p>';const total=D.counts.total; $('runSubtitle').textContent=`Performance review · ${total.toLocaleString()} assessed marker sequences${D.run.completed_at?' · completed '+D.run.completed_at.replace('T',' ').replace('Z',' UTC'):''}`;$('runStatus').textContent=`${D.run.status||'Status not recorded'}${D.run.version?' · v'+D.run.version:''}`;
+const metrics=[['Marker isolates assessed',total,'Partner marker sequences in this assessment'],['Already sequenced · marker cohort',D.counts.already_sequenced||0,'Assessed marker isolates with an existing genome'],['Selected · genome pending',D.counts.selected_pending||0,'Assessed marker isolates selected; genome not yet recorded'],['Genome-only partner isolates',D.counts.genome_only_records||0,'Registered genome records without a marker-cohort entry'],['High-confidence marker QC',D.counts.qc.PASS_HIGH_CONFIDENCE||0,'Passed without significant QC warnings'],['Marker QC needs attention',(D.counts.qc.PASS_WITH_WARNINGS||0)+(D.counts.qc.FAIL_QC||0),'Warnings or QC failures'],['Partner collections',Object.keys(D.counts.partners).length,'Contributing marker collections'],['Genome QC passed',D.counts.genome_qc_pass||0,'Registered genomes passing the recorded QC flag'],['Registered partner isolates',D.counts.registered_total||total,'All records in the project sequence catalogue'],['Selected · all partners',D.counts.registered_selected||0,'Current database selection commitments'],['Sequenced · all partners',D.counts.registered_sequenced||0,'Records with genome availability recorded']];$('metrics').innerHTML=metrics.map(x=>`<div class="card metric"><strong>${Number(x[1]).toLocaleString()}</strong><span>${esc(x[0])}</span><div class="hint">${esc(x[2])}</div></div>`).join('');
 function bars(target,obj,colour=''){let entries=Object.entries(obj||{}).sort((a,b)=>b[1]-a[1]),max=Math.max(1,...entries.map(x=>x[1]));$(target).innerHTML=entries.map(([k,v])=>`<div class="barrow"><span title="${esc(k)}">${esc(k.replaceAll('_',' '))}</span><div class="track"><div class="fill ${colour}" style="width:${100*v/max}%"></div></div><b>${v}</b></div>`).join('')||'<div class="empty">No data available</div>'}
 bars('recommendationChart',D.counts.recommendations);bars('partnerChart',D.counts.partners,'blue');bars('qcChart',D.counts.qc);bars('evidenceChart',D.counts.evidence,'blue');
-$('overviewText').innerHTML=`<strong>What this assessment says</strong><p>${total.toLocaleString()} marker isolates from ${Object.keys(D.counts.partners).length} partner collections were assessed. ${Number(D.counts.already_sequenced||0).toLocaleString()} are already represented by genome data, and ${Number(D.counts.selected_pending||0).toLocaleString()} have been selected but are still awaiting a genome. A further ${Number(D.counts.genome_only_records||0).toLocaleString()} genome-only partner isolates are registered separately. ${Number(D.counts.qc.PASS_HIGH_CONFIDENCE||0).toLocaleString()} marker sequences passed QC without significant warnings. Marker quality and sequencing priority are different questions; use the isolate and pangenome sections together when considering new sequencing.</p>`;
+const lifecycle=D.counts.partner_lifecycle||{};$('partnerLifecycleBody').innerHTML=Object.entries(lifecycle).sort((a,b)=>a[0].localeCompare(b[0])).map(([partner,x])=>`<tr><td>${esc(partner)}</td><td><b>${x.total}</b></td><td>${x.sequenced}</td><td>${x.selected_pending}</td><td>${x.awaiting_sab}</td><td>${x.remaining}</td></tr>`).join('');
+$('overviewText').innerHTML=`<strong>What this assessment says</strong><p>${Number(D.counts.registered_total||total).toLocaleString()} isolates are registered across the full partner catalogue. ${total.toLocaleString()} marker isolates were assessed, including those that failed marker QC. ${Number(D.counts.already_sequenced||0).toLocaleString()} assessed isolates are already represented by genome data, and ${Number(D.counts.selected_pending||0).toLocaleString()} assessed isolates are selected but still awaiting a genome. ${Number(D.counts.qc.PASS_HIGH_CONFIDENCE||0).toLocaleString()} marker sequences passed QC without significant warnings. Marker quality and sequencing priority are different questions; use the isolate and pangenome sections together when considering new sequencing.</p>`;
 let taxHtml='';for(const [db,counts] of Object.entries(D.counts.taxonomy)){let entries=Object.entries(counts).sort((a,b)=>b[1]-a[1]),sum=entries.reduce((a,x)=>a+x[1],0)||1;taxHtml+=`<div class="barrow"><span>${esc(db)}</span><div class="track" style="display:flex">${entries.map(([k,v])=>`<div title="${esc(k)}: ${v}" style="width:${100*v/sum}%;background:${k.includes('CONFIDENT')?'#27805a':k.includes('CONTEST')||k.includes('PROVISION')?'#c18a2e':k.includes('LOW')?'#b85b54':'#8b9a91'}"></div>`).join('')}</div><b>${sum}</b></div><div class="hint" style="margin:-5px 0 8px 0">${entries.map(([k,v])=>`${esc(k)}: ${v}`).join(' · ')}</div>`}$('taxonomyChart').innerHTML=taxHtml||'<div class="empty">No taxonomy evidence available</div>';
 const ranks=[...new Set(D.pangenome.map(x=>x.rank).filter(Boolean))].sort((a,b)=>['DOMAIN','PHYLUM','CLASS','ORDER','FAMILY','GENUS','SPECIES'].indexOf(a.toUpperCase())-['DOMAIN','PHYLUM','CLASS','ORDER','FAMILY','GENUS','SPECIES'].indexOf(b.toUpperCase()));
 $('rankFilter').innerHTML='<option value="">All ranks</option>'+ranks.map(x=>`<option>${esc(x)}</option>`).join('');
@@ -835,7 +1010,7 @@ $('pangenomeMetrics').innerHTML=[['Taxon groups',D.pangenome.length],['Targets a
 let pangenomeFiltered=[],pangenomePage=1;
 function renderPangenome(){const q=$('pangenomeSearch').value.trim().toLowerCase(),r=$('rankFilter').value; pangenomeFiltered=D.pangenome.filter(x=>(!r||x.rank===r)&&(!q||[x.rank,x.taxon,x.reason].join(' ').toLowerCase().includes(q)));pangenomeFiltered.sort((a,b)=>(b.gap??-1)-(a.gap??-1)||a.taxon.localeCompare(b.taxon));const size=50,pages=Math.max(1,Math.ceil(pangenomeFiltered.length/size));pangenomePage=Math.min(pangenomePage,pages);const shown=pangenomeFiltered.slice((pangenomePage-1)*size,pangenomePage*size);$('pangenomeCount').textContent=`Showing ${shown.length} of ${pangenomeFiltered.length} taxon groups`; $('pangenomeBody').innerHTML=shown.map(x=>`<tr class="pangenome-row" data-pangenome-open="${D.pangenome.indexOf(x)}" tabindex="0" aria-label="View members of ${esc(x.rank)} ${esc(x.taxon)}"><td>${esc(x.rank)}</td><td><button class="btn" data-pangenome-open="${D.pangenome.indexOf(x)}">${esc(x.taxon)}</button><div class="hint">${esc(x.provenance||'Taxonomy source not recorded')}</div></td><td>${fmt(x.candidates)}</td><td>${fmt(x.committed)}</td><td>${fmt(x.target)}</td><td>${fmt(x.gap)}</td><td>${pill(x.eligible)}</td><td title="${esc(x.reason)}">${esc(x.reason)}</td></tr>`).join('')||'<tr><td colspan="8" class="empty">No pangenome groups match these filters</td></tr>';pager('pangenomePager',pangenomePage,pages,pangenomeFiltered.length,p=>{pangenomePage=p;renderPangenome()})}
 ['pangenomeSearch','rankFilter'].forEach(id=>$(id).addEventListener(id==='pangenomeSearch'?'input':'change',()=>{pangenomePage=1;renderPangenome()}));renderPangenome();
-function openPangenomeGroup(g){if(!g)return;$('pangenomeDetailTitle').textContent=`${g.rank} · ${g.taxon}`;$('pangenomeDetailSubtitle').textContent=`${g.member_count||0} unique member(s) · ${g.eligible==='Yes'?'formal target assessable':'exploratory / not currently target-assessable'}`;const members=g.members||[];const rows=members.map(m=>`<tr><td><b>${esc(m.id)}</b><div class="hint">${esc(m.kind)}</div></td><td>${esc(m.partner||'—')}</td><td>${m.candidate?'Candidate':''}${m.candidate&&m.committed?' · ':''}${m.committed?'Genome commitment':''}</td><td>${esc(m.genome_id||'—')}</td><td>${esc(m.qc||'—')}</td><td>${esc(m.recommendation||'—')}</td><td>${esc(m.taxonomy||'—')}</td></tr>`).join('');$('pangenomeDetailContent').innerHTML=`<div class="detailgrid">${box('Target assessable',g.eligible)}${box('Assessed isolates',fmt(g.candidates))}${box('Genome commitments',fmt(g.committed))}${box('Target / remaining',fmt(g.target)+' / '+fmt(g.gap))}${box('Taxonomy provenance',g.provenance)}${box('Source hierarchy rows',fmt(g.source_rows))}</div><div class="detailbox"><small>Eligibility rationale</small><p>${esc(g.reason||'No rationale recorded.')}</p></div><div class="detailbox" style="margin-top:12px"><small>Isolates and genome records in this group</small><div class="tablewrap"><table class="member-table"><thead><tr><th>Record</th><th>Partner</th><th>Group role</th><th>Genome ID</th><th>QC</th><th>Recommendation</th><th>GTDB taxonomy</th></tr></thead><tbody>${rows||'<tr><td colspan="7" class="empty">No member identifiers were recorded in the hierarchy export.</td></tr>'}</tbody></table></div></div>`;$('pangenomeDetail').classList.add('open');document.body.style.overflow='hidden'}
+function openPangenomeGroup(g){if(!g)return;$('pangenomeDetailTitle').textContent=`${g.rank} · ${g.taxon}`;$('pangenomeDetailSubtitle').textContent=`${g.member_count||0} unique member(s) · ${g.eligible==='Yes'?'formal target assessable':'exploratory / not currently target-assessable'}`;const members=g.members||[];const rows=members.map(m=>`<tr><td><b>${esc(m.id)}</b><div class="hint">${esc(m.kind)}</div></td><td>${esc(m.partner_own_id||'—')}</td><td>${esc(m.partner||'—')}</td><td>${m.candidate?'Candidate':''}${m.candidate&&m.committed?' · ':''}${m.committed?'Genome commitment':''}</td><td>${esc(m.genome_id||'—')}</td><td>${esc(m.qc||'—')}</td><td>${esc(m.recommendation||'—')}</td><td>${esc(m.taxonomy||'—')}</td></tr>`).join('');$('pangenomeDetailContent').innerHTML=`<div class="detailgrid">${box('Target assessable',g.eligible)}${box('Assessed isolates',fmt(g.candidates))}${box('Genome commitments',fmt(g.committed))}${box('Target / remaining',fmt(g.target)+' / '+fmt(g.gap))}${box('Taxonomy provenance',g.provenance)}${box('Source hierarchy rows',fmt(g.source_rows))}</div><div class="detailbox"><small>Eligibility rationale</small><p>${esc(g.reason||'No rationale recorded.')}</p></div><div class="detailbox" style="margin-top:12px"><small>Isolates and genome records in this group</small><div class="tablewrap"><table class="member-table"><thead><tr><th>Project ID</th><th>Partner isolate ID</th><th>Partner</th><th>Group role</th><th>Genome ID</th><th>QC</th><th>Recommendation</th><th>GTDB taxonomy</th></tr></thead><tbody>${rows||'<tr><td colspan="7" class="empty">No member identifiers were recorded in the hierarchy export.</td></tr>'}</tbody></table></div></div>`;$('pangenomeDetail').classList.add('open');document.body.style.overflow='hidden'}
 $('pangenomeBody').addEventListener('click',e=>{const b=e.target.closest('[data-pangenome-open]');if(!b)return;const group=D.pangenome[Number(b.dataset.pangenomeOpen)];if(group)openPangenomeGroup(group)});
 $('pangenomeBody').addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&e.target.matches('tr[data-pangenome-open]')){e.preventDefault();const group=D.pangenome[Number(e.target.dataset.pangenomeOpen)];if(group)openPangenomeGroup(group)}});
 $('closePangenomeDetail').addEventListener('click',()=>{$('pangenomeDetail').classList.remove('open');document.body.style.overflow=''});
@@ -853,35 +1028,35 @@ const highIdentity=baseNovelty.filter(n=>n.nearest_identity!=null&&n.nearest_ide
 const no97=baseNovelty.filter(n=>n.nearest_identity!=null&&(n.matches_97||0)===0).length;
 $('noveltyMetrics').innerHTML=[['Compared to cultured collection',novelCount,'Isolates with a cultured comparison'],['Nearest cultured identity ≥97%',highIdentity,'At least one close cultured match'],['No cultured neighbours ≥97%',no97,'No reported neighbour at this cut-off'],['Genome collection comparisons',D.records.filter(x=>x.genome_nearest_hit||x.genome_matches_97!=null).length,'Separate from marker-only comparisons']].map(x=>`<div class="card metric"><strong>${Number(x[1]).toLocaleString()}</strong><span>${esc(x[0])}</span><div class="hint">${esc(x[2])}</div></div>`).join('');
 let noveltyFiltered=[],noveltyPage=1;
-function getNoveltyFiltered(){const q=$('noveltySearch').value.trim().toLowerCase(),p=$('noveltyPartner').value,k=$('noveltyComparison').value,sort=$('noveltySort').value;let a=D.records.filter(x=>!p||x.partner===p).filter(x=>{const n=getNovelty(x,k);return !q||[x.id,x.partner,x.partner_taxon,n.nearest_hit,n.density_source,x.recommendation].join(' ').toLowerCase().includes(q)});a.sort((x,y)=>{const n=getNovelty(x,k),m=getNovelty(y,k);if(sort==='identity_asc')return (n.nearest_identity??Infinity)-(m.nearest_identity??Infinity);if(sort==='identity_desc')return (m.nearest_identity??-Infinity)-(n.nearest_identity??-Infinity);if(sort==='matches_desc')return (m.matches_97??-1)-(n.matches_97??-1);if(sort==='score_desc')return (m.novelty_score??-Infinity)-(n.novelty_score??-Infinity);return x.id.localeCompare(y.id)});return a}
-function renderNovelty(){noveltyFiltered=getNoveltyFiltered();const key=$('noveltyComparison').value,size=Number($('noveltyPageSize').value||50),pages=Math.max(1,Math.ceil(noveltyFiltered.length/size));noveltyPage=Math.min(noveltyPage,pages);const shown=noveltyFiltered.slice((noveltyPage-1)*size,noveltyPage*size);$('noveltyCount').textContent=`Showing ${shown.length.toLocaleString()} of ${noveltyFiltered.length.toLocaleString()} isolates`;$('noveltyBody').innerHTML=shown.map(x=>{const n=getNovelty(x,key);return `<tr><td><b>${esc(x.id)}</b></td><td>${esc(x.partner)}</td><td>${esc(n.nearest_hit||'No hit recorded')}</td><td>${pct(n.nearest_identity)}</td><td>${fmt(n.matches_99)}</td><td>${fmt(n.matches_97)}</td><td>${fmt(n.matches_95)}</td><td>${esc(n.crowding||'—')}</td><td>${pill(n.priority||'Not recorded')}</td><td><button class="btn" data-novelty-open="${esc(x.id)}">Compare</button></td></tr>`}).join('')||'<tr><td colspan="10" class="empty">No novelty records match these filters</td></tr>';pager('noveltyPager',noveltyPage,pages,noveltyFiltered.length,p=>{noveltyPage=p;renderNovelty()})}
+function getNoveltyFiltered(){const q=$('noveltySearch').value.trim().toLowerCase(),p=$('noveltyPartner').value,k=$('noveltyComparison').value,sort=$('noveltySort').value;let a=D.records.filter(x=>!p||x.partner===p).filter(x=>{const n=getNovelty(x,k);return !q||[x.id,x.partner_own_id,x.partner,x.partner_taxon,n.nearest_hit,n.density_source,x.recommendation].join(' ').toLowerCase().includes(q)});a.sort((x,y)=>{const n=getNovelty(x,k),m=getNovelty(y,k);if(sort==='identity_asc')return (n.nearest_identity??Infinity)-(m.nearest_identity??Infinity);if(sort==='identity_desc')return (m.nearest_identity??-Infinity)-(n.nearest_identity??-Infinity);if(sort==='matches_desc')return (m.matches_97??-1)-(n.matches_97??-1);if(sort==='score_desc')return (m.novelty_score??-Infinity)-(n.novelty_score??-Infinity);return x.id.localeCompare(y.id)});return a}
+function renderNovelty(){noveltyFiltered=getNoveltyFiltered();const key=$('noveltyComparison').value,size=Number($('noveltyPageSize').value||50),pages=Math.max(1,Math.ceil(noveltyFiltered.length/size));noveltyPage=Math.min(noveltyPage,pages);const shown=noveltyFiltered.slice((noveltyPage-1)*size,noveltyPage*size);$('noveltyCount').textContent=`Showing ${shown.length.toLocaleString()} of ${noveltyFiltered.length.toLocaleString()} isolates`;$('noveltyBody').innerHTML=shown.map(x=>{const n=getNovelty(x,key);return `<tr><td><b>${esc(x.id)}</b></td><td>${esc(x.partner_own_id||'—')}</td><td>${esc(x.partner)}</td><td>${esc(n.nearest_hit||'No hit recorded')}</td><td>${pct(n.nearest_identity)}</td><td>${fmt(n.matches_99)}</td><td>${fmt(n.matches_97)}</td><td>${fmt(n.matches_95)}</td><td>${esc(n.crowding||'—')}</td><td>${pill(n.priority||'Not recorded')}</td><td><button class="btn" data-novelty-open="${esc(x.id)}">Compare</button></td></tr>`}).join('')||'<tr><td colspan="11" class="empty">No novelty records match these filters</td></tr>';pager('noveltyPager',noveltyPage,pages,noveltyFiltered.length,p=>{noveltyPage=p;renderNovelty()})}
 ['noveltySearch','noveltyPartner','noveltyComparison','noveltySort','noveltyPageSize'].forEach(id=>$(id).addEventListener(id==='noveltySearch'?'input':'change',()=>{noveltyPage=1;renderNovelty()}));
-function openNovelty(x){if(!x)return;const rows=x.novelty||[];$('noveltyDetailTitle').textContent=`${x.id} · comparison profile`;$('noveltyDetailSubtitle').textContent=`${x.partner} · ${x.recommendation}`;$('noveltyDetailBody').innerHTML=rows.map(n=>`<tr><td>${esc(n.label)}</td><td>${esc(n.nearest_hit||'No hit recorded')}</td><td>${pct(n.nearest_identity)}</td><td>${pct(n.query_coverage)}</td><td>${fmt(n.matches_99)}</td><td>${fmt(n.matches_97)}</td><td>${fmt(n.matches_95)}</td><td>${esc(n.crowding||'—')}</td><td>${pill(n.priority||'Not recorded')}</td></tr>`).join('');$('noveltyGenomeContext').textContent=`Genome collection: nearest genome hit ${x.genome_nearest_hit||'not recorded'}; identity ${pct(x.genome_nearest_identity)}; ≥97% matches ${fmt(x.genome_matches_97)}. ${x.genome_representation_interpretation||''}`;$('noveltyDetail').style.display='block';$('noveltyDetail').scrollIntoView({behavior:'smooth',block:'nearest'})}
-$('noveltyBody').addEventListener('click',e=>{const b=e.target.closest('[data-novelty-open]');if(b)openNovelty(D.records.find(x=>x.id===b.dataset.noveltyOpen))});$('closeNoveltyDetail').addEventListener('click',()=>{$('noveltyDetail').style.display='none'});$('noveltyExport').addEventListener('click',()=>{const key=$('noveltyComparison').value,cols=['id','partner','recommendation'];const rows=[['Isolate','Partner','Recommendation','Comparison','Nearest hit','Identity','Matches >=99%','Matches >=97%','Matches >=95%','Novelty score','Crowding','Priority','Query coverage','Density source','Density count method'].join(',')];for(const x of noveltyFiltered){const n=getNovelty(x,key);const vals=[x.id,x.partner,x.recommendation,noveltyLabels[key],n.nearest_hit,n.nearest_identity,n.matches_99,n.matches_97,n.matches_95,n.novelty_score,n.crowding,n.priority,n.query_coverage,n.density_source,n.density_method];rows.push(vals.map(v=>'"'+String(v??'').replaceAll('"','""')+'"').join(','))}const a=document.createElement('a'),u=URL.createObjectURL(new Blob([rows.join('\r\n')],{type:'text/csv;charset=utf-8'}));a.href=u;a.download='branchmanager_novelty_comparison.csv';a.click();URL.revokeObjectURL(u)});renderNovelty();
-const partners=[...new Set(D.records.map(x=>x.partner))].sort(),recs=[...new Set(D.records.map(x=>x.recommendation))].sort(),qcs=[...new Set(D.records.map(x=>x.marker_qc))].sort();$('partnerFilter').innerHTML+=partners.map(x=>`<option>${esc(x)}</option>`).join('');$('recommendationFilter').innerHTML+=recs.map(x=>`<option>${esc(x)}</option>`).join('');$('qcFilter').innerHTML+=qcs.map(x=>`<option>${esc(x)}</option>`).join('');
+function openNovelty(x){if(!x)return;const rows=x.novelty||[];$('noveltyDetailTitle').textContent=`${x.id} · comparison profile`;$('noveltyDetailSubtitle').textContent=`${x.partner} · ${x.partner_own_id||'Partner ID not recorded'} · ${x.recommendation}`;$('noveltyDetailBody').innerHTML=rows.map(n=>`<tr><td>${esc(n.label)}</td><td>${esc(n.nearest_hit||'No hit recorded')}</td><td>${pct(n.nearest_identity)}</td><td>${pct(n.query_coverage)}</td><td>${fmt(n.matches_99)}</td><td>${fmt(n.matches_97)}</td><td>${fmt(n.matches_95)}</td><td>${esc(n.crowding||'—')}</td><td>${pill(n.priority||'Not recorded')}</td></tr>`).join('');$('noveltyGenomeContext').textContent=`Genome collection: nearest genome hit ${x.genome_nearest_hit||'not recorded'}; identity ${pct(x.genome_nearest_identity)}; ≥97% matches ${fmt(x.genome_matches_97)}. ${x.genome_representation_interpretation||''}`;$('noveltyDetail').style.display='block';$('noveltyDetail').scrollIntoView({behavior:'smooth',block:'nearest'})}
+$('noveltyBody').addEventListener('click',e=>{const b=e.target.closest('[data-novelty-open]');if(b)openNovelty(D.records.find(x=>x.id===b.dataset.noveltyOpen))});$('closeNoveltyDetail').addEventListener('click',()=>{$('noveltyDetail').style.display='none'});$('noveltyExport').addEventListener('click',()=>{const key=$('noveltyComparison').value,cols=['id','partner','recommendation'];const rows=[['Project ID','Partner isolate ID','Partner','Recommendation','Comparison','Nearest hit','Identity','Matches >=99%','Matches >=97%','Matches >=95%','Novelty score','Crowding','Priority','Query coverage','Density source','Density count method'].join(',')];for(const x of noveltyFiltered){const n=getNovelty(x,key);const vals=[x.id,x.partner_own_id,x.partner,x.recommendation,noveltyLabels[key],n.nearest_hit,n.nearest_identity,n.matches_99,n.matches_97,n.matches_95,n.novelty_score,n.crowding,n.priority,n.query_coverage,n.density_source,n.density_method];rows.push(vals.map(v=>'"'+String(v??'').replaceAll('"','""')+'"').join(','))}const a=document.createElement('a'),u=URL.createObjectURL(new Blob([rows.join('\r\n')],{type:'text/csv;charset=utf-8'}));a.href=u;a.download='branchmanager_novelty_comparison.csv';a.click();URL.revokeObjectURL(u)});renderNovelty();
+const partners=[...new Set(D.explorer_records.map(x=>x.partner))].sort(),recs=[...new Set(D.explorer_records.map(x=>x.recommendation))].sort(),qcs=[...new Set(D.explorer_records.map(x=>x.marker_qc))].sort();$('partnerFilter').innerHTML+=partners.map(x=>`<option>${esc(x)}</option>`).join('');$('recommendationFilter').innerHTML+=recs.map(x=>`<option>${esc(x)}</option>`).join('');$('qcFilter').innerHTML+=qcs.map(x=>`<option>${esc(x)}</option>`).join('');
 let filtered=[],isolatePage=1;
 function getFiltered(){
  let q=$('search').value.trim().toLowerCase(),p=$('partnerFilter').value,r=$('recommendationFilter').value,c=$('qcFilter').value;
- return D.records.filter(x=>(!p||x.partner===p)&&(!r||x.recommendation===r)&&(!c||x.marker_qc===c)&&(!q||[
- x.id,x.partner,x.recommendation,x.partner_taxon,x.gtdb_taxonomy,x.baseline_class,x.recommendation_reason,x.species_context,x.genome_coverage,
+ return D.explorer_records.filter(x=>(!p||x.partner===p)&&(!r||x.recommendation===r)&&(!c||x.marker_qc===c)&&(!q||[
+ x.id,x.partner_own_id,x.partner,x.recommendation,x.partner_taxon,x.gtdb_taxonomy,x.baseline_class,x.recommendation_reason,x.species_context,x.genome_coverage,
  ...(x.taxonomy||[]).flatMap(t=>[t.database,t.status,t.taxon,t.lineage,t.rank,t.explanation])
  ].join(' ').toLowerCase().includes(q)));
 }
 function renderTable(){
  filtered=getFiltered();const size=Number($('pageSize').value||50),pages=Math.max(1,Math.ceil(filtered.length/size));isolatePage=Math.min(isolatePage,pages);
  const shown=filtered.slice((isolatePage-1)*size,isolatePage*size);
- $('resultCount').textContent=`Showing ${shown.length.toLocaleString()} isolates (${((isolatePage-1)*size+1).toLocaleString()}–${Math.min(isolatePage*size,filtered.length).toLocaleString()}) of ${filtered.length.toLocaleString()} matches · ${total.toLocaleString()} total`;
- $('isolateBody').innerHTML=shown.map(x=>`<tr><td><button class="btn" data-open="${esc(x.id)}">${esc(x.id)}</button></td><td>${esc(x.partner)}</td><td>${pill(x.marker_qc)}</td><td>${esc(x.recommendation)}</td><td>${pill((x.taxonomy.find(t=>t.database==='GTDB r232')||{}).status)}</td><td>${pct(x.baseline_nearest_identity)}</td><td>${pct(x.project_nearest_identity)}${x.project_identity_warning?` <span class="qc-warning" title="${esc(x.project_identity_warning_reason)}" aria-label="Marker QC warning">⚠ QC</span>`:''}</td></tr>`).join('')||'<tr><td colspan="7" class="empty">No isolates match these filters</td></tr>';
+ $('resultCount').textContent=`Showing ${shown.length.toLocaleString()} isolates (${((isolatePage-1)*size+1).toLocaleString()}–${Math.min(isolatePage*size,filtered.length).toLocaleString()}) of ${filtered.length.toLocaleString()} matches · ${D.counts.registered_total.toLocaleString()} registered isolates`;
+ $('isolateBody').innerHTML=shown.map(x=>`<tr><td><button class="btn" data-open="${esc(x.id)}">${esc(x.id)}</button></td><td>${esc(x.partner_own_id||'—')}</td><td>${esc(x.partner)}</td><td>${pill(x.marker_qc)}</td><td>${esc(x.recommendation)}</td><td>${pill((x.taxonomy.find(t=>t.database==='GTDB r232')||{}).status)}</td><td>${pct(x.baseline_nearest_identity)}</td><td>${pct(x.project_nearest_identity)}${x.project_identity_warning?` <span class="qc-warning" title="${esc(x.project_identity_warning_reason)}" aria-label="Marker QC warning">⚠ QC</span>`:''}</td></tr>`).join('')||'<tr><td colspan="8" class="empty">No isolates match these filters</td></tr>';
  pager('isolatePager',isolatePage,pages,filtered.length,p=>{isolatePage=p;renderTable()});
 }
 ['search','partnerFilter','recommendationFilter','qcFilter'].forEach(id=>$(id).addEventListener(id==='search'?'input':'change',()=>{isolatePage=1;renderTable()}));
 $('pageSize').addEventListener('change',()=>{isolatePage=1;renderTable()});
 $('clearFilters').addEventListener('click',()=>{['search','partnerFilter','recommendationFilter','qcFilter'].forEach(id=>$(id).value='');isolatePage=1;renderTable()});
-$('isolateBody').addEventListener('click',e=>{let b=e.target.closest('[data-open]');if(b)openDetail(D.records.find(x=>x.id===b.dataset.open))});renderTable();
+$('isolateBody').addEventListener('click',e=>{let b=e.target.closest('[data-open]');if(b)openDetail(D.explorer_records.find(x=>x.id===b.dataset.open))});renderTable();
 function box(label,value){return `<div class="detailbox"><small>${esc(label)}</small><strong>${esc(value==null||value===''?'Not available':value)}</strong></div>`}
-function openDetail(x){if(!x)return;$('detailTitle').textContent=x.id;$('detailSubtitle').textContent=`${x.partner} · ${x.recommendation}`;let tax=x.taxonomy.map(t=>`<div class="taxcard"><strong>${esc(t.database)}</strong><div>${pill(t.status)}</div><p><b>Best taxon:</b> ${esc(t.taxon)}</p><p><b>Identity:</b> ${pct(t.identity)} · <b>Query coverage:</b> ${pct(t.query_coverage)} · <b>Reference coverage:</b> ${pct(t.reference_coverage)}</p><p><b>Assigned rank:</b> ${esc(t.rank||'Not available')}</p>${t.explanation?`<p>${esc(t.explanation)}</p>`:''}<p class="lineage">${esc(t.lineage)}</p></div>`).join('');let fig='';if(x.local_tree_figure&&!x.local_tree_figure.match(/^(\.\.|\/)/))fig=`<p><a href="${esc(x.local_tree_figure.startsWith('assessment/')?x.local_tree_figure:'assessment/'+x.local_tree_figure)}" target="_blank" rel="noopener">Open local phylogenetic figure</a></p>`;$('detailContent').innerHTML=`<div class="detailgrid">${box('Marker QC',x.marker_qc)}${box('Manual review',x.marker_review)}${box('Evidence quality',x.evidence_quality)}${box('SAB decision',x.sab_decision||'Not recorded')}${box('Sequencing role',x.sequencing_role)}${box('Partner-supplied taxon',x.partner_taxon)}${box('Cultured baseline category',x.baseline_class)}<div class="detailbox"><small>Closest cultured identity</small><strong>${esc(pct(x.baseline_nearest_identity))}</strong><p><b>Nearest hit:</b> ${esc(x.baseline_nearest_hit||'No cultured hit recorded')}</p></div><div class="detailbox"><small>Closest project identity</small><strong>${esc(pct(x.project_nearest_identity))}</strong><p><b>Nearest hit:</b> ${esc(x.project_nearest_hit||'No project hit recorded')}</p>${x.project_identity_warning?`<p class="qc-warning-text">⚠ ${esc(x.project_identity_warning_reason)}</p>`:''}</div>${box('Pangenome group',x.pangenome_rank+' · '+x.pangenome_taxon)}${box('Pangenome gap / target',fmt(x.pangenome_gap)+' / '+fmt(x.pangenome_target))}</div><div class="detailbox" style="margin-top:12px"><small>Closest cultured and project sequence matches</small><div class="taxgrid">${[...(x.cultured_match_details||[]),{key:'Project',...x.project_match_details}].map(m=>`<div class="taxcard"><strong>${esc(m.label)}</strong><p><b>Identity:</b> ${pct(m.identity)}</p><p><b>Nearest hit:</b> ${esc(m.hit||'No hit recorded')}</p><p><b>Query coverage:</b> ${pct(m.query_coverage)} · <b>Aligned length:</b> ${fmt(m.alignment_length)} bp</p></div>`).join('')}</div></div><div class="detailbox"><small>Recommendation explanation</small><p>${esc(({ 'SECONDARY - STRAIN DIVERSITY':'This isolate is identified as a candidate that may add strain diversity to the current collection.','REVIEW BEFORE SELECTION':'The available evidence indicates that this isolate should be reviewed before a sequencing decision is made.','EXCLUDE - BASELINE REDUNDANT':'The assessment identifies a close match in the cultured baseline, so this isolate is not prioritised as an additional genome at present.','LOWER PRIORITY - TARGET MET':'The configured pangenome target is reported as met for the relevant group, so this isolate has a lower sequencing priority.','ALREADY SELECTED - GENOME PENDING':'This isolate is already selected for genome sequencing, but the genome is recorded as pending.','ALREADY SEQUENCED':'A genome is already recorded for this isolate.'})[x.recommendation]||'No plain-language definition is available for this recommendation.')}</p><p><b>Assessment rationale:</b> ${esc(x.recommendation_reason||'No detailed rationale recorded.')}</p></div><div class="detailbox" style="margin-top:12px"><small>Taxonomic evidence across reference databases</small><div class="taxgrid">${tax}</div></div><div class="detailbox" style="margin-top:12px"><small>Additional biological context</small><p>${esc(x.species_context||'No additional species context recorded.')}</p><p>${esc(x.genome_coverage||'')}</p>${fig}</div>`;$('detail').classList.add('open');document.body.style.overflow='hidden'}
+function openDetail(x){if(!x)return;$('detailTitle').textContent=x.id;$('detailSubtitle').textContent=`${x.partner} · ${x.partner_own_id||'Partner ID not recorded'} · ${x.recommendation}`;let tax=x.taxonomy.map(t=>`<div class="taxcard"><strong>${esc(t.database)}</strong><div>${pill(t.status)}</div><p><b>Best taxon:</b> ${esc(t.taxon)}</p><p><b>Identity:</b> ${pct(t.identity)} · <b>Query coverage:</b> ${pct(t.query_coverage)} · <b>Reference coverage:</b> ${pct(t.reference_coverage)}</p><p><b>Assigned rank:</b> ${esc(t.rank||'Not available')}</p>${t.explanation?`<p>${esc(t.explanation)}</p>`:''}<p class="lineage">${esc(t.lineage)}</p></div>`).join('');let fig='';if(x.local_tree_figure&&!x.local_tree_figure.match(/^(\.\.|\/)/))fig=`<p><a href="${esc(x.local_tree_figure.startsWith('assessment/')?x.local_tree_figure:'assessment/'+x.local_tree_figure)}" target="_blank" rel="noopener">Open local phylogenetic figure</a></p>`;$('detailContent').innerHTML=`<div class="detailgrid">${box('Project isolate ID',x.id)}${box('Partner isolate ID',x.partner_own_id||'Not recorded')}${box('Marker QC',x.marker_qc)}${box('Manual review',x.marker_review)}${box('Evidence quality',x.evidence_quality)}${box('SAB decision',x.sab_decision||'Not recorded')}${box('Sequencing role',x.sequencing_role)}${box('Partner-supplied taxon',x.partner_taxon)}${box('Cultured baseline category',x.baseline_class)}<div class="detailbox"><small>Closest cultured identity</small><strong>${esc(pct(x.baseline_nearest_identity))}</strong><p><b>Nearest hit:</b> ${esc(x.baseline_nearest_hit||'No cultured hit recorded')}</p></div><div class="detailbox"><small>Closest project identity</small><strong>${esc(pct(x.project_nearest_identity))}</strong><p><b>Nearest hit:</b> ${esc(x.project_nearest_hit||'No project hit recorded')}</p>${x.project_identity_warning?`<p class="qc-warning-text">⚠ ${esc(x.project_identity_warning_reason)}</p>`:''}</div>${box('Pangenome group',x.pangenome_rank+' · '+x.pangenome_taxon)}${box('Pangenome gap / target',fmt(x.pangenome_gap)+' / '+fmt(x.pangenome_target))}</div><div class="detailbox" style="margin-top:12px"><small>Closest cultured and project sequence matches</small><div class="taxgrid">${[...(x.cultured_match_details||[]),{key:'Project',...x.project_match_details}].map(m=>`<div class="taxcard"><strong>${esc(m.label)}</strong><p><b>Identity:</b> ${pct(m.identity)}</p><p><b>Nearest hit:</b> ${esc(m.hit||'No hit recorded')}</p><p><b>Query coverage:</b> ${pct(m.query_coverage)} · <b>Aligned length:</b> ${fmt(m.alignment_length)} bp</p></div>`).join('')}</div></div><div class="detailbox"><small>Recommendation explanation</small><p>${esc(({ 'SECONDARY - STRAIN DIVERSITY':'This isolate is identified as a candidate that may add strain diversity to the current collection.','REVIEW BEFORE SELECTION':'The available evidence indicates that this isolate should be reviewed before a sequencing decision is made.','EXCLUDE - BASELINE REDUNDANT':'The assessment identifies a close match in the cultured baseline, so this isolate is not prioritised as an additional genome at present.','LOWER PRIORITY - TARGET MET':'The configured pangenome target is reported as met for the relevant group, so this isolate has a lower sequencing priority.','ALREADY SELECTED - GENOME PENDING':'This isolate is already selected for genome sequencing, but the genome is recorded as pending.','ALREADY SEQUENCED':'A genome is already recorded for this isolate.'})[x.recommendation]||'No plain-language definition is available for this recommendation.')}</p><p><b>Assessment rationale:</b> ${esc(x.recommendation_reason||'No detailed rationale recorded.')}</p></div><div class="detailbox" style="margin-top:12px"><small>Taxonomic evidence across reference databases</small><div class="taxgrid">${tax}</div></div><div class="detailbox" style="margin-top:12px"><small>Additional biological context</small><p>${esc(x.species_context||'No additional species context recorded.')}</p><p>${esc(x.genome_coverage||'')}</p>${fig}</div>`;$('detail').classList.add('open');document.body.style.overflow='hidden'}
 $('closeDetail').addEventListener('click',()=>{$('detail').classList.remove('open');document.body.style.overflow='' });$('detail').addEventListener('click',e=>{if(e.target===$('detail'))$('closeDetail').click()});document.addEventListener('keydown',e=>{if(e.key==='Escape'){if($('pangenomeDetail').classList.contains('open'))$('closePangenomeDetail').click();else $('closeDetail').click()}});
-$('exportBtn').addEventListener('click',()=>{let rows=filtered,cols=['id','partner','marker_qc','recommendation','sequencing_role','evidence_quality','partner_taxon','baseline_class','baseline_nearest_identity','baseline_nearest_hit','project_nearest_identity','project_nearest_hit','pangenome_rank','pangenome_taxon','pangenome_gap','recommendation_reason'];let csv=[cols.join(','),...rows.map(x=>cols.map(k=>'"'+String(x[k]??'').replaceAll('"','""')+'"').join(','))].join('\r\n');let a=document.createElement('a'),u=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));a.href=u;a.download='branchmanager_filtered_isolates.csv';a.click();URL.revokeObjectURL(u)});
+$('exportBtn').addEventListener('click',()=>{let rows=filtered,cols=['id','partner_own_id','partner','marker_qc','recommendation','sequencing_role','evidence_quality','partner_taxon','baseline_class','baseline_nearest_identity','baseline_nearest_hit','project_nearest_identity','project_nearest_hit','pangenome_rank','pangenome_taxon','pangenome_gap','recommendation_reason'];let csv=[cols.join(','),...rows.map(x=>cols.map(k=>'"'+String(x[k]??'').replaceAll('"','""')+'"').join(','))].join('\r\n');let a=document.createElement('a'),u=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));a.href=u;a.download='branchmanager_filtered_isolates.csv';a.click();URL.revokeObjectURL(u)});
 const navLinks=[...document.querySelectorAll('.nav a')],sections=navLinks.map(a=>document.querySelector(a.getAttribute('href'))).filter(Boolean);
 if('IntersectionObserver' in window){const io=new IntersectionObserver(entries=>entries.forEach(entry=>{if(entry.isIntersecting){navLinks.forEach(a=>a.classList.toggle('active',a.getAttribute('href')==='#'+entry.target.id))}}),{rootMargin:'-18% 0px -72% 0px'});sections.forEach(s=>io.observe(s))}
 const topButton=$('toTop');window.addEventListener('scroll',()=>topButton.classList.toggle('visible',window.scrollY>450),{passive:true});topButton.addEventListener('click',()=>window.scrollTo({top:0,behavior:'smooth'}));
@@ -1779,26 +1954,37 @@ def write_annual_report(db, outdir: str | Path) -> dict:
             decision.get('decision_reason', ''),
         ))
 
+    own_id_by_sequence = {}
+    with db.connect() as conn:
+        for sequence_id, project_metadata_json in conn.execute('SELECT id, project_metadata_json FROM sequencing_metadata'):
+            try:
+                metadata_json = json.loads(project_metadata_json or '{}')
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata_json = {}
+            own_id_by_sequence[str(sequence_id)] = str(metadata_json.get('partner_own_id') or metadata_json.get('partner_own_ids') or '')
     isolate_path = output / 'project_isolate_ledger.tsv'
-    with open(isolate_path, 'w') as handle:
-        handle.write('SequenceID\tDataset\tPartnerID\tOperationalStatus\tMarkerQC\tSelectedForGenomeSequencing\tGenomeAlreadySequenced\n')
+    with open(isolate_path, 'w', encoding='utf-8') as handle:
+        handle.write('SequenceID\tPartnerOwnID\tDataset\tPartnerID\tOperationalStatus\tMarkerQC\tSelectedForGenomeSequencing\tGenomeAlreadySequenced\n')
         for row in isolate_rows:
-            handle.write('\t'.join(str(value) for value in row) + '\n')
+            values = [row[0], own_id_by_sequence.get(str(row[0]), ''), *row[1:]]
+            handle.write('\t'.join(str(value) for value in values) + '\n')
     genome_path = output / 'project_genome_ledger.tsv'
     with open(genome_path, 'w') as handle:
-        handle.write('GenomeID\tSequenceID\tAccession\tGenomeStatus\tGenomeQCPass\tCompleteness\tContamination\tGTDBTaxonomy\tANICluster\n')
+        handle.write('GenomeID\tSequenceID\tPartnerOwnID\tAccession\tGenomeStatus\tGenomeQCPass\tCompleteness\tContamination\tGTDBTaxonomy\tANICluster\n')
         for row in genome_rows:
-            handle.write('\t'.join('NA' if value is None else str(value) for value in row) + '\n')
+            values = [row[0], row[1], own_id_by_sequence.get(str(row[1]), ''), *row[2:]]
+            handle.write('\t'.join('NA' if value is None else str(value) for value in values) + '\n')
     candidate_path = output / 'project_candidate_overview.tsv'
     with open(candidate_path, 'w') as handle:
         handle.write(
-            'SequenceID\tDataset\tPartnerID\tOperationalStatus\tMarkerQC\tRecommendation\t'
+            'SequenceID\tPartnerOwnID\tDataset\tPartnerID\tOperationalStatus\tMarkerQC\tRecommendation\t'
             'EvidenceQuality\tSequencingSetRole\tGTDBTaxonomy\tBaselineNearestHit\t'
             'BaselineNearestIdentity\tProjectNearestHit\tProjectNearestIdentity\t'
             'InvestigationScore\tRecommendationReason\n'
         )
         for row in candidate_rows:
-            handle.write('\t'.join(str(value) for value in row) + '\n')
+            values = [row[0], own_id_by_sequence.get(str(row[0]), ''), *row[1:]]
+            handle.write('\t'.join(str(value) for value in values) + '\n')
     removals_path = output / 'sequence_removal_ledger.tsv'
     with open(removals_path, 'w') as handle:
         handle.write('SequenceID\tOriginalDataset\tPartnerID\tSequenceLength\tTaxonomy\tReason\tRemovedAt\n')

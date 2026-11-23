@@ -159,6 +159,98 @@ def import_status_updates(db, path: str | Path) -> list[dict]:
     return results
 
 
+def import_partner_catalogue(db, path: str | Path) -> list[dict]:
+    """Register/update isolates from the cumulative partner catalogue.
+
+    New records are created as markerless candidate isolates. Existing dataset and
+    lifecycle state are retained; catalogue flags are merged monotonically with
+    existing genome availability and reviewer commitments.
+    """
+    import json
+    from branchmanager.partner_metadata import load_partner_sequencing_metadata, merge_partner_project_metadata
+
+    source_file = str(Path(path).expanduser().resolve())
+    rows = load_partner_sequencing_metadata(source_file)
+    existing_ids = set(db.get_all_ids())
+    existing_metadata = db.get_sequencing_metadata_for_ids()
+    with db.connect() as conn:
+        dataset_by_id = {str(sid): str(ds or '') for sid, ds in conn.execute('SELECT id, dataset FROM sequences')}
+    roles = db.get_dataset_roles()
+    isolate_statuses = db.get_isolate_statuses()
+    inserts, metadata_rows, report = [], [], []
+    for row in rows:
+        sequence_id = str(row['source_id'])
+        partner = str(row.get('partner_id') or '').strip()
+        metadata = existing_metadata.get(sequence_id, {})
+        dataset = dataset_by_id.get(sequence_id) or metadata.get('dataset') or f'{partner}_01'
+        if roles.get(dataset, {}).get('role') == 'baseline':
+            report.append({
+                'sequence_id': sequence_id, 'partner_id': partner, 'partner_own_id': '',
+                'result': 'REJECTED',
+                'detail': f'Catalogue row maps to baseline dataset {dataset!r}',
+            })
+            continue
+        existing_project_meta = dict(metadata.get('project_metadata') or {})
+        incoming_project_meta = dict(row.get('project_metadata') or {})
+        incoming_project_meta.update({
+            'partner_catalogue_source_file': Path(source_file).name,
+        })
+        project_metadata, _protected = merge_partner_project_metadata(existing_project_meta, incoming_project_meta)
+        # Partner IDs and catalogue taxon remain authoritative, while identifiers
+        # and operational commitments are not allowed to regress on re-import.
+        lifecycle = str(isolate_statuses.get(sequence_id, {}).get('status') or '').upper()
+        selected = bool(row.get('selected_for_sequencing')) or bool(metadata.get('selected_for_sequencing'))
+        if lifecycle == 'SAB_APPROVED':
+            selected = True
+        elif lifecycle in {'SAB_DECLINED', 'SAB_DEFERRED'}:
+            selected = False
+        sequenced = bool(row.get('selected_for_wgs')) or bool(metadata.get('selected_for_wgs'))
+        if sequence_id not in existing_ids:
+            inserts.append((sequence_id, ''))
+        metadata_rows.append({
+            'id': sequence_id, 'partner_id': partner, 'dataset': dataset,
+            'selected_for_sequencing': selected, 'selected_for_wgs': sequenced,
+            'source_id': sequence_id, 'source_file': source_file,
+            'raw_selected_value': row.get('raw_selected_value', ''),
+            'raw_commitment_value': row.get('raw_commitment_value', ''),
+            'project_metadata': project_metadata,
+        })
+        report.append({
+            'sequence_id': sequence_id, 'partner_id': partner,
+            'partner_own_id': project_metadata.get('partner_own_id', ''),
+            'result': 'UPDATED' if sequence_id in existing_ids else 'INSERTED',
+            'detail': (
+                'Cumulative catalogue metadata reconciled; existing sequence, review, status '
+                'and genome evidence retained.'
+            ),
+        })
+        roles[dataset] = {'role': 'candidate'}
+    for dataset in sorted({row['dataset'] for row in metadata_rows}):
+        db.upsert_dataset_role(dataset, 'candidate', genomes_available=False)
+    if inserts:
+        dataset_by_new_id = {row['id']: row['dataset'] for row in metadata_rows}
+        grouped_inserts = {}
+        for sequence_id, sequence in inserts:
+            target_dataset = dataset_by_new_id.get(sequence_id, 'candidate')
+            grouped_inserts.setdefault(target_dataset, []).append((sequence_id, sequence))
+        for dataset, records in grouped_inserts.items():
+            db.insert_sequences(records, dataset=dataset)
+    if metadata_rows:
+        db.upsert_sequencing_metadata(metadata_rows)
+    return report
+
+
+def write_partner_catalogue_import_report(path: str | Path, rows: Iterable[dict]) -> str:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fields = ['sequence_id', 'partner_id', 'partner_own_id', 'result', 'detail']
+    with open(output, 'w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t', extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(rows)
+    return str(output)
+
+
 def import_genome_results(
     db, path: str | Path, *, min_completeness: float = 90.0,
     max_contamination: float = 5.0,
@@ -685,6 +777,7 @@ def import_partner_workbook(db, path: str | Path, *, sheet_name='Bulk Upload Tem
             'source_row': row['source_row'],
             'sequence_id': sequence_id,
             'partner_id': row.get('partner_id') or '',
+            'partner_own_id': str(project_metadata.get('partner_own_id') or ''),
             'metadata_result': 'INSERTED_ISOLATE' if is_new_sequence else 'METADATA_UPDATED',
             'maldi_result': maldi_result,
             'source_taxon_value': raw_taxon,
@@ -724,7 +817,7 @@ def write_partner_workbook_import_report(path: str | Path, rows: Iterable[dict])
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     fields = [
-        'source_row', 'sequence_id', 'partner_id', 'metadata_result',
+        'source_row', 'sequence_id', 'partner_id', 'partner_own_id', 'metadata_result',
         'maldi_result', 'source_taxon_value', 'metadata_details', 'detail',
     ]
     with open(output, 'w', newline='') as handle:
@@ -748,16 +841,20 @@ def write_import_report(path: str | Path, rows: Iterable[dict]) -> str:
 def import_genome_only_partner_workbook(
     db, path: str | Path, *, sheet_name='Bulk Upload Template', dataset='PartnerWorkbook',
 ) -> list[dict]:
-    """Register partner isolates from a workbook without importing marker/16S data.
+    """Register partner isolates from a workbook or genome-results table without importing marker data.
 
     This registers candidate isolate identities only. Genome assemblies and QC
     evidence are imported separately through the genome-results workflow.
     """
     import json
-    from branchmanager.partner_metadata import load_genome_only_partner_workbook_rows
+    from branchmanager.partner_metadata import (
+        load_genome_only_partner_workbook_rows, load_genome_only_registration_table,
+    )
 
     source_file = str(Path(path).expanduser().resolve())
-    rows = load_genome_only_partner_workbook_rows(source_file, sheet_name=sheet_name)
+    is_table = Path(source_file).suffix.lower() in {'.csv', '.tsv', '.txt'}
+    rows = (load_genome_only_registration_table(source_file) if is_table else
+            load_genome_only_partner_workbook_rows(source_file, sheet_name=sheet_name))
     if not rows:
         return []
 
@@ -819,16 +916,28 @@ def import_genome_only_partner_workbook(
 
         project_metadata = dict((metadata or {}).get('project_metadata') or {})
         project_metadata.update(row.get('project_metadata') or {})
-        project_metadata.update({
-            'registration_type': 'genome_only_partner_isolate',
-            'marker_sequence_status': 'NOT_IMPORTED_16S_IGNORED',
-            'partner_workbook_source': source_file,
-            'partner_workbook_sheet': sheet_name,
-            'partner_workbook_source_row': row['source_row'],
-            'partner_workbook_dataset': dataset,
-            'partner_workbook_partner_raw': row.get('partner_raw') or '',
-            'partner_culture_id': row.get('partner_culture_id') or '',
-        })
+        if is_table:
+            if not existing:
+                project_metadata.update({
+                    'registration_type': 'genome_only_partner_isolate',
+                    'marker_sequence_status': 'NOT_IMPORTED_16S_IGNORED',
+                })
+            project_metadata.update({
+                'genome_registration_source': source_file,
+                'genome_registration_source_row': row['source_row'],
+                'genome_registration_dataset': dataset,
+            })
+        else:
+            project_metadata.update({
+                'registration_type': 'genome_only_partner_isolate',
+                'marker_sequence_status': 'NOT_IMPORTED_16S_IGNORED',
+                'partner_culture_id': row.get('partner_culture_id') or '',
+                'partner_workbook_source': source_file,
+                'partner_workbook_sheet': sheet_name,
+                'partner_workbook_source_row': row['source_row'],
+                'partner_workbook_dataset': dataset,
+                'partner_workbook_partner_raw': row.get('partner_raw') or '',
+            })
 
         if not existing:
             inserts.append((sequence_id, ''))

@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import shutil
 from pathlib import Path
 
 import pytest
 
-from branchmanager import cli
+from branchmanager import cli, cli_core
 from branchmanager.db.interface import Database
 from branchmanager.utils.fasta import read_fasta
 
@@ -69,10 +70,42 @@ def test_manifest_requires_only_modality_fields_and_resolves_relative_paths(tmp_
         cli._read_assistant_cohort_manifest(bad)
 
 
+def test_cli_cohort_prepare_only_does_not_require_dataset_or_reference(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(cli_core, 'cmd_assistant', lambda args: seen.update(vars(args)))
+
+    cli_core.main([
+        'assistant',
+        '--partner-metadata', str(tmp_path / 'partner_metadata.tsv'),
+        '--db', str(tmp_path / 'project.sqlite'),
+        '--cohort-manifest', str(tmp_path / 'cohort.tsv'),
+        '--cohort-prepare-only',
+        '--out', str(tmp_path / 'out'),
+    ])
+
+    assert seen['dataset'] is None
+    assert seen['ref'] is None
+    assert seen['cohort_prepare_only'] is True
+
+
+def test_cli_regular_assistant_still_requires_reference(tmp_path):
+    with pytest.raises(SystemExit) as exc_info:
+        cli_core.main([
+            'assistant',
+            '--partner-metadata', str(tmp_path / 'partner_metadata.tsv'),
+            '--db', str(tmp_path / 'project.sqlite'),
+            '--fasta', str(tmp_path / 'markers.fasta'),
+            '--dataset', 'PartnerA',
+            '--out', str(tmp_path / 'out'),
+        ])
+
+    assert exc_info.value.code == 2
+
+
 def test_cohort_prepare_does_not_touch_live_db_or_run_panel(tmp_path, monkeypatch):
     _cohort(tmp_path)
     before = _digest(tmp_path / 'live.sqlite')
-    monkeypatch.setattr(cli, 'cmd_assistant', lambda a: pytest.fail('assistant must not run in prepare'))
+    monkeypatch.setattr(cli_core, 'cmd_assistant', lambda a: pytest.fail('assistant must not run in prepare'))
     cli.cmd_assistant_cohort(_args(tmp_path, '--cohort-manifest', str(tmp_path / 'cohort.tsv'),
                                    '--cohort-prepare-only'))
     prep = tmp_path / 'out' / '00_cohort_preparation'
@@ -96,6 +129,7 @@ def _prepare(tmp_path, monkeypatch):
                                    '--cohort-prepare-only'))
 
 
+@pytest.mark.skipif(not (shutil.which('vsearch') and shutil.which('mafft') and (shutil.which('FastTree') or shutil.which('fasttree'))), reason='requires VSEARCH, MAFFT, and FastTree integration dependencies')
 def test_cohort_resume_joint_assessment_and_publish(tmp_path, monkeypatch):
     _prepare(tmp_path, monkeypatch)
     seen = {}
@@ -105,7 +139,7 @@ def test_cohort_resume_joint_assessment_and_publish(tmp_path, monkeypatch):
         seen['db'] = a.db
         seen['live_ids_during'] = set(Database(str(tmp_path / 'live.sqlite')).get_all_ids())
 
-    monkeypatch.setattr(cli, 'cmd_assistant', fake_assistant)
+    monkeypatch.setattr(cli_core, 'cmd_assistant', fake_assistant)
     decisions = _tsv(tmp_path / 'decisions.tsv', [
         {'sequence_id': 'P2', 'decision': 'APPROVE_FAIL_QC', 'reviewer': 'NJ', 'notes': 'trace inspected',
          'reviewed_at': '2025-01-01'},
@@ -130,7 +164,7 @@ def test_cohort_resume_joint_assessment_and_publish(tmp_path, monkeypatch):
 def test_invalid_decision_aborts_before_any_change(tmp_path, monkeypatch):
     _prepare(tmp_path, monkeypatch)
     before = _digest(tmp_path / 'live.sqlite')
-    monkeypatch.setattr(cli, 'cmd_assistant', lambda a: pytest.fail('must not run'))
+    monkeypatch.setattr(cli_core, 'cmd_assistant', lambda a: pytest.fail('must not run'))
     decisions = _tsv(tmp_path / 'decisions.tsv', [
         {'sequence_id': 'P2', 'decision': 'APPROVE_FAIL_QC', 'reviewer': '', 'notes': ''}])
     with pytest.raises(SystemExit, match='Invalid manual-review'):
@@ -147,7 +181,7 @@ def test_failure_during_assessment_leaves_live_db_unchanged(tmp_path, monkeypatc
         Database(a.db).insert_sequences([('X1', SEQ)], dataset='PartnerA')
         raise RuntimeError('simulated hiring panel failure')
 
-    monkeypatch.setattr(cli, 'cmd_assistant', boom)
+    monkeypatch.setattr(cli_core, 'cmd_assistant', boom)
     with pytest.raises(RuntimeError):
         cli.cmd_assistant_cohort(_args(tmp_path, '--cohort-resume', str(tmp_path / 'out')))
     assert _digest(tmp_path / 'live.sqlite') == before

@@ -35,9 +35,20 @@ def test_demo_dashboard_builds_from_committed_fixtures(tmp_path):
     payload_end = html.index("</script>", payload_start)
     payload = json.loads(html[payload_start:payload_end])
     assert payload["records"]
+    assert len(payload["explorer_records"]) == 60
+    assert payload["counts"]["registered_total"] == 60
+    assert payload["counts"]["partners"] == {"North Farm": 15, "Rumen Research Unit": 15, "Field Station": 15, "Culture Collection": 15}
+    catalogue_only = [row for row in payload["explorer_records"] if row["assessment_present"] is False]
+    assert len(catalogue_only) == 36
+    assert any(row["already_selected_for_genome_sequencing"] for row in catalogue_only)
+    catalogue_members = [member for group in payload["pangenome"] for member in group["members"] if member["kind"] == "Registered catalogue isolate"]
+    assert catalogue_members
+    assert any(member["committed"] for member in catalogue_members)
     assert (output_dir / "taxonomy" / "taxonomy_GTDB_r232.tsv").is_file()
     assert (output_dir / "assessment" / "selection_summary.tsv").is_file()
+    assert (output_dir / "assessment" / "registered_catalogue.tsv").is_file()
     assert (output_dir / "run_manifest.json").is_file()
+    assert "Registered catalogue fixture TSV" in html
 
 
 def test_demo_root_resolves_to_repository_docs_demo():

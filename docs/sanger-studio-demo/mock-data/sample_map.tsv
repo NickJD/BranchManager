@@ -1,0 +1,8 @@
+sequence_id	file	primer	direction	attempt_group
+SS001	SS001_27F.ab1	27F	forward	batch_A
+SS001	SS001_1492R.ab1	1492R	reverse	batch_A
+SS002	SS002_27F.ab1	27F	forward	batch_A
+SS002	SS002_907R_attempt01.ab1	907R	reverse	batch_A
+SS002	SS002_907R_attempt02.ab1	907R	reverse	batch_B
+SS003	SS003_515F.ab1	515F	forward	batch_A
+SS003	SS003_806R.ab1	806R	reverse	batch_A
