@@ -6,6 +6,7 @@ evidence sources is counted once in isolate-level tallies.
 from __future__ import annotations
 
 import csv
+import json
 from collections import Counter
 from pathlib import Path
 
@@ -123,9 +124,24 @@ def write_v1_ledgers(db, output_dir: str | Path) -> dict:
                 "WHERE source_type != 'GENOME_BARRNAP' AND (manual_review_status IN ('PENDING','NOT_REVIEWED','REJECTED') "
                 "OR evidence_tier='LOW') ORDER BY sequence_id"
             )]
+        partner_own_ids = {}
+        for sequence_id, project_metadata_json in conn.execute(
+            "SELECT id, project_metadata_json FROM sequencing_metadata"
+        ):
+            try:
+                project_metadata = json.loads(project_metadata_json or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                project_metadata = {}
+            partner_own_ids[str(sequence_id)] = str(
+                project_metadata.get("partner_own_id") or project_metadata.get("partner_own_ids") or ""
+            )
         genome_rows = [dict(zip(
-            ("genome_id", "sequence_id", "accession", "genome_status", "genome_qc_pass", "completeness",
-             "contamination", "gtdb_taxonomy", "ani_cluster", "genome_path", "genome_sha256", "source_file"), r))
+            (
+                "genome_id", "sequence_id", "partner_own_id", "accession", "genome_status",
+                "genome_qc_pass", "completeness", "contamination", "gtdb_taxonomy",
+                "ani_cluster", "genome_path", "genome_sha256", "source_file",
+            ),
+            (r[0], r[1], partner_own_ids.get(str(r[1]), ""), *r[2:])))
             for r in conn.execute(
                 "SELECT genome_id, sequence_id, accession, genome_status, genome_qc_pass, completeness, contamination, "
                 "gtdb_taxonomy, ani_cluster, genome_path, genome_sha256, source_file FROM genome_records "
@@ -185,7 +201,7 @@ def write_v1_ledgers(db, output_dir: str | Path) -> dict:
         "sequence_id", "dataset", "source_type", "evidence_tier", "qc_class", "manual_review_status",
         "review_decision", "reviewer", "qc_detail"], unreviewed)
     genome_path = _write(output / "project_genome_ledger.tsv", [
-        "genome_id", "sequence_id", "accession", "genome_status", "genome_qc_pass", "completeness",
+        "genome_id", "sequence_id", "partner_own_id", "accession", "genome_status", "genome_qc_pass", "completeness",
         "contamination", "gtdb_taxonomy", "ani_cluster", "genome_path", "genome_sha256", "source_file",
         "genomic_16s_tier", "genomic_16s_qc_class", "gtdbtk_16s_concordance", "genomic_16s_taxonomy",
         "genomic_16s_identity", "genomic_16s_query_coverage"], genome_rows)

@@ -3,10 +3,13 @@ from __future__ import annotations
 from branchmanager.pipeline.evidence_policy import evidence_quality as _shared_evidence_quality
 import gzip
 import json
+import logging
 import os
 import csv
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
 
 from branchmanager.taxonomy_io import iter_taxonomy_assignment_rows
 from branchmanager.taxonomy import (
@@ -52,7 +55,10 @@ def _assignment_source_is_fasta(assignments_path: str, source_fasta_path: Option
                     continue
                 return stripped.startswith('>')
     except Exception:
-        logger.debug('Could not read file %s to check if it is a FASTA', assignments_path)
+        logging.getLogger(__name__).debug(
+            'Could not read file %s to check if it is a FASTA',
+            assignments_path
+        )
         return False
     return False
 

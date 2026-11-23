@@ -247,6 +247,10 @@ configuration](configs/README.md).
   `status-meeting` / `records-update` Import factual isolate and genome
                                       lifecycle information.
 
+  `continue-project`                  Version, reconcile and fully reassess an
+                                      existing project using cumulative metadata,
+                                      new markers and completed genome results.
+
   `annual-report`                     Produce cumulative project
                                       reporting.
 
@@ -260,6 +264,24 @@ configuration](configs/README.md).
 
 Other commands support genome evidence imports, focused tree extraction,
 iTOL annotation, marker review, MALDI metadata and project maintenance.
+
+### Continuing an existing project
+
+Use `continue-project` to create a timestamped project version from the current database, reconcile cumulative catalogue and partner metadata, import completed genome evidence, process optional new/replacement marker sequences, and run a fresh cumulative Performance Review. The previous database and assessment are preserved. Publication occurs only after required assessment outputs and SQLite integrity checks pass. Survey-export CSVs are supported; the worksheet argument is ignored for CSV inputs. The genome-only registration workbook is not required.
+
+```bash
+branchmanager continue-project \
+  --db project.sqlite \
+  --partner-catalogue Partner_Isolate_Catalogue_November.csv \
+  --genome-results Genome_Results.tsv \
+  --partner-workbook partner_metadata.csv \
+  --marker-fasta new_or_resequenced_markers.fasta \
+  --replacement-policy approve_qc_pass \
+  -o continue_project_run
+```
+
+Run with `--dry-run` first to stage imports, reassessment and reports without publishing the current database. Assessment configuration is inherited from the latest successful Performance Review manifest, with optional overrides. `partner_own_ids` is retained as `partner_own_id`. See [the continuation workflow guide](docs/continuation-workflow.md) for version layout, marker replacement policy and input details.
+
 
 To regenerate the interactive dashboard from an existing run without
 repeating the biological analyses:
@@ -454,3 +476,28 @@ See [LICENSE](LICENSE).
 
 -   Repository: https://github.com/NickJD/BranchManager
 -   Issues: https://github.com/NickJD/BranchManager/issues
+
+## Release-aware projects (v1.4.0)
+
+BranchManager now includes project and release lifecycle management. Initialise a project once, create isolated release directories with their own SQLite databases and configuration snapshots, adopt existing release directories without overwriting their contents, and inspect/validate releases.
+
+
+```bash
+# Initialise project metadata and a reusable config
+branchmanager project init --root /path/to/Database_Live --name "Rumen Gateway" --config-source /path/to/project_config.json
+
+# Create a release with an automatically generated UTC timestamp ID
+branchmanager release create --project /path/to/Database_Live
+
+# Adopt an existing release folder safely
+branchmanager release adopt --project /path/to/Database_Live --release-id 20261120_164056
+
+# Inspect and validate
+branchmanager project list-releases --root /path/to/Database_Live
+branchmanager release info --project /path/to/Database_Live --release latest
+branchmanager release validate --project /path/to/Database_Live --release latest
+```
+
+Database-backed workflows accept `--release <release-id-or-directory>` to resolve the database from the release manifest. Existing `--db` and `--out` operation remains supported for legacy workflows. See [`docs/release-aware-projects.md`](docs/release-aware-projects.md) for details and limitations.
+
+For a new project, the smallest valid project-wide configuration is [`configs/project.minimum.json`](configs/project.minimum.json). Copy it to the project root as `project_config.json` and edit `project_directory` if the config will not live in the project root. It provides the required schema and empty `data`, `defaults`, and `baselines` sections; add collection-specific paths and command defaults as needed.

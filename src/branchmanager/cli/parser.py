@@ -48,6 +48,7 @@ def build_parser():
             '  performance-review Assess taxonomy, novelty, phylogeny, and sequencing candidates.\n'            '  dashboard          Regenerate the interactive dashboard from an existing run output directory.\n'
             '  status-meeting     Import factual isolate lifecycle changes.\n'
             '  records-update     Import completed-genome, QC, GTDB, and ANI evidence.\n'
+            '  continue-project   Continue a project from its cumulative catalogue and genome results.\n'
             '  add-maldi-identifications Register partner isolates with MALDI-TOF taxonomy and no marker.\n'
             '  import-genome-16s  Register genomic 16S (GENOME_BARRNAP) evidence and existing genomes.\n'
             '  import-genome-evidence Import partner genome FASTAs with GTDB-Tk and CheckM2 evidence.\n'
@@ -241,6 +242,8 @@ def build_parser():
         help='Paper Trail/Merge Meeting assembly_report.tsv sidecar. Auto-discovered beside --input when omitted.')
     performance_review_parser.add_argument('--marker-review', dest='marker_review', default=None,
         help='CSV/TSV manual-review decisions for PASS_WITH_WARNINGS or unverified marker sequences.')
+    performance_review_parser.add_argument('--replacement-policy', choices=['prompt', 'approve_qc_pass', 'approve_all', 'decline'], default='prompt',
+        help='Policy for non-identical marker resequencing: prompt, approve QC-passing replacements only, approve all (including lower-QC), or decline (default: prompt).')
     performance_review_parser.add_argument('--accept-unverified-marker-qc', action='store_true', default=False,
         help='Permit processing FASTA without QC provenance; this does not approve it for selection and requires the explicit authorizer/reason below.')
     performance_review_parser.add_argument('--unverified-override-authorizer', default='',
@@ -846,6 +849,66 @@ def build_parser():
         help='Maximum estimated contamination for automatic QC pass (default: 5).')
     records_update_parser.add_argument('-o', '--out', required=True)
 
+    continue_project_parser = sub.add_parser(
+        'continue-project',
+        help='Continue a project from its existing database using the cumulative partner catalogue and genome results.',
+        formatter_class=_Fmt,
+    )
+    continue_project_parser.add_argument(
+        '--db', required=True, help='Existing project SQLite database to update safely.'
+    )
+    continue_project_parser.add_argument(
+        '--partner-catalogue', required=True, help='Cumulative partner catalogue CSV/TSV.'
+    )
+    continue_project_parser.add_argument(
+        '--genome-results', required=True, help='Genome Results TSV/CSV containing completed genome evidence.'
+    )
+    continue_project_parser.add_argument(
+        '--partner-workbook', default=None, help='Optional partner workbook or survey CSV for additional metadata.'
+    )
+    continue_project_parser.add_argument(
+        '--partner-workbook-sheet', default='Bulk Upload Template',
+        help='Worksheet name for Excel workbook input; ignored for CSV.'
+    )
+    continue_project_parser.add_argument(
+        '--partner-workbook-dataset', default='AU_01',
+        help='Dataset used for optional partner workbook/CSV metadata.'
+    )
+    continue_project_parser.add_argument('--marker-fasta', default=None,
+        help='Optional new/replacement marker FASTA for this continuation; replacement decisions follow --replacement-policy.')
+    continue_project_parser.add_argument('--marker-source-type', choices=['auto', 'SANGER_AB1', 'PARTNER_FASTA', 'PACBIO_HIFI', 'MIXED'], default='auto', help='Provenance label for incoming marker sequences.')
+    continue_project_parser.add_argument('--marker-qc', default=None, help='Optional QC sidecar for --marker-fasta.')
+    continue_project_parser.add_argument('--marker-review', default=None, help='Optional manual marker-review decisions for --marker-fasta.')
+    continue_project_parser.add_argument('--taxa-assignments', default=None, help='Optional precomputed taxonomy assignments for incoming markers only.')
+    continue_project_parser.add_argument('--replacement-policy', choices=['prompt', 'approve_qc_pass', 'approve_all', 'decline'], default='prompt',
+        help='How to handle changed markers for existing isolates (default: prompt).')
+    continue_project_parser.add_argument('--marker-dataset', default='Continuation_Markers', help='Dataset label for new marker records supplied in this continuation.')
+    continue_project_parser.add_argument('--ref', default=None, help='Override the primary reference FASTA from the previous Performance Review.')
+    continue_project_parser.add_argument('--taxa', default=None, help='Override the taxonomy table associated with --ref.')
+    continue_project_parser.add_argument('--main-ref', default=None, help='Override the primary reference database name.')
+    continue_project_parser.add_argument('--mwl', default=None, help='Override the Most Wanted List source.')
+    continue_project_parser.add_argument('--mwl-sheet', default=None, help='Override the MWL worksheet name.')
+    continue_project_parser.add_argument('--threads', type=int, default=None, help='Override assessment thread count.')
+    continue_project_parser.add_argument('--baseline-fasta', default=None, help='Override inherited baseline/context FASTA.')
+    continue_project_parser.add_argument('--baseline-taxa-assignments', default=None, help='Override inherited baseline taxonomy assignments.')
+    continue_project_parser.add_argument('--chimera-ref', default=None, help='Override inherited chimera reference FASTA.')
+    continue_project_parser.add_argument('--anchors', default=None, help='Override inherited phylogenetic anchors FASTA.')
+    continue_project_parser.add_argument('--alt-ref', action='append', default=None, help='Override/add alternate reference FASTA(s), repeatable.')
+    continue_project_parser.add_argument('--alt-taxa', action='append', default=None, help='Override/add taxonomy tables for alternate refs, repeatable.')
+    continue_project_parser.add_argument('--alt-ref-name', action='append', default=None, help='Override/add names for alternate references, repeatable.')
+    continue_project_parser.add_argument('--sequence-domain', choices=SEQUENCE_DOMAIN_CHOICES, default=None, help='Override the inherited sequence-domain profile.')
+    continue_project_parser.add_argument('--accept-unverified-marker-qc', action='store_true', default=False, help='Explicitly allow incoming marker FASTA without QC provenance (requires authorizer and reason).')
+    continue_project_parser.add_argument('--unverified-override-authorizer', default='', help='Person authorizing unverified incoming marker QC.')
+    continue_project_parser.add_argument('--unverified-override-reason', default='', help='Reason for accepting unverified incoming marker QC.')
+    continue_project_parser.add_argument('--version-root', default=None, help='Directory for immutable project versions (default: <database-parent>/<database-stem>_versions).')
+    continue_project_parser.add_argument(
+        '--dry-run', action='store_true',
+        help='Validate and report on a staged copy without publishing database changes.'
+    )
+    continue_project_parser.add_argument(
+        '-o', '--out', required=True, help='Output directory for reports and run manifest.'
+    )
+
     external_genomes_parser = sub.add_parser(
         'add-external-genomes',
         help='Register previously sequenced collection genomes, with optional 16S markers.',
@@ -874,14 +937,14 @@ def build_parser():
 
     partner_workbook_parser = sub.add_parser(
         'import-partner-workbook',
-        help='Import isolate metadata and MALDI status from a partner .xlsm workbook.',
+        help='Import isolate metadata and MALDI status from a partner Excel workbook or survey CSV/TSV.',
         formatter_class=_Fmt,
     )
     partner_workbook_parser.add_argument('--db', required=True)
     partner_workbook_parser.add_argument('--input', required=True,
-        help='Partner .xlsm workbook with a Bulk Upload Template sheet.')
+        help='Partner Excel workbook or survey-export CSV/TSV; with --genome-only, a genome-results CSV/TSV with sequence_id and partner_id is also accepted.')
     partner_workbook_parser.add_argument('--sheet', default='Bulk Upload Template',
-        help='Worksheet containing the partner isolate records.')
+        help='Worksheet containing the partner isolate records (ignored for CSV/TSV).')
     partner_workbook_parser.add_argument('--dataset', default='PartnerWorkbook',
         help='Dataset label for newly created markerless isolate records.')
     partner_workbook_parser.add_argument('--genome-only', action='store_true',
@@ -1062,8 +1125,8 @@ def build_parser():
         help='Evidence provenance for the marker imported by Assistant (default: infer from input mode).')
     assistant_parser.add_argument('--read-dir', default=None)
     assistant_parser.add_argument('--db', required=True)
-    assistant_parser.add_argument('--dataset', required=True)
-    assistant_parser.add_argument('--ref', required=True)
+    assistant_parser.add_argument('--dataset')
+    assistant_parser.add_argument('--ref')
     assistant_parser.add_argument('--taxa', default=None)
     assistant_parser.add_argument('--ref-name', default='GTDB')
     assistant_parser.add_argument('--alt-ref', action='append', default=[])
@@ -1299,5 +1362,62 @@ def build_parser():
     # paths remain unchanged.
     from branchmanager.validation import add_cli_arguments as _add_validation_arguments
     _add_validation_arguments(sub)
+
+    # Project/release lifecycle management (does not alter legacy workflow commands).
+    project_parser = sub.add_parser('project', help='Manage a BranchManager project and its releases')
+    project_sub = project_parser.add_subparsers(dest='project_action', required=True)
+    project_init = project_sub.add_parser('init', help='Initialise a project root and reusable config')
+    project_init.add_argument('--root', required=True, help='Project root directory')
+    project_init.add_argument('--name', default='BranchManager Project', help='Human-readable project name')
+    project_init.add_argument('--config-source', help='Optional existing project config JSON to copy')
+    project_init.add_argument('--releases-dir', default=None, help='Release-store directory relative to project root (default Releases/BranchManager_Project)')
+    project_init.add_argument('--overwrite', action='store_true', help='Replace existing project config (manifest is refreshed)')
+    for action_name, action_help in (('info','Show project metadata'), ('validate','Validate project manifest/config'), ('list-releases','List releases')):
+        pp = project_sub.add_parser(action_name, help=action_help)
+        pp.add_argument('--root', required=True, help='Project root directory')
+
+    release_parser = sub.add_parser('release', help='Create, inspect and validate project releases')
+    release_sub = release_parser.add_subparsers(dest='release_action', required=True)
+    release_adopt = release_sub.add_parser('adopt', help='Adopt an existing release directory without overwriting its contents')
+    release_adopt.add_argument('--project', '--root', dest='project_root', required=True, help='Project root')
+    release_adopt.add_argument('--release-id', required=True, help='Existing release directory name')
+    release_adopt.add_argument('--no-config-snapshot', action='store_true', help='Do not add a project config snapshot')
+    release_create = release_sub.add_parser('create', help='Create an isolated release directory')
+    release_create.add_argument('--project', '--root', dest='project_root', required=True, help='Project root')
+    release_create.add_argument('--release-id', default=None, help='Optional release ID (default UTC timestamp)')
+    release_create.add_argument('--parent-release', default=None, help='Parent release ID or directory')
+    release_create.add_argument('--copy-database', action='store_true', help='Copy parent release database with SQLite backup')
+    release_create.add_argument('--no-config-snapshot', action='store_true', help='Do not snapshot project config into release')
+    for action_name, action_help in (('info','Show release manifest and resolved paths'), ('validate','Validate release structure and SQLite'), ('status','Update release lifecycle status')):
+        rp = release_sub.add_parser(action_name, help=action_help)
+        rp.add_argument('--project', '--root', dest='project_root', required=True, help='Project root')
+        rp.add_argument('--release', required=True, help='Release ID or release directory')
+        if action_name == 'status':
+            rp.add_argument('--set', dest='status_value', required=True, choices=['CREATED','IN_PROGRESS','VALIDATING','READY','FAILED','ABORTED','ARCHIVED'])
+            rp.add_argument('--workflow', choices=['inputs','registration','genome_import','filing_cabinet','cohort','assessment','dashboard','validation','continuation'])
+            rp.add_argument('--note', default=None, help='Optional status event note')
+
+    # Add release context to database-backed workflows without removing legacy
+    # --db/--out operation. The release resolver supplies --db when omitted.
+    _project_cmds = sub.choices
+    _db_release_commands = {
+        'filing-cabinet', 'performance-review', 'quarterly-review', 'label-maker',
+        'org-chart', 'replacement', 'status-meeting', 'records-update',
+        'add-external-genomes', 'add-maldi-identifications', 'import-partner-workbook',
+        'exit-interview', 'marker-evidence-migrate', 'register-marker-evidence',
+        'import-genome-16s', 'import-genome-evidence', 'import-genome-results',
+        'marker-review-apply', 'annual-report', 'assistant', 'regenerate-assessment', 'continue-project',
+    }
+    for _command_name in _db_release_commands:
+        _command_parser = _project_cmds.get(_command_name)
+        if _command_parser is None:
+            continue
+        _command_parser.add_argument('--release', dest='release_context', default=None,
+            help='Release ID or release directory; supplies the release database and safe default output paths')
+        for _action in _command_parser._actions:
+            # Release context supplies these paths; retain the arguments for
+            # standalone/legacy use and permit explicit overrides.
+            if _action.dest in {'db', 'out'} and _action.required:
+                _action.required = False
 
     return parser

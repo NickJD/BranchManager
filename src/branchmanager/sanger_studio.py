@@ -501,12 +501,74 @@ def _combine_normalised_read_maps(paths: list[Path]) -> tuple[list[dict[str, str
     return list(by_read.values()), source_paths
 
 
-def _combine_standalone_sample_maps(paths: list[Path]) -> tuple[list[dict[str, str]], list[str]]:
+def _discover_cohort_manifest_for_review(review_path: Path) -> tuple[Path | None, Path]:
+    """Find a cohort-level partner manifest adjacent to a marker-review TSV.
+
+    Review templates are normally stored in cohort/00_cohort_preparation;
+    manifests are searched only within that cohort tree and its immediate parent.
+    """
+    review_dir = review_path.parent.resolve()
+    cohort_root = review_dir.parent if review_dir.name == '00_cohort_preparation' else review_dir
+    search_roots = [cohort_root, cohort_root.parent]
+    candidate_names = {
+        'partner_marker_cohort_manifest.csv', 'partner_marker_cohort_manifest.tsv',
+        'partner_marker_cohort_manifest.txt', 'cohort_manifest.csv', 'cohort_manifest.tsv',
+        'partner_marker_cohort_manifest_november.csv',
+    }
+    for root_index, root in enumerate(search_roots):
+        if not root.is_dir():
+            continue
+        if root_index == 1:
+            # Avoid accidentally finding a manifest from another release/cohort.
+            candidates = [(root, sorted(root.iterdir()))]
+        else:
+            candidates = []
+            for current, dirs, files in os.walk(root):
+                dirs[:] = sorted(d for d in dirs if d not in {'.git', '__pycache__', 'sanger_studio_runs'} and not d.startswith('.'))
+                candidates.append((Path(current), [Path(current) / name for name in files]))
+        for current, items in candidates:
+            for item in sorted(items, key=lambda x: x.name.lower()):
+                if item.is_file() and item.name.lower() in candidate_names:
+                    return item, cohort_root
+    return None, cohort_root
+
+
+def _read_cohort_manifest_for_review(path: Path, review_rows: list[dict]) -> list[dict]:
+    """Read cohort manifest entries matching partner/dataset represented in review TSV."""
+    with open(path, newline='', encoding='utf-8-sig') as handle:
+        sample = handle.read(4096)
+        handle.seek(0)
+        delimiter = '\t' if path.suffix.lower() in {'.tsv', '.txt'} else ','
+        raw_rows = csv.DictReader(handle, delimiter=delimiter)
+        manifest_rows = list(raw_rows)
+    wanted = {(str(r.get('partner_id') or '').strip().casefold(), str(r.get('dataset') or '').strip().casefold()) for r in review_rows}
+    selected = []
+    for raw in manifest_rows:
+        row = {str(k or '').strip().lower().replace('-', '_').replace(' ', '_'): str(v or '').strip() for k, v in raw.items() if k}
+        partner = row.get('partner_id') or row.get('partner') or row.get('partner_acronym')
+        dataset = row.get('dataset') or row.get('batch_id')
+        if (partner.casefold(), dataset.casefold()) not in wanted:
+            continue
+        sample_map = row.get('sample_map') or row.get('ab1_map') or row.get('mailroom_map')
+        read_dir = row.get('read_dir') or ''
+        if sample_map:
+            mp = Path(sample_map).expanduser()
+            if not mp.is_absolute():
+                mp = path.parent / mp
+            if mp.is_file():
+                rd = Path(read_dir).expanduser() if read_dir else None
+                if rd and not rd.is_absolute():
+                    rd = path.parent / rd
+                selected.append({'sample_map': mp.resolve(), 'read_dir': rd.resolve() if rd else None})
+    return selected
+
+
+def _combine_standalone_sample_maps(paths: list[Path], read_dirs: dict[Path, Path] | None = None) -> tuple[list[dict[str, str]], list[str]]:
     """Combine recognised standalone maps, deduplicating identical physical reads."""
     by_file: dict[str, dict[str, str]] = {}
     source_paths = []
     for path in sorted(paths):
-        rows = _read_map(path)
+        rows = _read_map(path, (read_dirs or {}).get(path))
         source_paths.append(str(path))
         for row in rows:
             key = str(Path(row['file']).resolve())
@@ -720,8 +782,8 @@ def _row_get(row: dict[str, str], names: tuple[str, ...]) -> str:
     return next((values[name] for name in names if values.get(name)), '')
 
 
-def _read_map(path: str | Path) -> list[dict[str, str]]:
-    """Read a user-selected sample map; mapped AB1 paths may live anywhere."""
+def _read_map(path: str | Path, read_dir: str | Path | None = None) -> list[dict[str, str]]:
+    """Read a sample map; resolve relative AB1 paths against map then read_dir."""
     map_path = Path(path).expanduser().resolve()
     if not map_path.is_file():
         raise ValueError(f'Sample map does not exist: {map_path}')
@@ -742,7 +804,9 @@ def _read_map(path: str | Path) -> list[dict[str, str]]:
             )
         read_path = Path(read_file).expanduser()
         if not read_path.is_absolute():
-            read_path = map_path.parent / read_path
+            map_relative = (map_path.parent / read_path).resolve()
+            read_relative = (Path(read_dir).expanduser().resolve() / read_path).resolve() if read_dir else map_relative
+            read_path = map_relative if map_relative.is_file() else read_relative
         read_path = read_path.resolve()
         if not read_path.is_file():
             raise ValueError(f'Read file on row {line} does not exist: {read_path}')
@@ -2015,7 +2079,42 @@ class SangerStudio:
         self.marker_review_fields = fields
         self.marker_review_rows = normalised
         self.dialog_start = source.parent
-        return self.marker_review_state()
+        review_state = self.marker_review_state()
+        # Review-first cohort workflow: discover cohort manifest and load mapped AB1s
+        # without prompting the user to manually browse for chromatograms.
+        manifest_path, cohort_root = _discover_cohort_manifest_for_review(source)
+        auto_load_status = 'No cohort manifest discovered; review loaded without reads.'
+        if manifest_path:
+            try:
+                manifest_entries = _read_cohort_manifest_for_review(manifest_path, normalised)
+                maps = [entry['sample_map'] for entry in manifest_entries]
+                read_dirs = {entry['sample_map']: entry['read_dir'] for entry in manifest_entries if entry.get('read_dir')}
+                if maps:
+                    rows, source_paths = _combine_standalone_sample_maps(maps, read_dirs)
+                    with self.lock:
+                        self.map_rows = [dict(row) for row in rows]
+                        self.map_path = maps[0] if len(maps) == 1 else None
+                        self.input_source = 'cohort_manifest'
+                        self.input_directory = str(cohort_root)
+                        self.input_files = source_paths
+                        self.onboarding_taxonomy = None
+                        self.pre_screen_taxonomy_by_isolate = {}
+                    samples = _samples_from_rows(rows)
+                    review_state.update({
+                        'samples': samples, 'read_count': len(rows), 'input_kind': 'standalone_sample_map',
+                        'path': str(self.map_path) if self.map_path else '', 'map_paths': source_paths,
+                        'taxonomy_loaded': False, 'taxonomy_status': 'NOT_SCREENED',
+                        'onboarding_taxonomy': self.onboarding_taxonomy_state(),
+                        'status_message': f'Automatically loaded {len(samples)} isolate(s) and {len(rows)} read(s) from {len(source_paths)} cohort manifest map(s).',
+                        'auto_loaded_from_manifest': True,
+                    })
+                    auto_load_status = review_state['status_message']
+                else:
+                    auto_load_status = 'Cohort manifest found, but no matching Sanger sample maps were listed for review partner/dataset values.'
+            except Exception as exc:
+                auto_load_status = f'Cohort manifest was found, but automatic read loading failed: {exc}'
+        review_state['auto_load_status'] = auto_load_status
+        return review_state
 
     def marker_review_state(self) -> dict:
         rows = []
@@ -2076,9 +2175,63 @@ class SangerStudio:
                 raw_notes = item.get('notes')
                 notes = str(raw_notes if raw_notes is not None else (row.get('notes') or '')).strip()
                 manual_selection_changed = False
+                candidate_selection_changed = False
+
+                # Persist the explicit retained assembly/read candidate separately
+                # from the legacy individual-read fallback selector.
+                selected_candidate_id = str(item.get('selected_candidate_id') or '').strip()
+                if selected_candidate_id:
+                    previous_candidate_id = str(row.get('selected_candidate_id') or '').strip()
+                    candidate_selection_changed = previous_candidate_id != selected_candidate_id
+                    if candidate_selection_changed:
+                        # Only a newly changed selection must be validated against
+                        # the current inspection. An unchanged candidate imported
+                        # from a saved review is historical evidence and should be
+                        # retained across Studio sessions without requiring that
+                        # the candidate be regenerated in this session.
+                        inspection_for_candidate = self.last_inspection.get(sid)
+                        # Assemblies and individual-read fallback candidates are
+                        # stored separately in an inspection. Validate against both;
+                        # otherwise valid fallback selections are falsely reported stale.
+                        inspection = inspection_for_candidate or {}
+                        valid_candidates = list(inspection.get('assembly_candidates') or [])
+                        fallback_options = _parse_fallback_read_options(inspection.get('fallback_read_options'))
+                        candidate = next((c for c in valid_candidates if str(c.get('CandidateID') or '').strip() == selected_candidate_id), None)
+                        fallback = next((c for c in fallback_options if str(c.get('read_id') or '').strip() == selected_candidate_id), None)
+                        if candidate is None and fallback is None:
+                            raise ValueError(
+                                f'{sid}: newly selected candidate {selected_candidate_id!r} is not in the latest inspection '
+                                '(neither an assembly candidate nor an individual-read fallback). '
+                                'Re-inspect this isolate and select a candidate from the current results.'
+                            )
+                        if candidate is not None:
+                            read_ids = [x.strip() for x in str(candidate.get('ReadIDs') or '').split(';') if x.strip()]
+                            row['selected_candidate_type'] = 'INDIVIDUAL_READ' if len(read_ids) <= 1 else 'ASSEMBLY'
+                            row['selected_candidate_length'] = str(candidate.get('OutputLength') or candidate.get('SequenceLength') or len(str(candidate.get('Sequence') or '')))
+                        else:
+                            row['selected_candidate_type'] = 'INDIVIDUAL_READ'
+                            row['selected_candidate_length'] = str(fallback.get('length') or fallback.get('trimmed_length') or '')
+                        row['selected_candidate_source'] = 'MANUAL'
+                        manual_selection_changed = manual_selection_changed or candidate_selection_changed
+                        if not reviewer:
+                            raise ValueError(f'{sid}: reviewer identity is required when selecting a retained assembly/read candidate.')
+                        row['reviewer'] = reviewer
+                    # Preserve the ID and its stored metadata for an unchanged
+                    # candidate from an attached review file.
+                    row['selected_candidate_id'] = selected_candidate_id
+                elif 'selected_candidate_id' in item:
+                    row['selected_candidate_id'] = ''
+                    row['selected_candidate_type'] = ''
+                    row['selected_candidate_length'] = ''
+                    row['selected_candidate_source'] = ''
 
                 if 'selected_read_id' in item:
                     selected_read_id = str(item.get('selected_read_id') or '').strip()
+                    # If a final candidate (assembly or individual read) is
+                    # selected, it supersedes the legacy fallback-read selector.
+                    # Clear any stale dropdown value before QC validation.
+                    if selected_candidate_id:
+                        selected_read_id = ''
 
                     # An inspection may have been run after the cohort review TSV
                     # was attached. In that workflow the browser receives the
@@ -2198,6 +2351,8 @@ class SangerStudio:
                             row['reviewed_at'] = (
                                 today if row.get('read_selection_source') == 'MANUAL' else ''
                             )
+                        elif candidate_selection_changed:
+                            row['reviewed_at'] = today
                         elif row.get('read_selection_source') != 'MANUAL':
                             row['reviewed_at'] = ''
                     row['_original_decision'] = ''
@@ -2208,7 +2363,9 @@ class SangerStudio:
                 'eligible_for_manual_acceptance', 'allowed_decisions',
                 'fallback_read_options', 'recommended_read_id', 'selected_read_id',
                 'read_selection_source', 'fallback_reason', 'processing_mode',
-                'assembly_status', 'output_type',
+                'assembly_status', 'output_type', 'selected_candidate_id',
+                'selected_candidate_type', 'selected_candidate_length',
+                'selected_candidate_source',
             ):
                 if required_field not in fields:
                     fields.append(required_field)

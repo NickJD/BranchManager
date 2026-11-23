@@ -6,10 +6,10 @@
 <title>BranchManager · Sanger Studio</title>
 <style>
 :root{--ink:#152438;--muted:#63738a;--line:#dce4ee;--paper:#f4f7fb;--card:#fff;--navy:#163554;--blue:#2474c6;--teal:#148777;--amber:#b86b08;--red:#b83a44;--softblue:#e9f3ff;--softteal:#e8f7f3;--softamber:#fff4df;--softred:#ffeded;--shadow:0 8px 28px rgba(24,48,78,.07)}
-*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}button,input,select{font:inherit}button{border:0;border-radius:8px;padding:9px 13px;background:var(--navy);color:white;font-weight:650;cursor:pointer}button:hover{filter:brightness(1.08)}button:disabled{opacity:.5;cursor:wait}.secondary{background:#e7edf5;color:var(--ink)}.blue{background:var(--blue)}.green{background:var(--teal)}.red{background:var(--red)}.quiet{background:transparent;color:var(--blue);padding:5px 7px}.wrap{width:100%;max-width:none;margin:0;padding:22px clamp(14px,1.4vw,30px)}.top{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:16px}.brand{display:flex;gap:14px;align-items:center}.mark{display:grid;place-items:center;width:44px;height:44px;border-radius:13px;background:#dcecff;color:#15558c;font-size:23px}.brand h1{font-size:23px;line-height:1.15;margin:0}.brand p{margin:5px 0 0;color:var(--muted)}.top-actions{display:flex;align-items:center;justify-content:flex-end;gap:9px;min-width:0}.rootbadge{padding:8px 11px;border:1px solid var(--line);border-radius:9px;background:white;color:var(--muted);max-width:48%;overflow-wrap:anywhere}.shutdown{background:#fff0f0;color:#9d2630;border:1px solid #f1c8cb;white-space:nowrap}.shutdown:hover{background:#ffe4e5}.shutdown:disabled{opacity:.6}.shutdown-notice{display:none;margin:12px 0;padding:13px 16px;border:1px solid #e8c1c4;border-radius:10px;background:#fff1f1;color:#8f2630;font-weight:650}.shutdown-notice.show{display:block}.principle{border:1px solid #c8deef;background:linear-gradient(100deg,#edf7ff,#f3fbfa);border-radius:12px;padding:13px 16px;margin:14px 0 18px;display:flex;gap:12px;align-items:flex-start}.principle strong{color:#18486d}.principle p{margin:0;color:#41536a}.grid{display:grid;grid-template-columns:minmax(270px,340px) minmax(0,1fr);gap:17px;align-items:start}main{min-width:0}.sidebar{position:sticky;top:12px;height:calc(100vh - 24px);max-height:calc(100vh - 24px);display:flex;flex-direction:column;overflow:hidden}.sidebar>.cardbody{flex:1;min-height:0;display:flex;flex-direction:column}.sidebar-runbar{margin-top:10px;padding:10px 0 2px;border-top:1px solid var(--line);background:var(--card)}.sidebar-runbar button{width:100%}.sidebar-runbar .statusline{display:block;margin-top:5px;min-height:17px}.card{background:var(--card);border:1px solid var(--line);border-radius:13px;box-shadow:var(--shadow);min-width:0}.cardhead{padding:14px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0}.cardhead h2,.cardhead h3{font-size:15px;margin:0}.cardhead>.small{min-width:0;max-width:48%;text-align:right;overflow-wrap:anywhere;word-break:break-word}.resulttitle{min-width:0;flex-wrap:wrap}.cardbody{padding:15px 16px;min-width:0}.mapline{display:flex;gap:8px}.mapline input{min-width:0;flex:1}.textinput,input[type=text],input[type=number],select,textarea{border:1px solid #cbd6e3;border-radius:8px;padding:9px 10px;color:var(--ink);background:white}input[type=number]{width:100%}.small{font-size:12px;color:var(--muted)}.samples{flex:1;min-height:100px;max-height:none;overflow:auto;margin-top:12px;border-top:1px solid var(--line)}.sample{padding:10px 9px;display:flex;justify-content:space-between;gap:8px;border-bottom:1px solid #edf1f6;cursor:pointer}.sample:hover,.sample.active{background:#edf5ff}.sampleid{font-weight:700}.samplemeta{font-size:11px;color:var(--muted)}.count{border-radius:12px;background:#edf1f6;color:#4d6075;padding:2px 8px;font-size:11px;height:max-content}.section{margin-bottom:16px}.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.row.between{justify-content:space-between}.muted{color:var(--muted)}.help{font-size:12px;color:var(--muted);margin:5px 0 0}.settings{display:grid;grid-template-columns:repeat(4,minmax(110px,1fr));gap:11px}.setting label{display:block;font-size:12px;font-weight:650;color:#495b71;margin-bottom:5px}.setting .explain{font-size:10px;color:var(--muted);margin-top:3px}.readscroll{max-width:100%;overflow:auto}.reads{width:100%;min-width:800px;border-collapse:collapse;font-size:12px}.reads th,.reads td{text-align:left;padding:8px 7px;border-bottom:1px solid #e9eef4;vertical-align:middle}.reads th{font-size:11px;color:var(--muted);font-weight:650}.reads input{width:100%;min-width:100px;padding:7px}.reads select{padding:7px}.runbar{display:flex;align-items:center;gap:12px;margin-top:14px;flex-wrap:wrap}.statusline{min-height:22px;color:var(--muted)}.batchbox{margin-top:12px;padding:10px;border:1px solid #dce7f2;border-radius:9px;background:#f8fbff}.batchbox .statusline{overflow-wrap:anywhere}.results{margin-top:18px}.resulttitle{display:flex;align-items:center;justify-content:space-between;gap:10px}.pill{padding:5px 9px;border-radius:20px;font-size:11px;font-weight:750}.pill.pass{background:var(--softteal);color:#087663}.pill.warn{background:var(--softamber);color:#9b5b00}.pill.fail{background:var(--softred);color:#a42c36}.pill.neutral{background:#edf1f5;color:#56667b}.metrics{display:grid;grid-template-columns:repeat(5,minmax(100px,1fr));gap:9px;margin:13px 0}.metric{background:#f7f9fc;border:1px solid #e6ebf2;border-radius:9px;padding:10px}.metric label{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.04em}.metric b{font-size:17px}.why{padding:11px 13px;border-radius:9px;background:#f3f6fa;margin:10px 0;overflow-wrap:anywhere}.images{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:11px}.images figure{margin:0;padding:8px;border:1px solid var(--line);border-radius:9px;background:#fff}.images img{width:100%;height:auto;display:block}.images figcaption{font-size:11px;color:var(--muted);padding:5px}.links{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}.links a{color:#145e9d;text-decoration:none;border:1px solid #d5e3f0;border-radius:7px;background:#f6faff;padding:6px 9px;font-size:12px}.reviewbox{margin-top:14px;padding:13px;border:1px solid #efd397;background:#fff9eb;border-radius:10px}.reviewbox textarea{width:100%;min-height:65px;margin-top:8px}.reviewbox input{max-width:230px}.reviewbox .row{margin-top:9px}.hidden{display:none!important}.modal{position:fixed;inset:0;background:rgba(18,34,55,.45);display:grid;place-items:center;padding:18px;z-index:5}.modalbox{background:white;border-radius:14px;width:min(780px,100%);max-height:85vh;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 20px 70px #10253d44}.modalbody{padding:14px;overflow:auto}.browseritem{display:flex;align-items:center;gap:8px;padding:8px;border-bottom:1px solid #edf1f5}.browseritem span{flex:1;overflow-wrap:anywhere}.browseritem button{padding:6px 9px;font-size:12px}.footer{margin:18px 0 0;text-align:center;color:var(--muted);font-size:11px}.error{color:var(--red);white-space:pre-wrap}.spinner{width:15px;height:15px;border:2px solid #d3e5f6;border-top-color:#2474c6;border-radius:50%;animation:spin .7s linear infinite;display:inline-block;vertical-align:middle}@keyframes spin{to{transform:rotate(360deg)}}
-@media(max-width:900px){.top-actions{max-width:100%;width:100%;justify-content:space-between}.grid{grid-template-columns:1fr}.sidebar{position:static;height:auto;max-height:none;overflow:visible}.sidebar>.cardbody{display:block;flex:none}.samples{max-height:32vh;min-height:0;flex:none}.settings{grid-template-columns:repeat(2,minmax(110px,1fr))}.metrics{grid-template-columns:repeat(3,minmax(90px,1fr))}.rootbadge{max-width:55%}}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}button,input,select{font:inherit}button{border:0;border-radius:8px;padding:9px 13px;background:var(--navy);color:white;font-weight:650;cursor:pointer}button:hover{filter:brightness(1.08)}button:disabled{opacity:.5;cursor:wait}.secondary{background:#e7edf5;color:var(--ink)}.blue{background:var(--blue)}.green{background:var(--teal)}.red{background:var(--red)}.quiet{background:transparent;color:var(--blue);padding:5px 7px}.wrap{width:100%;max-width:none;margin:0;padding:22px clamp(14px,1.4vw,30px)}.top{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:16px}.brand{display:flex;gap:14px;align-items:center}.mark{display:grid;place-items:center;width:44px;height:44px;border-radius:13px;background:#dcecff;color:#15558c;font-size:23px}.brand h1{font-size:23px;line-height:1.15;margin:0}.brand p{margin:5px 0 0;color:var(--muted)}.top-actions{display:flex;align-items:center;justify-content:flex-end;gap:9px;min-width:0}.rootbadge{padding:8px 11px;border:1px solid var(--line);border-radius:9px;background:white;color:var(--muted);max-width:48%;overflow-wrap:anywhere}.shutdown{background:#fff0f0;color:#9d2630;border:1px solid #f1c8cb;white-space:nowrap}.shutdown:hover{background:#ffe4e5}.shutdown:disabled{opacity:.6}.shutdown-notice{display:none;margin:12px 0;padding:13px 16px;border:1px solid #e8c1c4;border-radius:10px;background:#fff1f1;color:#8f2630;font-weight:650}.shutdown-notice.show{display:block}.principle{border:1px solid #c8deef;background:linear-gradient(100deg,#edf7ff,#f3fbfa);border-radius:12px;padding:13px 16px;margin:14px 0 18px;display:flex;gap:12px;align-items:flex-start}.principle strong{color:#18486d}.principle p{margin:0;color:#41536a}.grid{display:grid;grid-template-columns:minmax(270px,340px) minmax(0,1fr);gap:17px;align-items:start}main{min-width:0}.sidebar{position:sticky;top:12px;height:calc(100vh - 24px);max-height:calc(100vh - 24px);display:flex;flex-direction:column;overflow:hidden}.sidebar>.cardbody{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;overflow:hidden}.sidebar-runbar{flex:0 0 auto;margin-top:10px;padding:10px 0 2px;border-top:1px solid var(--line);background:var(--card)}.samples{flex:1 1 auto;min-height:0;max-height:none;overflow-y:auto;overflow-x:hidden;margin-top:12px;border-top:1px solid var(--line)}.sidebar-runbar button{width:100%}.sidebar-runbar .statusline{display:block;margin-top:5px;min-height:17px}.card{background:var(--card);border:1px solid var(--line);border-radius:13px;box-shadow:var(--shadow);min-width:0}.cardhead{padding:14px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0}.cardhead h2,.cardhead h3{font-size:15px;margin:0}.cardhead>.small{min-width:0;max-width:48%;text-align:right;overflow-wrap:anywhere;word-break:break-word}.resulttitle{min-width:0;flex-wrap:wrap}.cardbody{padding:15px 16px;min-width:0}.mapline{display:flex;gap:8px}.mapline input{min-width:0;flex:1}.textinput,input[type=text],input[type=number],select,textarea{border:1px solid #cbd6e3;border-radius:8px;padding:9px 10px;color:var(--ink);background:white}input[type=number]{width:100%}.small{font-size:12px;color:var(--muted)}.sidebar>.cardbody{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;overflow-y:auto;overflow-x:hidden;}.sample{padding:10px 9px;display:flex;justify-content:space-between;gap:8px;border-bottom:1px solid #edf1f6;cursor:pointer}.sample:hover,.sample.active{background:#edf5ff}.sampleid{font-weight:700}.samplemeta{font-size:11px;color:var(--muted)}.count{border-radius:12px;background:#edf1f6;color:#4d6075;padding:2px 8px;font-size:11px;height:max-content}.section{margin-bottom:16px}.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.row.between{justify-content:space-between}.muted{color:var(--muted)}.help{font-size:12px;color:var(--muted);margin:5px 0 0}.settings{display:grid;grid-template-columns:repeat(4,minmax(110px,1fr));gap:11px}.setting label{display:block;font-size:12px;font-weight:650;color:#495b71;margin-bottom:5px}.setting .explain{font-size:10px;color:var(--muted);margin-top:3px}.readscroll{max-width:100%;overflow:auto}.reads{width:100%;min-width:800px;border-collapse:collapse;font-size:12px}.reads th,.reads td{text-align:left;padding:8px 7px;border-bottom:1px solid #e9eef4;vertical-align:middle}.reads th{font-size:11px;color:var(--muted);font-weight:650}.reads input{width:100%;min-width:100px;padding:7px}.reads select{padding:7px}.runbar{display:flex;align-items:center;gap:12px;margin-top:14px;flex-wrap:wrap}.statusline{min-height:22px;color:var(--muted)}.batchbox{margin-top:12px;padding:10px;border:1px solid #dce7f2;border-radius:9px;background:#f8fbff}.batchbox .statusline{overflow-wrap:anywhere}.results{margin-top:18px}.resulttitle{display:flex;align-items:center;justify-content:space-between;gap:10px}.pill{padding:5px 9px;border-radius:20px;font-size:11px;font-weight:750}.pill.pass{background:var(--softteal);color:#087663}.pill.warn{background:var(--softamber);color:#9b5b00}.pill.fail{background:var(--softred);color:#a42c36}.pill.neutral{background:#edf1f5;color:#56667b}.metrics{display:grid;grid-template-columns:repeat(5,minmax(100px,1fr));gap:9px;margin:13px 0}.metric{background:#f7f9fc;border:1px solid #e6ebf2;border-radius:9px;padding:10px}.metric label{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.04em}.metric b{font-size:17px}.why{padding:11px 13px;border-radius:9px;background:#f3f6fa;margin:10px 0;overflow-wrap:anywhere}.images{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:11px}.images figure{margin:0;padding:8px;border:1px solid var(--line);border-radius:9px;background:#fff}.images img{width:100%;height:auto;display:block}.images figcaption{font-size:11px;color:var(--muted);padding:5px}.links{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}.links a{color:#145e9d;text-decoration:none;border:1px solid #d5e3f0;border-radius:7px;background:#f6faff;padding:6px 9px;font-size:12px}.reviewbox{margin-top:14px;padding:13px;border:1px solid #efd397;background:#fff9eb;border-radius:10px}.reviewbox textarea{width:100%;min-height:65px;margin-top:8px}.reviewbox input{max-width:230px}.reviewbox .row{margin-top:9px}.hidden{display:none!important}.modal{position:fixed;inset:0;background:rgba(18,34,55,.45);display:grid;place-items:center;padding:18px;z-index:5}.modalbox{background:white;border-radius:14px;width:min(780px,100%);max-height:85vh;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 20px 70px #10253d44}.modalbody{padding:14px;overflow:auto}.browseritem{display:flex;align-items:center;gap:8px;padding:8px;border-bottom:1px solid #edf1f5}.browseritem span{flex:1;overflow-wrap:anywhere}.browseritem button{padding:6px 9px;font-size:12px}.footer{margin:18px 0 0;text-align:center;color:var(--muted);font-size:11px}.error{color:var(--red);white-space:pre-wrap}.spinner{width:15px;height:15px;border:2px solid #d3e5f6;border-top-color:#2474c6;border-radius:50%;animation:spin .7s linear infinite;display:inline-block;vertical-align:middle}@keyframes spin{to{transform:rotate(360deg)}}
+@media(max-width:900px){.top-actions{max-width:100%;width:100%;justify-content:space-between}.grid{grid-template-columns:1fr}.sidebar{position:static;height:auto;max-height:none;overflow:visible}.sidebar>.cardbody{display:block;flex:none}.samples{max-height:45vh;min-height:160px;flex:0 1 auto}.settings{grid-template-columns:repeat(2,minmax(110px,1fr))}.metrics{grid-template-columns:repeat(3,minmax(90px,1fr))}.rootbadge{max-width:55%}}
 @media(max-width:560px){.wrap{padding:12px}.top{align-items:flex-start;flex-direction:column}.top-actions{align-items:stretch;flex-direction:column}.rootbadge{max-width:100%}.rootbadge{max-width:100%}.settings{grid-template-columns:repeat(2,minmax(90px,1fr))}.metrics{grid-template-columns:repeat(2,minmax(90px,1fr))}.images{grid-template-columns:1fr}.reads{min-width:680px}.readscroll{overflow:auto}}
-.reads td:first-child{max-width:340px;overflow-wrap:anywhere}.reads td .small{overflow-wrap:anywhere;word-break:break-word}.reviewtablewrap{max-height:68vh;overflow:auto;position:relative;overscroll-behavior:contain;border:1px solid var(--line);border-radius:9px}.reviewtable{min-width:1660px;border-collapse:separate;border-spacing:0}.reviewtable thead th{position:sticky;top:0;z-index:4;background:#f7f9fc;box-shadow:0 1px 0 var(--line)}.reviewtable td{vertical-align:top}.reviewtable td:nth-child(1){min-width:115px;font-weight:700}.reviewtable td:nth-child(4){min-width:210px;white-space:normal;overflow-wrap:anywhere}.reviewtable td:nth-child(5){min-width:300px;white-space:normal;overflow-wrap:anywhere}.reviewtable td:nth-child(6){min-width:220px;white-space:normal;overflow-wrap:anywhere}.reviewReadEvidence{margin-top:5px;color:var(--muted);font-size:11px;line-height:1.35;overflow-wrap:anywhere}.reviewtable select{min-width:170px}.reviewtable input{min-width:180px}.review-override-hint{margin-top:4px;color:#8b5708;font-weight:650}.reviewtable tr.qcfail{background:#fffafa}.reviewtable tr.warning{background:#fffdf8}.qualityreads{min-width:1180px}.qualityreads thead tr:first-child th{text-align:center;background:#f7f9fc}.qualityreads thead tr:nth-child(2) th{border-top:0}
+.reads td:first-child{max-width:340px;overflow-wrap:anywhere}.reads td .small{overflow-wrap:anywhere;word-break:break-word}.reviewtablewrap{max-height:68vh;overflow:auto;position:relative;overscroll-behavior:contain;border:1px solid var(--line);border-radius:9px}.reviewtable{min-width:1660px;border-collapse:separate;border-spacing:0}.reviewtable thead th{position:sticky;top:0;z-index:4;background:#f7f9fc;box-shadow:0 1px 0 var(--line)}.reviewtable td{vertical-align:top}.reviewtable td:nth-child(1){min-width:115px;font-weight:700}.reviewtable td:nth-child(4){min-width:210px;white-space:normal;overflow-wrap:anywhere}.reviewtable td:nth-child(5){min-width:300px;white-space:normal;overflow-wrap:anywhere}.reviewtable td:nth-child(6){min-width:220px;white-space:normal;overflow-wrap:anywhere}.reviewReadEvidence{margin-top:5px;color:var(--muted);font-size:11px;line-height:1.35;overflow-wrap:anywhere}.reviewtable select{min-width:170px}.reviewtable input{min-width:180px}.review-override-hint{margin-top:4px;color:#8b5708;font-weight:650}.retained-selection{border:1px solid #9bd6c6;background:#eefaf6;color:#155f50;border-radius:7px;padding:7px 8px;font-size:12px;line-height:1.35}.retained-selection strong{display:block;font-size:10px;letter-spacing:.04em;margin-bottom:3px}.fallback-inactive{margin-top:5px;opacity:.8}.reviewtable tr.qcfail{background:#fffafa}.reviewtable tr.warning{background:#fffdf8}.qualityreads{min-width:1180px}.qualityreads thead tr:first-child th{text-align:center;background:#f7f9fc}.qualityreads thead tr:nth-child(2) th{border-top:0}
 .taxonomy-settings{margin-top:15px;padding:12px;border:1px solid #d9e4ef;border-radius:9px;background:#f8fbff}.taxonomy-settings h3{font-size:13px;margin:0 0 7px}.taxonomy-path{display:flex;gap:8px;align-items:center;margin-top:7px}.taxonomy-path input{min-width:0;flex:1;width:100%;font-size:12px}.taxonomy-status{margin-top:6px;overflow-wrap:anywhere}.taxonomy-results{margin-top:15px;padding:13px;border:1px solid var(--line);border-radius:10px;background:#fbfcfe}.taxonomy-results h3{margin:0 0 8px;font-size:14px}.taxonomy-results h4{font-size:12px;margin:13px 0 6px}.taxonomy-summary{min-width:1050px}.taxonomy-hits{min-width:1250px}.taxonomy-results .readscroll{margin-top:6px}.taxon-nearbest{display:inline-block;padding:2px 6px;border-radius:12px;background:#e6f5ef;color:#087663;font-size:10px;font-weight:750}.taxon-qualified{display:inline-block;padding:2px 6px;border-radius:12px;background:#eaf2ff;color:#245f9a;font-size:10px;font-weight:750}.taxon-muted{color:var(--muted);font-size:11px}
 
 /* Assembly-centred review redesign */
@@ -148,7 +148,7 @@
             </div>
             <div class="help">Every recorded decision needs a reviewer name or initials. APPROVE, APPROVE_FAIL_QC and APPROVE_UNVERIFIED also require a short rationale in Reviewer notes. Blank decisions are saved as drafts.</div>
             <div id="cohortReviewCounts" class="batchbox small"></div>
-            <div class="readscroll reviewtablewrap"><table class="reads reviewtable"><thead><tr><th>Sequence</th><th>Partner / dataset</th><th>QC / review type</th><th>QC reasons</th><th>Output sequence / review candidate</th><th>Fallback read selection</th><th>Taxonomy evidence</th><th>Decision</th><th>Reviewer notes</th></tr></thead><tbody id="cohortReviewRows"></tbody></table></div>
+            <div class="readscroll reviewtablewrap"><table class="reads reviewtable"><thead><tr><th>Sequence</th><th>Partner / dataset</th><th>QC / review type</th><th>QC reasons</th><th>Output sequence / review candidate</th><th>Individual-read fallback (only)</th><th>Taxonomy evidence</th><th>Decision</th><th>Reviewer notes</th></tr></thead><tbody id="cohortReviewRows"></tbody></table></div>
             <div id="cohortReviewSaveStatus" class="statusline small" style="margin-top:10px"></div>
           </div>
         </div>
@@ -302,7 +302,52 @@ async function shutdownStudio(){
   button.textContent='Studio stopped';
  }catch(e){button.disabled=false;button.textContent='Shut down Studio';setStatus($('#mapStatus'),e.message,true)}
 }
-async function attachReview(){setStatus($('#cohortReviewStatus'),'Choose a cohort marker review template…');try{let d=await api('/api/pick-marker-review',{});if(d.cancelled)return;renderCohortReview(d);$('#cohortReviewStatus').textContent=`Attached ${d.source} · ${d.total} marker(s).`; }catch(e){setStatus($('#cohortReviewStatus'),e.message,true)}}
+function reconcileReviewReads(){
+ if(!cohortReview||!(studioState?.samples||[]).length)return;
+ const rows=cohortReview.rows||[], keys=['partner_own_ids','partner_alias','partner_aliases','partner_id','partner_ids','partner_identifier','partner_identifiers'];
+ const canonical=new Map(), aliases=new Map();
+ rows.forEach(row=>{
+  const sid=String(row.sequence_id||'').trim();if(!sid)return;
+  canonical.set(sid,sid);
+  keys.forEach(key=>{
+   const value=String(row[key]||'').trim();if(!value)return;
+   value.split(/[;,|]/).map(x=>x.trim()).filter(Boolean).forEach(alias=>{
+    if(!aliases.has(alias))aliases.set(alias,new Set());aliases.get(alias).add(sid);
+   });
+  });
+ });
+ const exact=[],aliasMatches=[],ambiguous=[],unmatched=[];
+ (studioState.samples||[]).forEach(sample=>{
+  const id=String(sample.sequence_id||'').trim();
+  if(canonical.has(id)){exact.push(id);return;}
+  const hits=aliases.get(id);
+  if(hits&&hits.size===1)aliasMatches.push({readId:id,sequenceId:[...hits][0]});
+  else if(hits&&hits.size>1)ambiguous.push({readId:id,sequenceIds:[...hits].sort()});
+  else unmatched.push(id);
+ });
+ const summary=`Read–review ID reconciliation: ${exact.length} exact · ${aliasMatches.length} alias match(es) · ${ambiguous.length} ambiguous alias(es) · ${unmatched.length} unmatched.`;
+ const details=[summary,'AB1 inferred ID and AB1 filename(s) are reported separately; Unmatched or ambiguous IDs are not silently renamed.'];
+ if(exact.length)details.push(`Exact canonical ID: ${exact.join(', ')}`);
+ if(aliasMatches.length)details.push(`Partner alias match: ${aliasMatches.map(x=>`${x.readId} → ${x.sequenceId}`).join(', ')}`);
+ if(ambiguous.length)details.push(`Ambiguous alias: ${ambiguous.map(x=>`${x.readId} → ${x.sequenceIds.join('/')}`).join(', ')}`);
+ if(unmatched.length)details.push(`Unmatched: ${unmatched.join(', ')}`);
+ const status=$('#cohortReviewStatus');if(status)status.textContent=details.join(' | ');
+ return {exact,aliasMatches,ambiguous,unmatched};
+}
+async function attachReview(){
+ setStatus($('#cohortReviewStatus'),'Choose a cohort marker review template…');
+ try{
+  let d=await api('/api/pick-marker-review',{});if(d.cancelled)return;
+  renderCohortReview(d);
+  if(d.auto_loaded_from_manifest&&d.samples){await applyLoadedMap(d);}
+  else if(!(studioState?.samples||[]).length){
+   $('#cohortReviewStatus').textContent=`Attached ${d.source} · ${d.total} marker(s). Choose AB1/ABI chromatograms to reconcile review IDs.`;
+   await chooseReads();
+  }
+  if((studioState?.samples||[]).length)reconcileReviewReads();
+  else $('#cohortReviewStatus').textContent=`Attached ${d.source} · ${d.total} marker(s). ${d.auto_load_status||'No chromatograms loaded; review remains available.'}`;
+ }catch(e){setStatus($('#cohortReviewStatus'),e.message,true)}
+}
 function renderCohortReview(data){cohortReview=data;$('#cohortReviewControls').classList.remove('hidden');$('#cohortReviewPill').className='pill neutral';$('#cohortReviewPill').textContent=`${data.decided}/${data.total} decided`;$('#cohortReviewStatus').textContent=`Source: ${data.source}`;$('#cohortReviewer').value=$('#cohortReviewer').value||((data.rows.find(r=>r.reviewer)?.reviewer)||'');renderCohortReviewRows();}
 function renderReviewSequenceEvidence(r){
  const rawLength=String(r.output_length??'').trim();
@@ -324,11 +369,24 @@ function renderReviewSequenceEvidence(r){
  }else if(candidateLength>0&&candidateSource==='FAILED_FINAL_CONSENSUS'){
   candidateLine=`<div><b>Review candidate:</b> failed final consensus (${esc(candidateLength)} bp · N: ${candidateN?`${esc(candidateN)}%`:'not recorded'})</div>`;
  }
+ const selectedCandidateId=String(r.selected_candidate_id||'').trim();
+ const selectedCandidateType=String(r.selected_candidate_type||'').trim();
+ const selectedCandidateLength=String(r.selected_candidate_length||'').trim();
+ const retainedLine=selectedCandidateId?`<div class="reviewReadEvidence"><b>Selected retained candidate:</b> ${esc(selectedCandidateType||'CANDIDATE')} · ${esc(selectedCandidateId)}${selectedCandidateLength?` · ${esc(selectedCandidateLength)} bp`:''}</div>`:'';
  const readEvidence=String(r.read_level_evidence??'').trim();
  const readLine=readEvidence?`<div class="reviewReadEvidence"><b>Read-level QC:</b> ${esc(readEvidence)}</div>`:'';
- return finalLine+candidateLine+readLine;
+ // Once a consensus/read candidate is explicitly selected, hide the old
+ // fallback/output candidate line so the review table cannot display stale state.
+ return (selectedCandidateId?retainedLine:finalLine+candidateLine)+readLine;
 }
 function renderFallbackReadChoice(r){
+ const retained=String(r.selected_candidate_id||'').trim();
+ if(retained){
+  const kind=String(r.selected_candidate_type||'CANDIDATE').replace(/_/g,' ');
+  const bp=String(r.selected_candidate_length||'').trim();
+  const fallback=String(r.recommended_read_id||'').trim();
+  return `<div class="retained-selection"><strong>RETAINED SEQUENCE</strong><div>${esc(kind)} · ${esc(retained)}</div>${bp?`<div>${esc(bp)} bp</div>`:''}</div><div class="small fallback-inactive">Fallback recommendation (inactive): ${esc(fallback||'none')}</div>`;
+ }
  const candidates=Array.isArray(r.fallback_read_options_list)?r.fallback_read_options_list:[];
  if(candidates.length<2)return '<span class="taxon-muted">Not required</span>';
  const recommended=String(r.recommended_read_id||candidates[0].read_id||'');
@@ -365,13 +423,21 @@ async function saveCohortReview(){
   sequence_id:tr.dataset.seq,
   decision:tr.querySelector('.cohortDecision').value,
   notes:tr.querySelector('.cohortNotes').value,
-  selected_read_id:tr.querySelector('.fallbackReadChoice')?.value||''
+  selected_read_id:cohortReview.rows.find(r=>r.sequence_id===tr.dataset.seq)?.selected_candidate_id?'':(tr.querySelector('.fallbackReadChoice')?.value||''),
+  selected_candidate_id:cohortReview.rows.find(r=>r.sequence_id===tr.dataset.seq)?.selected_candidate_id||'',
+  selected_candidate_type:cohortReview.rows.find(r=>r.sequence_id===tr.dataset.seq)?.selected_candidate_type||'',
+  selected_candidate_length:cohortReview.rows.find(r=>r.sequence_id===tr.dataset.seq)?.selected_candidate_length||'',
+  selected_candidate_source:cohortReview.rows.find(r=>r.sequence_id===tr.dataset.seq)?.selected_candidate_source||''
  }));
  /* Include filtered-out rows unchanged so selections and decisions are preserved. */
  let visible=new Map(rows.map(r=>[r.sequence_id,r]));
  let all=cohortReview.rows.map(r=>visible.get(r.sequence_id)||({
   sequence_id:r.sequence_id,decision:r.decision||'',notes:r.notes||'',
-  selected_read_id:r.selected_read_id||''
+  selected_read_id:r.selected_read_id||'',
+  selected_candidate_id:r.selected_candidate_id||'',
+  selected_candidate_type:r.selected_candidate_type||'',
+  selected_candidate_length:r.selected_candidate_length||'',
+  selected_candidate_source:r.selected_candidate_source||''
  }));
  const reviewer=$('#cohortReviewer').value.trim();
  const metadata=new Map(cohortReview.rows.map(r=>[r.sequence_id,r]));
@@ -389,13 +455,14 @@ async function saveCohortReview(){
   if(decision&&!(meta.allowed_decisions_list||[]).includes(decision)){
    problems.push(`${row.sequence_id}: ${decision} is not an allowed decision for this QC class.`);
   }
+  const retainedCandidate=String(row.selected_candidate_id||meta.selected_candidate_id||'').trim();
   const selected=String(row.selected_read_id||'').trim();
   const options=meta.fallback_read_options_list||[];
   const optionIds=options.map(x=>String(x.read_id||'').trim());
-  if(selected&& !optionIds.includes(selected)){
+  if(!retainedCandidate&&selected&& !optionIds.includes(selected)){
    problems.push(`${row.sequence_id}: selected fallback read is not in the QC-passing options.`);
   }
-  if(selected&&selected!==String(meta.recommended_read_id||'').trim()&&!rowReviewer){
+  if(!retainedCandidate&&selected&&selected!==String(meta.recommended_read_id||'').trim()&&!rowReviewer){
    problems.push(`${row.sequence_id}: a manual fallback-read choice needs reviewer identity.`);
   }
  }
@@ -715,6 +782,10 @@ function renderResult(r){
     // Any change to the primer set invalidates the previous final choice.
     // The newly compatible candidate is only a preview until explicitly selected.
     selectedCandidate=null;
+    if(cohortReview){
+      const reviewRow=cohortReview.rows.find(row=>row.sequence_id===r.sequence_id);
+      if(reviewRow){reviewRow.selected_candidate_id='';reviewRow.selected_candidate_type='';reviewRow.selected_candidate_length='';reviewRow.selected_candidate_source='';renderCohortReviewRows();}
+    }
     selectedDownload.disabled=true;
     $('#assignCandidateTaxonomy').disabled=true;
     $('#candidateTaxonomyResult').innerHTML='';
@@ -791,6 +862,18 @@ function renderResult(r){
      try{
        selectedCandidate=candidate;
        activateCandidateAlignment(candidate);
+       if(cohortReview){
+         const reviewRow=cohortReview.rows.find(row=>row.sequence_id===r.sequence_id);
+         if(reviewRow){
+           reviewRow.selected_candidate_id=String(candidate.CandidateID||'');
+           const componentReads=String(candidate.ReadIDs||'').split(';').map(x=>x.trim()).filter(Boolean);
+           reviewRow.selected_candidate_type=componentReads.length<=1?'INDIVIDUAL_READ':'ASSEMBLY';
+           reviewRow.selected_candidate_length=String(candidate.len||candidate.OutputLength||candidate.SequenceLength||candidate.Sequence?.length||'');
+           reviewRow.selected_candidate_source='MANUAL';
+           reviewRow.reviewer=$('#cohortReviewer').value.trim()||reviewRow.reviewer||'';
+           renderCohortReviewRows();
+         }
+       }
        candidateGrid.querySelectorAll('.candidate-card').forEach(card=>card.classList.remove('chosen'));
        btn.closest('.candidate-card')?.classList.add('chosen');
        selectedStatus.textContent=`Selected ${candidate.CandidateID} · ${candidate.len.toLocaleString()} bp · ${candidate.QCClass}`;

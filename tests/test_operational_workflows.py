@@ -276,6 +276,27 @@ class OperationalWorkflowTests(unittest.TestCase):
                 ['severity\tline\tsequence_id\tcode\tdetail'],
             )
 
+    def test_onboarding_resolves_partner_alias_to_canonical_project_id(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            read = root / 'ss172_907R.ab1'
+            read.write_bytes(b'ABIF-placeholder')
+            mapping = root / 'mapping.tsv'
+            mapping.write_text('sequence_id\t907R\nss172\tss172_907R.ab1\n')
+            metadata = root / 'catalogue.tsv'
+            metadata.write_text(
+                'sequence_id\tpartner_id\talready_sequenced\tpartner_own_ids\n'
+                'AU_0001\tAU\tno\tss172\n'
+            )
+            result = validate_submission(
+                mapping, partner_metadata=metadata, read_dir=root,
+                expected_partner_id='AU', dataset='AU_01',
+            )
+            self.assertEqual(result['status'], 'PASS')
+            self.assertEqual(result['normalised'][0]['sequence_id'], 'AU_0001')
+            self.assertEqual(result['normalised_reads'][0]['sequence_id'], 'AU_0001')
+            self.assertEqual(result['normalised'][0]['partner_id'], 'AU')
+
     def test_onboarding_groups_row_per_read_map_and_resolves_trace_prefixes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

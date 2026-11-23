@@ -70,6 +70,38 @@ def test_manifest_requires_only_modality_fields_and_resolves_relative_paths(tmp_
         cli._read_assistant_cohort_manifest(bad)
 
 
+def test_cli_cohort_prepare_only_does_not_require_dataset_or_reference(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(cli_core, 'cmd_assistant', lambda args: seen.update(vars(args)))
+
+    cli_core.main([
+        'assistant',
+        '--partner-metadata', str(tmp_path / 'partner_metadata.tsv'),
+        '--db', str(tmp_path / 'project.sqlite'),
+        '--cohort-manifest', str(tmp_path / 'cohort.tsv'),
+        '--cohort-prepare-only',
+        '--out', str(tmp_path / 'out'),
+    ])
+
+    assert seen['dataset'] is None
+    assert seen['ref'] is None
+    assert seen['cohort_prepare_only'] is True
+
+
+def test_cli_regular_assistant_still_requires_reference(tmp_path):
+    with pytest.raises(SystemExit) as exc_info:
+        cli_core.main([
+            'assistant',
+            '--partner-metadata', str(tmp_path / 'partner_metadata.tsv'),
+            '--db', str(tmp_path / 'project.sqlite'),
+            '--fasta', str(tmp_path / 'markers.fasta'),
+            '--dataset', 'PartnerA',
+            '--out', str(tmp_path / 'out'),
+        ])
+
+    assert exc_info.value.code == 2
+
+
 def test_cohort_prepare_does_not_touch_live_db_or_run_panel(tmp_path, monkeypatch):
     _cohort(tmp_path)
     before = _digest(tmp_path / 'live.sqlite')

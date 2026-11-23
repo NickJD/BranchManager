@@ -139,35 +139,89 @@ def load_partner_workbook_rows(
     *,
     sheet_name: str = 'Bulk Upload Template',
 ) -> list[dict]:
-    """Read the Rumen Gateway partner workbook into source-labeled isolate rows.
+    """Read partner workbook or survey-export CSV into source-labeled isolate rows.
 
-    This deliberately reads values only and never executes workbook macros. The
-    source's ``taxon_id`` field is retained as a raw MALDI result because partner
-    workbooks may contain a taxon name or a partner culture ID in that column.
+
+    This deliberately reads values only and never executes workbook macros. CSV
+    exports from survey tools can use human-readable headers (for example,
+    ``Sequential identifier:`` and ``Partner ID:``); those are normalised to the
+    workbook template fields before the shared metadata mapping is applied.
     """
-    try:
-        from openpyxl import load_workbook
-    except Exception as exc:
-        raise RuntimeError('Reading .xlsm partner workbooks requires openpyxl') from exc
+    source_path = Path(path)
+    if source_path.suffix.lower() in {'.csv', '.tsv', '.txt'}:
+        raw_rows = _rows_from_delimited(source_path)
+        if not raw_rows:
+            return []
+        # Survey export headers differ from the machine-readable workbook
+        # template. Match exact normalised labels and map the known export form.
+        aliases = {
+            'record_id': {'sequentialidentifier', 'recordid'},
+            'partner_id': {'partnerid'},
+            'partner_culture_id': {'partnerculturecollectionisolateid', 'partnercultureid'},
+            'project': {'projectorstudyassociated'},
+            'microorganism': {'microorganismtype'},
+            'taxonomic_classification___1': {'taxonomicclassificationmethodchoiceamplicon'},
+            'taxonomic_classification___2': {'taxonomicclassificationmethodchoicemalditof'},
+            'isolate_sci_name': {'ncbi scientific name of the isolate from amplicon taxonomic identification'},
+            'isolate_ncbi_tax_id': {'ncbi taxon id of the isolate from amplicon taxonomic identification'},
+            'perc_identity_ncbi': {'percentage identity of the amplicon assignment ncbi'},
+            'gtdb_sci_name': {'gtdb scientific name of the isolate from amplicon taxonomic identification'},
+            'perc_identity_gtdb': {'percentage identity of the amplicon assignment gtdb'},
+            'gg2_sci_name': {'gg2 scientific name of the isolate from amplicon taxonomic identification'},
+            'perc_identity_gg2': {'percentage identity of the amplicon assignment gg2'},
+            'silva_sci_name': {'silva scientific name of the isolate from amplicon taxonomic identification'},
+            'perc_identity_silva': {'percentage identity of the amplicon assignment silva'},
+            'taxon_id': {'taxon name id returned by maldi tof ms'},
+            'maldi_platform': {'name model of maldi tof ms machine'},
+            'maldi_db_version': {'name and version of database used'},
+            'ruminant_name': {'common name of the ruminant'},
+            'ruminant_tax_id': {'ruminant from which the sample used for isolation was obtained ncbi taxon identifier'},
+            'ruminant_sex': {'sex of the ruminant source of the sample used to isolate'},
+            'ruminant_age': {'age of the ruminant source of the sample used to isolate in weeks'},
+            'ruminant_breed': {'breed of the ruminant source of the sample used to isolate'},
+            'production_type': {'purpose of animal production'},
+            'sample_location': {'specific anatomical region or microhabitat sampled within the ruminant body habitat'},
+            'sample_desc': {
+                'brief description of the sample used to isolate and potentially the process applied to the sample'
+            },
+            'ruminant_diet': {'diet of the ruminant at the moment of sample collection'},
+            'diet_details': {'any additional details on diet contribution form different sources'},
+            'isolation_date': {'month and year at which isolation was performed'},
+            'isolation_temperature': {'temperature at which isolation occurred in celsius'},
+            'oxygen_requirement': {'what is the oxygen requirement of the isolate'},
+            'pure_culture': {'is it a pure culture or a co culture'},
+            'gram_stain': {'result of gram stain'},
+            'deposite_culture_collect': {'has the isolate been deposited to a culture collection'},
+            'which_culture': {'which culture collection'},
+            'deposited_id': {'what is the id of the deposited isolate'},
+        }
+        def header_key(value):
+            return re.sub(r'[^a-z0-9]+', '', str(value or '').casefold())
+        header_map = {}
+        for original in raw_rows[0]:
+            key = header_key(original)
+            for output, keys in aliases.items():
+                if key in {header_key(alias) for alias in keys}:
+                    header_map[original] = output
+                    break
+        normalized_rows = []
+        for raw in raw_rows:
+            row = dict(raw)
+            for original, output in header_map.items():
+                row[output] = raw.get(original, '')
+            normalized_rows.append(row)
+        raw_rows = normalized_rows
+        # CSV headers do not have worksheet names; sheet_name is intentionally ignored.
+        source_rows = raw_rows
+    else:
+        try:
+            from openpyxl import load_workbook
+        except Exception as exc:
+            raise RuntimeError('Reading .xlsm partner workbooks requires openpyxl') from exc
 
-    # This importer only reads cached cell values; it never writes the workbook
-    # or executes macros. openpyxl warns when it encounters Excel's extended
-    # data-validation metadata, which is irrelevant to reading these values.
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            'ignore',
-            message='Data Validation extension is not supported and will be removed',
-            category=UserWarning,
-            module=r'openpyxl\.worksheet\.',
-        )
-        workbook = load_workbook(path, read_only=True, data_only=True, keep_vba=False)
-    try:
-        if sheet_name not in workbook.sheetnames:
-            raise ValueError(
-                f"Partner workbook does not contain sheet {sheet_name!r}; "
-                f"available sheets: {', '.join(workbook.sheetnames)}"
-            )
-        sheet = workbook[sheet_name]
+        # This importer only reads cached cell values; it never writes the workbook
+        # or executes macros. openpyxl warns when it encounters Excel's extended
+        # data-validation metadata, which is irrelevant to reading these values.
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 'ignore',
@@ -175,113 +229,153 @@ def load_partner_workbook_rows(
                 category=UserWarning,
                 module=r'openpyxl\.worksheet\.',
             )
-            rows_iter = iter(list(sheet.iter_rows(values_only=True)))
-        header_row = next(rows_iter, None)
-        if not header_row:
-            return []
-        headers = [str(value or '').strip().lower() for value in header_row]
-        if 'record_id' not in headers:
-            raise ValueError(f"Sheet {sheet_name!r} must have a record_id field in row 1")
-        indices = {name: index for index, name in enumerate(headers) if name}
-
-        def get(values, field):
-            index = indices.get(field)
-            return values[index] if index is not None and index < len(values) else None
-
-        def clean(value):
-            return str(value).strip() if value is not None else ''
-
-        def enum_label(value):
-            text = clean(value)
-            return re.sub(r'^\s*\d+\s*,\s*', '', text).strip()
-
-        result = []
-        seen_ids = {}
-        for row_number, values in enumerate(rows_iter, start=2):
-            source_id = clean(get(values, 'record_id'))
-            # The template has instructional rows between its internal header
-            # and its first isolate. Rumen Gateway IDs use the stable PREFIX_NNNN form.
-            if not re.fullmatch(r'[A-Za-z][A-Za-z0-9._-]*_\d+', source_id):
-                continue
-            if source_id in seen_ids:
+            workbook = load_workbook(source_path, read_only=True, data_only=True, keep_vba=False)
+        try:
+            if sheet_name not in workbook.sheetnames:
                 raise ValueError(
-                    f'Partner workbook contains duplicate record_id {source_id!r} '
-                    f'on rows {seen_ids[source_id]} and {row_number}'
+                    f"Partner workbook does not contain sheet {sheet_name!r}; "
+                    f"available sheets: {', '.join(workbook.sheetnames)}"
                 )
-            seen_ids[source_id] = row_number
-            partner_raw = clean(get(values, 'partner_id'))
-            acronym_match = re.search(r'\(([A-Za-z0-9_-]+)\)\s*$', partner_raw)
-            partner_id = acronym_match.group(1) if acronym_match else source_id.split('_', 1)[0]
-            amplicon_method = enum_label(get(values, 'taxonomic_classification___1')).lower() == 'selected'
-            maldi_method = enum_label(get(values, 'taxonomic_classification___2')).lower() == 'selected'
-            maldi_result = clean(get(values, 'taxon_id'))
+            sheet = workbook[sheet_name]
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    'ignore',
+                    message='Data Validation extension is not supported and will be removed',
+                    category=UserWarning,
+                    module=r'openpyxl\.worksheet\.',
+                )
+                rows_iter = iter(list(sheet.iter_rows(values_only=True)))
+            header_row = next(rows_iter, None)
+            if not header_row:
+                return []
+            headers = [str(value or '').strip().lower() for value in header_row]
+            if 'record_id' not in headers:
+                raise ValueError(f"Sheet {sheet_name!r} must have a record_id field in row 1")
+            indices = {name: index for index, name in enumerate(headers) if name}
+            source_rows = []
+            for values in rows_iter:
+                source_rows.append({
+                    name: values[index] if index < len(values) else None
+                    for name, index in indices.items()
+                })
+        finally:
+            workbook.close()
 
-            metadata_map = {
-                'partner_culture_id': 'partner_culture_id',
-                'project': 'project',
-                'microorganism_type': 'microorganism',
-                'amplicon_method_reported': 'taxonomic_classification___1',
-                'maldi_method_reported': 'taxonomic_classification___2',
-                'amplicon_ncbi_name_reported': 'isolate_sci_name',
-                'amplicon_ncbi_taxid_reported': 'isolate_ncbi_tax_id',
-                'amplicon_ncbi_identity_reported': 'perc_identity_ncbi',
-                'amplicon_gtdb_name_reported': 'gtdb_sci_name',
-                'amplicon_gtdb_identity_reported': 'perc_identity_gtdb',
-                'amplicon_gg2_name_reported': 'gg2_sci_name',
-                'amplicon_gg2_identity_reported': 'perc_identity_gg2',
-                'amplicon_silva_name_reported': 'silva_sci_name',
-                'amplicon_silva_identity_reported': 'perc_identity_silva',
-                'maldi_taxon_raw': 'taxon_id',
-                'maldi_instrument': 'maldi_platform',
-                'maldi_library': 'maldi_db_version',
-                'host_species': 'ruminant_name',
-                'host_taxid': 'ruminant_tax_id',
-                'host_sex': 'ruminant_sex',
-                'host_age_weeks': 'ruminant_age',
-                'host_breed': 'ruminant_breed',
-                'production_type': 'production_type',
-                'sample_location': 'sample_location',
-                'sample_description': 'sample_desc',
-                'ruminant_diet': 'ruminant_diet',
-                'diet_details': 'diet_details',
-                'isolation_date': 'isolation_date',
-                'isolation_temperature': 'isolation_temperature',
-                'oxygen_requirement': 'oxygen_requirement',
-                'culture_purity': 'pure_culture',
-                'gram_stain': 'gram_stain',
-                'culture_collection': 'deposite_culture_collect',
-                'culture_collection_name': 'which_culture',
-                'deposited_id': 'deposited_id',
-            }
-            metadata = {}
-            for output_key, source_key in metadata_map.items():
-                value = get(values, source_key)
-                if value is None or not clean(value):
+    def get(values, field):
+        return values.get(field)
+
+    def clean(value):
+        return str(value).strip() if value is not None else ''
+
+    def enum_label(value):
+        text = clean(value)
+        # Survey CSV exports use Checked/Unchecked, while the XLSM template
+        # stores numbered enum labels such as "1, Selected".
+        return re.sub(r'^\s*\d+\s*,\s*', '', text).strip()
+
+    result = []
+    seen_ids = {}
+    for row_number, values in enumerate(source_rows, start=2):
+        source_id = clean(get(values, 'record_id'))
+        if not re.fullmatch(r'[A-Za-z][A-Za-z0-9._-]*_\d+', source_id):
+            continue
+        if source_id in seen_ids:
+            raise ValueError(
+                f'Partner workbook contains duplicate record_id {source_id!r} '
+                f'on rows {seen_ids[source_id]} and {row_number}'
+            )
+        seen_ids[source_id] = row_number
+        partner_raw = clean(get(values, 'partner_id'))
+        acronym_match = re.search(r'\(([A-Za-z0-9_-]+)\)\s*$', partner_raw)
+        partner_id = acronym_match.group(1) if acronym_match else source_id.split('_', 1)[0]
+        amplicon_value = enum_label(get(values, 'taxonomic_classification___1')).lower()
+        maldi_value = enum_label(get(values, 'taxonomic_classification___2')).lower()
+        amplicon_method = amplicon_value in {'selected', 'checked', 'yes', 'true', '1'}
+        maldi_method = maldi_value in {'selected', 'checked', 'yes', 'true', '1'}
+        maldi_result = clean(get(values, 'taxon_id'))
+
+        metadata_map = {
+            'partner_culture_id': 'partner_culture_id',
+            'project': 'project',
+            'microorganism_type': 'microorganism',
+            'amplicon_method_reported': 'taxonomic_classification___1',
+            'maldi_method_reported': 'taxonomic_classification___2',
+            'amplicon_ncbi_name_reported': 'isolate_sci_name',
+            'amplicon_ncbi_taxid_reported': 'isolate_ncbi_tax_id',
+            'amplicon_ncbi_identity_reported': 'perc_identity_ncbi',
+            'amplicon_gtdb_name_reported': 'gtdb_sci_name',
+            'amplicon_gtdb_identity_reported': 'perc_identity_gtdb',
+            'amplicon_gg2_name_reported': 'gg2_sci_name',
+            'amplicon_gg2_identity_reported': 'perc_identity_gg2',
+            'amplicon_silva_name_reported': 'silva_sci_name',
+            'amplicon_silva_identity_reported': 'perc_identity_silva',
+            'maldi_taxon_raw': 'taxon_id',
+            'maldi_instrument': 'maldi_platform',
+            'maldi_library': 'maldi_db_version',
+            'host_species': 'ruminant_name',
+            'host_taxid': 'ruminant_tax_id',
+            'host_sex': 'ruminant_sex',
+            'host_age_weeks': 'ruminant_age',
+            'host_breed': 'ruminant_breed',
+            'production_type': 'production_type',
+            'sample_location': 'sample_location',
+            'sample_description': 'sample_desc',
+            'ruminant_diet': 'ruminant_diet',
+            'diet_details': 'diet_details',
+            'isolation_date': 'isolation_date',
+            'isolation_temperature': 'isolation_temperature',
+            'oxygen_requirement': 'oxygen_requirement',
+            'culture_purity': 'pure_culture',
+            'gram_stain': 'gram_stain',
+            'culture_collection': 'deposite_culture_collect',
+            'culture_collection_name': 'which_culture',
+            'deposited_id': 'deposited_id',
+        }
+        metadata = {}
+        if source_path.suffix.lower() in {'.csv', '.tsv', '.txt'}:
+            # Preserve the non-sequence survey metadata from CSV exports as a
+            # source-labelled block. Canonical fields below remain the convenient
+            # downstream interface; sequence-valued columns are deliberately
+            # omitted to avoid importing marker sequences through metadata.
+            raw_survey_fields = {}
+            for source_header, source_value in values.items():
+                if source_header in {'record_id', 'partner_id'} or source_value in (None, ''):
                     continue
-                text = enum_label(value) if source_key in {
-                    'taxonomic_classification___1', 'taxonomic_classification___2',
-                    'microorganism', 'ruminant_name', 'ruminant_sex', 'ruminant_breed',
-                    'production_type', 'sample_location', 'oxygen_requirement',
-                    'pure_culture', 'gram_stain', 'deposite_culture_collect',
-                } else clean(value)
-                if text:
-                    metadata[output_key] = text
+                header_text = str(source_header or '')
+                header_key_text = header_text.casefold()
+                if ('sequence' in header_key_text and not any(token in header_key_text for token in ('platform', 'sequencing platform', 'primer'))):
+                    continue
+                if 'upload' in header_key_text or 'video' in header_key_text or 'photo' in header_key_text:
+                    continue
+                raw_survey_fields[header_text] = clean(source_value)
+            if raw_survey_fields:
+                metadata['partner_csv_raw_fields'] = raw_survey_fields
+        for output_key, source_key in metadata_map.items():
+            value = get(values, source_key)
+            if value is None or not clean(value):
+                continue
+            text = enum_label(value) if source_key in {
+                'taxonomic_classification___1', 'taxonomic_classification___2',
+                'microorganism', 'ruminant_name', 'ruminant_sex', 'ruminant_breed',
+                'production_type', 'sample_location', 'oxygen_requirement',
+                'pure_culture', 'gram_stain', 'deposite_culture_collect',
+            } else clean(value)
+            if text:
+                metadata[output_key] = text
 
-            result.append({
-                'source_row': row_number,
-                'source_id': source_id,
-                'partner_id': partner_id,
-                'partner_raw': partner_raw,
-                'amplicon_method_reported': amplicon_method,
-                'maldi_method_reported': maldi_method,
-                'maldi_result_raw': maldi_result,
-                'maldi_instrument': clean(get(values, 'maldi_platform')),
-                'maldi_library': clean(get(values, 'maldi_db_version')),
-                'project_metadata': metadata,
-            })
-        return result
-    finally:
-        workbook.close()
+        result.append({
+            'source_row': row_number,
+            'source_id': source_id,
+            'partner_id': partner_id,
+            'partner_raw': partner_raw,
+            'amplicon_method_reported': amplicon_method,
+            'maldi_method_reported': maldi_method,
+            'maldi_result_raw': maldi_result,
+            'maldi_instrument': clean(get(values, 'maldi_platform')),
+            'maldi_library': clean(get(values, 'maldi_db_version')),
+            'project_metadata': metadata,
+        })
+    return result
 
 
 def load_partner_sequencing_metadata(path: str | Path, sheet_name: str | None = None) -> list[dict]:
@@ -313,6 +407,7 @@ def load_partner_sequencing_metadata(path: str | Path, sheet_name: str | None = 
     addition_method_col = _find_column(fieldnames, ADDITION_METHOD_COLUMNS)
     taxon_col = _find_column(fieldnames, TAXON_COLUMNS)
     taxon_rank_col = _find_column(fieldnames, TAXON_RANK_COLUMNS)
+    partner_own_id_col = _find_column(fieldnames, {'partner_own_ids', 'partner_own_id', 'partner-owned id', 'partner own id'})
 
     if not id_col:
         raise ValueError(
@@ -397,9 +492,59 @@ def load_partner_sequencing_metadata(path: str | Path, sheet_name: str | None = 
                 **({'partner_taxon_raw': raw_expected_taxon} if raw_expected_taxon else {}),
                 **({'partner_taxonomy_source_file': p.name} if raw_expected_taxon else {}),
                 **({'partner_taxon_rank': raw_taxon_rank} if raw_taxon_rank else {}),
+                **({'partner_own_id': str(raw.get(partner_own_id_col) or '').strip()} if partner_own_id_col and str(raw.get(partner_own_id_col) or '').strip() else {}),
                 'expected_domain': expected_domain,
             },
         })
+    return rows
+
+
+def load_genome_only_registration_table(path: str | Path) -> list[dict]:
+    """Read isolate identities from a genome-results CSV or TSV, without importing genome evidence."""
+    source = Path(path)
+    delimiter = ',' if source.suffix.lower() == '.csv' else '\t'
+    with open_text(source, encoding='utf-8-sig') as handle:
+        reader = csv.DictReader(handle, delimiter=delimiter)
+        if not reader.fieldnames:
+            raise ValueError(f'Genome registration table has no header: {source}')
+        headers = [str(name or '').strip().lower() for name in reader.fieldnames]
+        if len(set(headers)) != len(headers):
+            raise ValueError(f'Genome registration table has duplicate column names: {source}')
+        missing = {'sequence_id', 'partner_id'} - set(headers)
+        if missing:
+            raise ValueError(f'Genome registration table requires columns: {", ".join(sorted(missing))}')
+        reader.fieldnames = headers
+        rows = []
+        seen = {}
+        for raw in reader:
+            row_number = reader.line_num
+            if None in raw:
+                raise ValueError(f'Too many fields in genome registration table on line {row_number}')
+            if not any(str(value or '').strip() for value in raw.values()):
+                continue
+            source_id = str(raw.get('sequence_id') or '').strip()
+            partner_id = str(raw.get('partner_id') or '').strip()
+            if not source_id or not partner_id:
+                raise ValueError(f'Genome registration table requires sequence_id and partner_id on line {row_number}')
+            if source_id in seen:
+                previous_partner, previous_line = seen[source_id]
+                if partner_id.casefold() != previous_partner.casefold():
+                    raise ValueError(
+                        f'Conflicting partner_id for sequence_id {source_id!r} '
+                        f'on lines {previous_line} and {row_number}'
+                    )
+                continue
+            seen[source_id] = (partner_id, row_number)
+            rows.append({
+                'source_row': row_number,
+                'source_id': source_id,
+                'partner_id': partner_id,
+                'partner_raw': partner_id,
+                'partner_culture_id': '',
+                'project_metadata': {},
+            })
+    if not rows:
+        raise ValueError(f'No genome registration rows found in {source}')
     return rows
 
 
