@@ -49,10 +49,7 @@ included in this repository.
 
 ## What BranchManager does
 
-<<<<<<< HEAD
 
-=======
->>>>>>> origin/main
 | Area | What it provides |
 |---|---|
 | Sanger Studio | A local browser interface for inspecting AB1/ABI chromatograms, organising reads, reviewing assemblies and processing batches. ZIP archives containing nested folders of chromatograms can be uploaded directly. |
@@ -74,7 +71,7 @@ inspect or repeat a particular part of the process.
 
 BranchManager requires **Python 3.12 or newer**.
 
-### Conda is required
+### Conda is recommended for the full installation
 
 **Conda is required for the recommended BranchManager installation
 methods.** It is used to create an isolated Python environment and
@@ -175,12 +172,6 @@ archives can contain nested directories; Sanger Studio searches them for
 `.ab1` and `.abi` files.
 
 For a full guide, see [Sanger Studio](docs/sanger-studio.md).
-
-## What's new in v1.2.0
-
-BranchManager v1.2.0 improves Sanger Studio resequencing and read-selection workflows, chromatogram interpretation, cohort assessment and dashboard reporting. It also strengthens GTDB-based pangenome safeguards and introduces tools for ground-truth validation and workflow drift detection.
-
-See the [v1.2.0 release notes](docs/releases/v1.2.0.md) for details.
 
 ### Run the preflight checks
 
@@ -473,17 +464,7 @@ In particular:
 For details, see [Outputs and
 interpretation](docs/outputs-and-interpretation.md).
 
-## License
-
-BranchManager is distributed under the GNU General Public License v3.0.
-See [LICENSE](LICENSE).
-
-## Project links
-
--   Repository: https://github.com/NickJD/BranchManager
--   Issues: https://github.com/NickJD/BranchManager/issues
-
-## Release-aware projects (v1.4.0)
+## Release-aware projects 
 
 BranchManager now includes project and release lifecycle management. Initialise a project once, create isolated release directories with their own SQLite databases and configuration snapshots, adopt existing release directories without overwriting their contents, and inspect/validate releases.
 
