@@ -115,7 +115,7 @@ def _resolve_config_path(value: str, base: Path) -> str:
     return str((path if path.is_absolute() else base / path).resolve())
 
 
-def load_project_config(path: str | Path) -> dict:
+def load_project_config(path: str | Path, *, project_root: str | Path | None = None) -> dict:
     """Read and validate a profile, expanding environment variables and paths."""
     config_path = Path(path).expanduser().resolve()
     with config_path.open(encoding='utf-8') as handle:
@@ -131,10 +131,12 @@ def load_project_config(path: str | Path) -> dict:
         raise ValueError(f"Unsupported command(s) in project config: {', '.join(sorted(unknown))}")
     expanded = _expand(config, config_path.parent)
     configured_directory = expanded.get('project_directory')
-    if configured_directory is None:
-        project_directory = config_path.parent
-    elif not isinstance(configured_directory, str) or not configured_directory.strip():
+    if configured_directory is not None and (not isinstance(configured_directory, str) or not configured_directory.strip()):
         raise ValueError("Project config 'project_directory' must be a non-empty path")
+    if project_root is not None:
+        project_directory = Path(project_root).expanduser().resolve()
+    elif configured_directory is None:
+        project_directory = config_path.parent
     else:
         project_directory = Path(configured_directory).expanduser()
         if not project_directory.is_absolute():

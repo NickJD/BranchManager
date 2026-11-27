@@ -71,88 +71,6 @@ _SEQUENCE_TYPE_PROFILES = {
     'CUSTOM': {'min_read_length': None, 'min_final_length': None, 'label': 'Other / custom target'},
 }
 
-_DIALOG_LOCK = threading.Lock()
-
-def _native_dialog(kind: str, *, initialdir: str | Path | None = None):
-    """Open a native local file/folder dialog from the localhost UI.
-
-    The dialog returns paths only; the HTTP API never exposes arbitrary directory
-    browsing or file contents.
-    """
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-    except Exception as exc:  # pragma: no cover - depends on desktop installation
-        raise RuntimeError(
-            'Native file dialogs are unavailable. Install/enable Python tkinter and run Sanger Studio in a desktop session.'
-        ) from exc
-
-    with _DIALOG_LOCK:
-        window = None
-        try:
-            window = tk.Tk()
-            window.withdraw()
-            try:
-                window.attributes('-topmost', True)
-            except Exception:
-                pass  # -topmost not supported on all platforms
-            window.update_idletasks()
-            start = str(Path(initialdir).expanduser().resolve()) if initialdir else str(Path.cwd())
-            if kind == 'map':
-                result = filedialog.askopenfilename(
-                    parent=window, title='Select Sanger sample map', initialdir=start,
-                    filetypes=[('Sample maps', '*.tsv *.csv *.txt'), ('All files', '*.*')],
-                )
-            elif kind == 'review':
-                result = filedialog.askopenfilename(
-                    parent=window, title='Attach cohort marker review template', initialdir=start,
-                    filetypes=[('TSV / CSV review files', '*.tsv *.csv *.txt'), ('All files', '*.*')],
-                )
-            elif kind == 'reads':
-                result = filedialog.askopenfilenames(
-                    parent=window, title='Select AB1 / ABI chromatograms', initialdir=start,
-                    filetypes=[('Sanger chromatograms', '*.ab1 *.abi'), ('All files', '*.*')],
-                )
-            elif kind == 'taxonomy_ref':
-                result = filedialog.askopenfilename(
-                    parent=window, title='Select taxonomy reference FASTA', initialdir=start,
-                    filetypes=[
-                        ('FASTA reference databases', '*.fasta *.fa *.fna *.fas *.fasta.gz *.fa.gz *.fna.gz *.fas.gz'),
-                        ('All files', '*.*'),
-                    ],
-                )
-            elif kind == 'taxonomy_taxa':
-                result = filedialog.askopenfilename(
-                    parent=window, title='Select reference taxonomy mapping (optional)', initialdir=start,
-                    filetypes=[('Taxonomy tables', '*.tsv *.csv *.txt *.tsv.gz *.csv.gz'), ('All files', '*.*')],
-                )
-            elif kind in {'input_folder', 'onboarding'}:
-                result = filedialog.askdirectory(
-                    parent=window,
-                    title='Select Sanger input folder (Assistant cohort, sample map, or raw AB1/ABI files)',
-                    initialdir=start,
-                    mustexist=True,
-                )
-            elif kind == 'output':
-                result = filedialog.askdirectory(
-                    parent=window, title='Choose Sanger Studio output directory', initialdir=start,
-                    mustexist=True,
-                )
-            else:
-                raise ValueError(f'Unknown native dialog type: {kind}')
-            return result
-        except tk.TclError as exc:
-            raise RuntimeError(
-                'Could not open the native file dialog. Check that Sanger Studio is running in a graphical desktop session.'
-            ) from exc
-        finally:
-            if window is not None:
-                try:
-                    window.destroy()
-                except Exception:
-                    pass  # window may already be destroyed
-
-
 def _table_delimiter(path: str | Path, sample: str = '') -> str:
     """Choose a delimiter without allowing cell contents to override a TSV/CSV suffix.
 
@@ -1597,7 +1515,7 @@ def _review_decision_options(row: dict[str, str]) -> tuple[list[str], bool]:
 
 class SangerStudio:
     def __init__(self, root: str | Path | None = None, out: str | Path | None = None):
-        # The launch directory is only a starting location for native file dialogs;
+        # The launch directory is only a starting location for browser-upload staging;
         # it is not a read-path security boundary.
         self.root = Path(root or Path.cwd()).expanduser().resolve()
         if not self.root.is_dir():
@@ -1695,6 +1613,69 @@ class SangerStudio:
     def choose_and_load_onboarding_output(self) -> dict:
         """Backward-compatible alias for the generic input-folder picker."""
         return self.choose_and_load_input_folder()
+
+    def save_browser_uploads(self, purpose: str, files: list[tuple[str, bytes]]) -> list[str]:
+        """Store browser-selected files safely, preserving relative folder paths."""
+        import re
+        if purpose not in {'reads', 'folder', 'map', 'review', 'taxonomy_ref', 'taxonomy_taxa'}:
+            raise ValueError('Unsupported browser upload purpose.')
+        root = (self.out / 'browser_uploads' / purpose).resolve()
+        if purpose == 'folder' and root.exists():
+            import shutil
+            shutil.rmtree(root)
+        root.mkdir(parents=True, exist_ok=True)
+        saved = []
+        for name, content in files:
+            if not content:
+                continue
+            # webkitRelativePath is relative; strip unsafe path components and reject traversal.
+            raw = str(name or '').replace('\\', '/')
+            parts = [part for part in raw.split('/') if part not in {'', '.', '..'}]
+            if not parts:
+                continue
+            safe_parts = [re.sub(r'[^A-Za-z0-9._ -]', '_', part) for part in parts]
+            destination = (root.joinpath(*safe_parts)).resolve()
+            if not _is_within(destination, root):
+                raise ValueError('Upload path escaped the upload staging directory.')
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(content)
+            saved.append(str(destination))
+        if not saved:
+            raise ValueError('No files were uploaded.')
+        return saved
+
+    def load_browser_uploads(self, purpose: str, files: list[tuple[str, bytes]]) -> dict:
+        """Load browser uploads for a selected input type."""
+        saved = self.save_browser_uploads(purpose, files)
+        if purpose == 'reads':
+            paths = [p for p in saved if Path(p).suffix.lower() in _READ_EXTENSIONS]
+            if not paths:
+                raise ValueError('No .ab1 or .abi chromatograms were included in the selection.')
+            return self.quick_map(paths)
+        if purpose == 'folder':
+            staged = (self.out / 'browser_uploads' / 'folder').resolve()
+            return self.load_input_directory(staged)
+        if purpose == 'map':
+            path = next((p for p in saved if Path(p).suffix.lower() in _MAP_EXTENSIONS), None)
+            if not path:
+                raise ValueError('Select a TSV, CSV or TXT sample map.')
+            return self.load_map(path)
+        if purpose == 'review':
+            path = next((p for p in saved if Path(p).suffix.lower() in _MAP_EXTENSIONS), None)
+            if not path:
+                raise ValueError('Select a TSV, CSV or TXT marker-review file.')
+            return self.load_marker_review(path)
+        if purpose == 'taxonomy_ref':
+            path = next((p for p in saved if Path(p).suffix.lower() in {'.fasta', '.fa', '.fna', '.fas', '.gz'}), None)
+            if not path:
+                raise ValueError('Select a FASTA reference file.')
+            return self.set_taxonomy_screen(path, self.screen_taxa)
+        if purpose == 'taxonomy_taxa':
+            path = next((p for p in saved if Path(p).suffix.lower() in _MAP_EXTENSIONS | {'.gz'}), None)
+            if not path:
+                raise ValueError('Select a taxonomy mapping table.')
+            return self.set_taxonomy_screen(self.screen_ref, path)
+        raise ValueError('Unsupported upload purpose.')
 
     def load_uploaded_ab1_zip(self, archive_bytes: bytes, filename: str = 'sanger_reads.zip') -> dict:
         """Safely extract AB1/ABI files from a browser-uploaded ZIP and load them."""
@@ -3114,8 +3095,37 @@ def serve(*, port: int = 8765, open_browser: bool = True) -> None:
             except Exception as exc:
                 self._json(400, {'error': str(exc)})
 
+        def _multipart_upload(self):
+            from email.parser import BytesParser
+            from email.policy import default
+            length = int(self.headers.get('Content-Length') or '0')
+            if length <= 0 or length > 1024 * 1024 * 1024:
+                raise ValueError('Upload must be between 1 byte and 1 GB.')
+            body = self.rfile.read(length)
+            if len(body) != length:
+                raise ValueError('Upload was incomplete.')
+            message = BytesParser(policy=default).parsebytes(
+                b'Content-Type: ' + self.headers.get('Content-Type', '').encode('ascii', 'replace') + b'\r\nMIME-Version: 1.0\r\n\r\n' + body
+            )
+            purpose = ''
+            uploads = []
+            for part in message.iter_parts():
+                field = part.get_param('name', header='content-disposition')
+                filename = part.get_filename()
+                payload = part.get_payload(decode=True) or b''
+                if field == 'purpose':
+                    purpose = payload.decode('utf-8', 'replace').strip()
+                elif filename:
+                    relative = part.get_param('filename', header='content-disposition') or filename
+                    uploads.append((relative, payload))
+            return purpose, uploads
+
         def do_POST(self):  # noqa: N802 - stdlib handler name
             try:
+                if self.path == '/api/browser-upload':
+                    purpose, uploads = self._multipart_upload()
+                    self._json(200, studio.load_browser_uploads(purpose, uploads))
+                    return
                 if self.path == '/api/upload-ab1-zip':
                     size = int(self.headers.get('Content-Length') or '0')
                     if size <= 0 or size > 500 * 1024 * 1024:
@@ -3206,6 +3216,7 @@ def serve(*, port: int = 8765, open_browser: bool = True) -> None:
             print(f'[sanger-studio] {self.address_string()} - {format % args}')
 
     try:
+        # Sanger Studio uses browser-native file selection; no GUI toolkit is opened from server handlers.
         server = ThreadingHTTPServer(('127.0.0.1', int(port)), Handler)
     except OSError as exc:
         raise SystemExit(f'[sanger-studio] Could not bind to 127.0.0.1:{port}: {exc}') from exc

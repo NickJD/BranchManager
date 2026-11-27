@@ -27,6 +27,12 @@ The multiple-read alignment interface provides a position-by-position comparison
 
 These improvements help distinguish genuine sequence disagreements from orientation or coordinate-mapping issues and provide a more transparent basis for read selection and sequence assembly. Assembly candidates remain subject to inspection and user selection rather than being accepted automatically.
 
+## Cross-platform file selection
+
+Sanger Studio uses the browser's file-selection controls for AB1/ABI reads, sample maps, cohort-review TSVs, taxonomy references and input-folder uploads. This avoids opening Tk/AppKit/Windows desktop windows from HTTP request threads and is intended to work on macOS, Linux and Windows with a supported browser. Folder upload preserves the selected folder's relative structure. Uploads are staged locally under the configured output directory.
+
+The output directory is selected by entering a local filesystem path, because browser security rules do not permit a web page to obtain an arbitrary local directory path. The path must already exist and be accessible to the BranchManager process. For sample maps containing relative read paths, upload the containing folder instead of uploading the map alone; absolute read paths can be used when the local server can access them.
+
 ## Input options
 
 Sanger Studio supports several ways to provide reads:

@@ -7628,10 +7628,9 @@ def _cohort_assess(args, root: Path) -> None:
             nested_review = joint_root / '03_performance_review_hiring_panel'
             release_context = getattr(args, 'release_context', None)
             if release_context:
-                release_context_path = Path(release_context).expanduser()
-                if release_context_path.is_absolute() and (release_context_path / 'release_manifest.json').is_file():
-                    release_dir = release_context_path.resolve()
-                else:
+                release_dir = getattr(args, '_release_dir', None)
+                release_manager = getattr(args, '_release_manager', None)
+                if release_dir is None:
                     from branchmanager.release_manager import ReleaseManager
                     project_root_hint = None
                     config_hint = getattr(args, 'config', None)
@@ -7641,7 +7640,8 @@ def _cohort_assess(args, root: Path) -> None:
                         except Exception:
                             pass
                     project_root_hint = project_root_hint or os.getcwd()
-                    release_dir = ReleaseManager(project_root_hint).resolve_release(str(release_context))
+                    release_manager = ReleaseManager(project_root_hint)
+                    release_dir = release_manager.resolve_release(str(release_context))
                 nested_assessment = nested_review / 'assessment'
                 release_assessment = release_dir / 'assessment'
                 if nested_assessment.is_dir():
@@ -7655,9 +7655,6 @@ def _cohort_assess(args, root: Path) -> None:
                 # Only mark these stages complete when the promoted artefacts exist.
                 if (release_assessment / 'sequence_assessment.tsv').is_file() and (release_assessment / 'selection_summary.tsv').is_file():
                     try:
-                        from branchmanager.release_manager import ReleaseManager
-                        project_root = json.loads((release_dir / 'release_manifest.json').read_text()).get('project_root')
-                        release_manager = ReleaseManager(project_root)
                         release_manager.update_workflow_status(release_dir, 'assessment', 'COMPLETE', event='cohort_assessment_promoted', details={'source': str(nested_assessment)})
                         if (release_dir / 'dashboard' / nested_dashboard.name).is_file():
                             release_manager.update_workflow_status(release_dir, 'dashboard', 'COMPLETE', event='cohort_dashboard_promoted', details={'source': str(nested_dashboard)})
@@ -8262,7 +8259,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command in {'project', 'release'}:
         from branchmanager.release_manager import ReleaseManager
-        manager = ReleaseManager(args.root if args.command == 'project' else args.project_root)
+        manager = ReleaseManager(args.root if args.command == 'project' else args.project_root,
+                                 releases_dir=args.releases_dir if getattr(args, 'project_action', None) != 'init' else None)
         if args.command == 'project':
             if args.project_action == 'init':
                 manifest = manager.init_project(args.name, config_source=args.config_source, releases_dir=args.releases_dir, overwrite=args.overwrite)
@@ -8317,37 +8315,53 @@ def main(argv=None):
     release_dir = None
     release_manifest = None
     if release_context:
-        from branchmanager.release_manager import ReleaseManager
+        from branchmanager.release_manager import PROJECT_MANIFEST, ReleaseManager
         release_path = Path(release_context).expanduser()
         if release_path.is_absolute() or release_path.exists():
             release_manifest_path = release_path.resolve() / 'release_manifest.json'
             if not release_manifest_path.is_file():
                 parser.error(f'--release does not point to a BranchManager release: {release_context}')
             release_manifest = json.loads(release_manifest_path.read_text(encoding='utf-8'))
-            project_root = release_manifest.get('project_root')
+            project_root = args.project_root
             if not project_root:
-                parser.error(f'Release manifest has no project_root: {release_manifest_path}')
-            release_manager = ReleaseManager(project_root)
+                for parent in release_path.resolve().parents:
+                    if (parent / PROJECT_MANIFEST).is_file():
+                        candidate = ReleaseManager(parent, releases_dir=args.releases_dir)
+                        try:
+                            candidate.resolve_release(release_path)
+                        except (ValueError, FileNotFoundError):
+                            continue
+                        project_root = parent
+                        break
+            project_root = project_root or release_manifest.get('project_root')
+            if not project_root:
+                parser.error(f'Cannot locate project for release: {release_manifest_path}; specify --project-root')
+            release_manager = ReleaseManager(project_root, releases_dir=args.releases_dir)
             try: release_dir = release_manager.resolve_release(release_path)
             except Exception as exc: parser.error(str(exc))
         else:
             # Release IDs are resolved against the project root from --config or cwd.
-            project_root = None
-            if selected_config:
-                try: project_root = load_project_config(selected_config).get('project_directory')
-                except Exception: pass
+            project_root = args.project_root
+            if not project_root and selected_config:
+                config_dir = Path(selected_config).expanduser().resolve().parent
+                project_root = next((p for p in (config_dir, *config_dir.parents) if (p / PROJECT_MANIFEST).is_file()), None)
+                if not project_root:
+                    project_root = load_project_config(selected_config).get('project_directory')
             project_root = project_root or os.getcwd()
-            release_manager = ReleaseManager(project_root)
+            release_manager = ReleaseManager(project_root, releases_dir=args.releases_dir)
             try: release_dir = release_manager.resolve_release(release_context)
             except Exception as exc: parser.error(str(exc))
         release_manifest = release_manager.get_release_manifest(release_dir)
         if not selected_config and release_manifest.get('config_snapshot'):
             selected_config = str(release_dir / release_manifest['config_snapshot'])
     if selected_config:
-        project_config = load_project_config(selected_config)
+        project_config = (load_project_config(selected_config, project_root=release_manager.project_root)
+                          if release_manager else load_project_config(selected_config))
         apply_project_config_defaults(parser, project_config)
     args = parser.parse_args(argv)
     if release_dir:
+        args._release_manager = release_manager
+        args._release_dir = release_dir
         release_db = Path(release_manifest.get('database', release_dir / 'project.sqlite')).expanduser().resolve()
         if not release_db.is_relative_to(release_dir.resolve()):
             parser.error(f'Release database path escapes release directory: {release_db}')

@@ -11,6 +11,26 @@ branchmanager project init --root /path/to/Database_Live --name "Rumen Gateway" 
 ```
 This writes `project_manifest.json` and records the project config and release-store location. By default the release store is `Releases/BranchManager_Project`; use `--releases-dir` to choose another relative or absolute store.
 
+Project-local release stores can move with the project, including stores recorded
+as absolute paths by older BranchManager versions. Pass the current project path
+to `--project` or `--root`; existing manifests are resolved without rewriting
+them. The `latest` alias and release database paths follow the relocated store.
+
+An absolute store outside the project retains its configured location. If that
+store moves too, specify its current location for each command, for example:
+
+```bash
+branchmanager release info --project /new/project --releases-dir /new/store --release latest
+branchmanager project list-releases --root /new/project --releases-dir /new/store
+branchmanager continue-project --project-root /new/project --releases-dir /new/store \
+  --release latest --partner-catalogue partners.csv --genome-results genomes.tsv
+```
+
+Release-aware workflows also accept `--project-root` when the project cannot be
+discovered from a release path or config. Relative paths in a project config use
+the current project root in release context; absolute paths to external
+scientific inputs remain unchanged and must be updated separately if they move.
+
 ## Create a fresh release
 
 ```bash

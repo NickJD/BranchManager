@@ -1585,11 +1585,11 @@ def _marker_review_display(row: dict) -> str:
 def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str = 'GTDB'):
     """Write the SAB-facing shortlist of proposed genome-sequencing candidates.
 
-    Include all marker-assessed isolates except completely failed QC, isolates
-    already genome-sequenced, and isolates already selected/committed for genome
-    sequencing. Redundant isolates and lower-priority recommendations remain visible
-    to the SAB so the shortlist is a complete decision set rather than only
-    positive recommendations.
+    Include all marker-assessed isolates that still require an SAB decision,
+    including failed-QC/no-sequence records (clearly labelled for QC/resequencing).
+    Exclude only isolates already sequenced or already committed for sequencing.
+    PRIMARY/BACKUP and other recommendation roles are not decisions and remain in
+    this file until the SAB decision is recorded.
 
     The summary deliberately exposes the key biological and taxonomic context
     needed for a decision; detailed classifier and novelty evidence remains in
@@ -1615,27 +1615,19 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
         'RecommendationReason',
         'SABDecision',
     ]
-    # Exclude only records with completely failed marker QC, an existing genome,
-    # or a current sequencing commitment. Redundancy is evidence for the SAB, not
-    # a reason to hide an isolate from its decision table.
+    # Completed sequencing states are not awaiting an SAB decision. Failed-QC
+    # and no-sequence isolates remain in the decision file so the SAB can record
+    # resequence/defer/reject actions. Ranking roles are recommendations only.
     def is_excluded(row, support):
-        qc = str(row.get('marker_qc_class') or '').strip().upper()
-        if qc in {'FAIL_QC', 'FAILED_QC', 'QC_FAIL', 'COMPLETELY_FAILED_QC'}:
-            return True
-        no_sequence = str(row.get('no_marker_sequence') or '').strip().lower() in {'true', '1', 'yes'}
-        if no_sequence:
-            return True
         decision = str(support.get('decision') or '').strip().upper()
-        if decision == 'ALREADY SEQUENCED':
-            return True
-        if decision == 'ALREADY SELECTED - GENOME PENDING':
+        if decision in {'ALREADY SEQUENCED', 'ALREADY SELECTED - GENOME PENDING'}:
             return True
         if str(row.get('genome_already_sequenced') or row.get('GenomeAlreadySequenced') or '').strip().lower() in {'true', '1', 'yes'}:
             return True
         if str(row.get('already_selected_for_genome_sequencing') or row.get('AlreadySelectedForGenomeSequencing') or '').strip().lower() in {'true', '1', 'yes'}:
             return True
         role = str(row.get('sequencing_set_role') or '').strip().upper()
-        return role in {'PRIMARY', 'BACKUP', 'DIVERSITY_CANDIDATE', 'ALTERNATE', 'COMMITTED', 'SELECTED'}
+        return role in {'COMMITTED', 'SELECTED', 'SEQUENCED'}
 
     decision_order = {
         'PRIORITISE - SET PRIMARY': 0,
@@ -1644,8 +1636,9 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
         'STRONG CANDIDATE - STRAIN DIVERSITY': 2,
         'SECONDARY - STRAIN DIVERSITY': 3,
         'SECONDARY CANDIDATE': 4,
-        'REVIEW BEFORE SELECTION': 5,
-        'REVIEW - PANGENOME BOUNDARY': 6,
+        'RESEQUENCE REQUIRED - NO SEQUENCE': 5,
+        'REVIEW BEFORE SELECTION': 6,
+        'REVIEW - PANGENOME BOUNDARY': 7,
     }
 
     def display_value(row, key):

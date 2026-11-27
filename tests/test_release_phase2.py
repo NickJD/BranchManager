@@ -91,3 +91,56 @@ def test_manual_workflow_status_accepts_continuation():
     args = parser.parse_args(["release", "status", "--project", "/tmp/project", "--release", "r1",
         "--set", "IN_PROGRESS", "--workflow", "continuation"])
     assert args.workflow == "continuation"
+
+
+def test_moved_release_workflow_resolves_paths_and_relative_config(tmp_path, monkeypatch):
+    import branchmanager.cli_core as core
+    from branchmanager.project_config import load_project_config
+
+    manager, old_release = make_release(tmp_path)
+    old_root = manager.project_root
+    manifest_path = old_release / "release_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["release_dir"] = str(old_release)
+    manifest["database"] = str(old_release / "project.sqlite")
+    manifest_path.write_text(json.dumps(manifest))
+    config = old_root / "project_config.json"
+    config.write_text(json.dumps({"schema_version": 1, "project_directory": str(old_root),
+                                  "data": {"fasta": "inputs/reference.fasta"}, "defaults": {}}))
+    new_root = tmp_path / "moved" / "project"
+    new_root.parent.mkdir()
+    old_root.rename(new_root)
+    release = new_root / old_release.relative_to(old_root)
+    captured = []
+    monkeypatch.setattr(core, "cmd_continue_project", lambda args: captured.append(args.db))
+    for selector in (str(release), "r_phase2"):
+        core.main(["--config", str(new_root / "project_config.json"),
+                   "continue-project", "--release", selector,
+                   "--partner-catalogue", "partners.csv", "--genome-results", "genomes.tsv"])
+    assert captured == [str(release / "project.sqlite")] * 2
+    config_data = load_project_config(new_root / "project_config.json", project_root=new_root)
+    assert config_data["data"]["fasta"] == str(new_root / "inputs" / "reference.fasta")
+
+
+def test_moved_external_release_workflow_with_overrides(tmp_path, monkeypatch):
+    import branchmanager.cli_core as core
+
+    old_root = tmp_path / "old" / "project"
+    old_store = tmp_path / "old" / "store"
+    config = tmp_path / "source.json"
+    config.write_text(json.dumps({"schema_version": 1, "data": {}, "defaults": {}}))
+    manager = ReleaseManager(old_root)
+    manager.init_project("External", releases_dir=old_store, config_source=config)
+    manager.create_release("r1")
+    new_root = tmp_path / "new" / "project"
+    new_store = tmp_path / "new" / "store"
+    new_root.parent.mkdir()
+    old_root.rename(new_root)
+    old_store.rename(new_store)
+    captured = []
+    monkeypatch.setattr(core, "cmd_continue_project", lambda args: captured.append(args.db))
+    for selector in ("r1", str(new_store / "versions" / "r1")):
+        core.main(["continue-project", "--release", selector, "--project-root", str(new_root),
+                   "--releases-dir", str(new_store), "--partner-catalogue", "partners.csv",
+                   "--genome-results", "genomes.tsv"])
+    assert captured == [str(new_store / "versions" / "r1" / "project.sqlite")] * 2

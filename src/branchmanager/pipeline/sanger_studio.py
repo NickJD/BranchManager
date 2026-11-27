@@ -71,88 +71,6 @@ _SEQUENCE_TYPE_PROFILES = {
     'CUSTOM': {'min_read_length': None, 'min_final_length': None, 'label': 'Other / custom target'},
 }
 
-_DIALOG_LOCK = threading.Lock()
-
-def _native_dialog(kind: str, *, initialdir: str | Path | None = None):
-    """Open a native local file/folder dialog from the localhost UI.
-
-    The dialog returns paths only; the HTTP API never exposes arbitrary directory
-    browsing or file contents.
-    """
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-    except Exception as exc:  # pragma: no cover - depends on desktop installation
-        raise RuntimeError(
-            'Native file dialogs are unavailable. Install/enable Python tkinter and run Sanger Studio in a desktop session.'
-        ) from exc
-
-    with _DIALOG_LOCK:
-        window = None
-        try:
-            window = tk.Tk()
-            window.withdraw()
-            try:
-                window.attributes('-topmost', True)
-            except Exception:
-                pass  # -topmost not supported on all platforms
-            window.update_idletasks()
-            start = str(Path(initialdir).expanduser().resolve()) if initialdir else str(Path.cwd())
-            if kind == 'map':
-                result = filedialog.askopenfilename(
-                    parent=window, title='Select Sanger sample map', initialdir=start,
-                    filetypes=[('Sample maps', '*.tsv *.csv *.txt'), ('All files', '*.*')],
-                )
-            elif kind == 'review':
-                result = filedialog.askopenfilename(
-                    parent=window, title='Attach cohort marker review template', initialdir=start,
-                    filetypes=[('TSV / CSV review files', '*.tsv *.csv *.txt'), ('All files', '*.*')],
-                )
-            elif kind == 'reads':
-                result = filedialog.askopenfilenames(
-                    parent=window, title='Select AB1 / ABI chromatograms', initialdir=start,
-                    filetypes=[('Sanger chromatograms', '*.ab1 *.abi'), ('All files', '*.*')],
-                )
-            elif kind == 'taxonomy_ref':
-                result = filedialog.askopenfilename(
-                    parent=window, title='Select taxonomy reference FASTA', initialdir=start,
-                    filetypes=[
-                        ('FASTA reference databases', '*.fasta *.fa *.fna *.fas *.fasta.gz *.fa.gz *.fna.gz *.fas.gz'),
-                        ('All files', '*.*'),
-                    ],
-                )
-            elif kind == 'taxonomy_taxa':
-                result = filedialog.askopenfilename(
-                    parent=window, title='Select reference taxonomy mapping (optional)', initialdir=start,
-                    filetypes=[('Taxonomy tables', '*.tsv *.csv *.txt *.tsv.gz *.csv.gz'), ('All files', '*.*')],
-                )
-            elif kind in {'input_folder', 'onboarding'}:
-                result = filedialog.askdirectory(
-                    parent=window,
-                    title='Select Sanger input folder (Assistant cohort, sample map, or raw AB1/ABI files)',
-                    initialdir=start,
-                    mustexist=True,
-                )
-            elif kind == 'output':
-                result = filedialog.askdirectory(
-                    parent=window, title='Choose Sanger Studio output directory', initialdir=start,
-                    mustexist=True,
-                )
-            else:
-                raise ValueError(f'Unknown native dialog type: {kind}')
-            return result
-        except tk.TclError as exc:
-            raise RuntimeError(
-                'Could not open the native file dialog. Check that Sanger Studio is running in a graphical desktop session.'
-            ) from exc
-        finally:
-            if window is not None:
-                try:
-                    window.destroy()
-                except Exception:
-                    pass  # window may already be destroyed
-
-
 def _table_delimiter(path: str | Path, sample: str = '') -> str:
     """Choose a delimiter without allowing cell contents to override a TSV/CSV suffix.
 
@@ -501,12 +419,74 @@ def _combine_normalised_read_maps(paths: list[Path]) -> tuple[list[dict[str, str
     return list(by_read.values()), source_paths
 
 
-def _combine_standalone_sample_maps(paths: list[Path]) -> tuple[list[dict[str, str]], list[str]]:
+def _discover_cohort_manifest_for_review(review_path: Path) -> tuple[Path | None, Path]:
+    """Find a cohort-level partner manifest adjacent to a marker-review TSV.
+
+    Review templates are normally stored in cohort/00_cohort_preparation;
+    manifests are searched only within that cohort tree and its immediate parent.
+    """
+    review_dir = review_path.parent.resolve()
+    cohort_root = review_dir.parent if review_dir.name == '00_cohort_preparation' else review_dir
+    search_roots = [cohort_root, cohort_root.parent]
+    candidate_names = {
+        'partner_marker_cohort_manifest.csv', 'partner_marker_cohort_manifest.tsv',
+        'partner_marker_cohort_manifest.txt', 'cohort_manifest.csv', 'cohort_manifest.tsv',
+        'partner_marker_cohort_manifest_november.csv',
+    }
+    for root_index, root in enumerate(search_roots):
+        if not root.is_dir():
+            continue
+        if root_index == 1:
+            # Avoid accidentally finding a manifest from another release/cohort.
+            candidates = [(root, sorted(root.iterdir()))]
+        else:
+            candidates = []
+            for current, dirs, files in os.walk(root):
+                dirs[:] = sorted(d for d in dirs if d not in {'.git', '__pycache__', 'sanger_studio_runs'} and not d.startswith('.'))
+                candidates.append((Path(current), [Path(current) / name for name in files]))
+        for current, items in candidates:
+            for item in sorted(items, key=lambda x: x.name.lower()):
+                if item.is_file() and item.name.lower() in candidate_names:
+                    return item, cohort_root
+    return None, cohort_root
+
+
+def _read_cohort_manifest_for_review(path: Path, review_rows: list[dict]) -> list[dict]:
+    """Read cohort manifest entries matching partner/dataset represented in review TSV."""
+    with open(path, newline='', encoding='utf-8-sig') as handle:
+        sample = handle.read(4096)
+        handle.seek(0)
+        delimiter = '\t' if path.suffix.lower() in {'.tsv', '.txt'} else ','
+        raw_rows = csv.DictReader(handle, delimiter=delimiter)
+        manifest_rows = list(raw_rows)
+    wanted = {(str(r.get('partner_id') or '').strip().casefold(), str(r.get('dataset') or '').strip().casefold()) for r in review_rows}
+    selected = []
+    for raw in manifest_rows:
+        row = {str(k or '').strip().lower().replace('-', '_').replace(' ', '_'): str(v or '').strip() for k, v in raw.items() if k}
+        partner = row.get('partner_id') or row.get('partner') or row.get('partner_acronym')
+        dataset = row.get('dataset') or row.get('batch_id')
+        if (partner.casefold(), dataset.casefold()) not in wanted:
+            continue
+        sample_map = row.get('sample_map') or row.get('ab1_map') or row.get('mailroom_map')
+        read_dir = row.get('read_dir') or ''
+        if sample_map:
+            mp = Path(sample_map).expanduser()
+            if not mp.is_absolute():
+                mp = path.parent / mp
+            if mp.is_file():
+                rd = Path(read_dir).expanduser() if read_dir else None
+                if rd and not rd.is_absolute():
+                    rd = path.parent / rd
+                selected.append({'sample_map': mp.resolve(), 'read_dir': rd.resolve() if rd else None})
+    return selected
+
+
+def _combine_standalone_sample_maps(paths: list[Path], read_dirs: dict[Path, Path] | None = None) -> tuple[list[dict[str, str]], list[str]]:
     """Combine recognised standalone maps, deduplicating identical physical reads."""
     by_file: dict[str, dict[str, str]] = {}
     source_paths = []
     for path in sorted(paths):
-        rows = _read_map(path)
+        rows = _read_map(path, (read_dirs or {}).get(path))
         source_paths.append(str(path))
         for row in rows:
             key = str(Path(row['file']).resolve())
@@ -720,8 +700,8 @@ def _row_get(row: dict[str, str], names: tuple[str, ...]) -> str:
     return next((values[name] for name in names if values.get(name)), '')
 
 
-def _read_map(path: str | Path) -> list[dict[str, str]]:
-    """Read a user-selected sample map; mapped AB1 paths may live anywhere."""
+def _read_map(path: str | Path, read_dir: str | Path | None = None) -> list[dict[str, str]]:
+    """Read a sample map; resolve relative AB1 paths against map then read_dir."""
     map_path = Path(path).expanduser().resolve()
     if not map_path.is_file():
         raise ValueError(f'Sample map does not exist: {map_path}')
@@ -742,7 +722,9 @@ def _read_map(path: str | Path) -> list[dict[str, str]]:
             )
         read_path = Path(read_file).expanduser()
         if not read_path.is_absolute():
-            read_path = map_path.parent / read_path
+            map_relative = (map_path.parent / read_path).resolve()
+            read_relative = (Path(read_dir).expanduser().resolve() / read_path).resolve() if read_dir else map_relative
+            read_path = map_relative if map_relative.is_file() else read_relative
         read_path = read_path.resolve()
         if not read_path.is_file():
             raise ValueError(f'Read file on row {line} does not exist: {read_path}')
@@ -1284,12 +1266,7 @@ def _serialise_inspection(output: dict, sequence_id: str, job_dir: Path, output_
                 if not details.get('trace_available'):
                     trace_review[read_id] = {
                         'available': False,
-                        'reason': (
-                            'AB1 dye-channel order (FWO_1/FWO_2) is missing or invalid; '
-                            'channel identities were not guessed.'
-                            if not details.get('trace_order_valid', False)
-                            else 'AB1 trace channels or peak locations could not be decoded; base calls/qualities may still be available.'
-                        ),
+                        'reason': 'AB1 trace channels or peak locations could not be decoded; base calls/qualities may still be available.',
                     }
                     continue
                 channels = details.get('trace_channels') or {}
@@ -1303,27 +1280,12 @@ def _serialise_inspection(output: dict, sequence_id: str, job_dir: Path, output_
                         max(values[i:i + bin_size], default=0)
                         for i in range(0, len(values), bin_size)
                     ]
-                peak_locations = details.get('peak_locations') or []
-                # Exact per-called-base fluorescence is retained separately
-                # from the downsampled display trace. This lets the hover
-                # readout report the real signal at the mapped AB1 peak.
-                peak_channel_signals = {
-                    base: [
-                        int(values[peak]) if 0 <= int(peak) < len(values) else 0
-                        for peak in peak_locations
-                    ]
-                    for base, values in channels.items()
-                }
                 trace_review[read_id] = {
                     'available': True,
                     'trace_length': trace_length,
                     'bin_size': bin_size,
-                    'trace_order': details.get('trace_order') or '',
-                    'trace_order_valid': bool(details.get('trace_order_valid', True)),
-                    'trace_order_source': details.get('trace_order_source') or '',
                     'channels': pooled,
-                    'peak_channel_signals': peak_channel_signals,
-                    'peak_locations': peak_locations,
+                    'peak_locations': details.get('peak_locations') or [],
                     'trim_start': int(row.get('TrimStart') or 0),
                     'trim_end': int(row.get('TrimEnd') or 0),
                     'direction': str(row.get('Direction') or ''),
@@ -1553,7 +1515,7 @@ def _review_decision_options(row: dict[str, str]) -> tuple[list[str], bool]:
 
 class SangerStudio:
     def __init__(self, root: str | Path | None = None, out: str | Path | None = None):
-        # The launch directory is only a starting location for native file dialogs;
+        # The launch directory is only a starting location for browser-upload staging;
         # it is not a read-path security boundary.
         self.root = Path(root or Path.cwd()).expanduser().resolve()
         if not self.root.is_dir():
@@ -1651,6 +1613,69 @@ class SangerStudio:
     def choose_and_load_onboarding_output(self) -> dict:
         """Backward-compatible alias for the generic input-folder picker."""
         return self.choose_and_load_input_folder()
+
+    def save_browser_uploads(self, purpose: str, files: list[tuple[str, bytes]]) -> list[str]:
+        """Store browser-selected files safely, preserving relative folder paths."""
+        import re
+        if purpose not in {'reads', 'folder', 'map', 'review', 'taxonomy_ref', 'taxonomy_taxa'}:
+            raise ValueError('Unsupported browser upload purpose.')
+        root = (self.out / 'browser_uploads' / purpose).resolve()
+        if purpose == 'folder' and root.exists():
+            import shutil
+            shutil.rmtree(root)
+        root.mkdir(parents=True, exist_ok=True)
+        saved = []
+        for name, content in files:
+            if not content:
+                continue
+            # webkitRelativePath is relative; strip unsafe path components and reject traversal.
+            raw = str(name or '').replace('\\', '/')
+            parts = [part for part in raw.split('/') if part not in {'', '.', '..'}]
+            if not parts:
+                continue
+            safe_parts = [re.sub(r'[^A-Za-z0-9._ -]', '_', part) for part in parts]
+            destination = (root.joinpath(*safe_parts)).resolve()
+            if not _is_within(destination, root):
+                raise ValueError('Upload path escaped the upload staging directory.')
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(content)
+            saved.append(str(destination))
+        if not saved:
+            raise ValueError('No files were uploaded.')
+        return saved
+
+    def load_browser_uploads(self, purpose: str, files: list[tuple[str, bytes]]) -> dict:
+        """Load browser uploads for a selected input type."""
+        saved = self.save_browser_uploads(purpose, files)
+        if purpose == 'reads':
+            paths = [p for p in saved if Path(p).suffix.lower() in _READ_EXTENSIONS]
+            if not paths:
+                raise ValueError('No .ab1 or .abi chromatograms were included in the selection.')
+            return self.quick_map(paths)
+        if purpose == 'folder':
+            staged = (self.out / 'browser_uploads' / 'folder').resolve()
+            return self.load_input_directory(staged)
+        if purpose == 'map':
+            path = next((p for p in saved if Path(p).suffix.lower() in _MAP_EXTENSIONS), None)
+            if not path:
+                raise ValueError('Select a TSV, CSV or TXT sample map.')
+            return self.load_map(path)
+        if purpose == 'review':
+            path = next((p for p in saved if Path(p).suffix.lower() in _MAP_EXTENSIONS), None)
+            if not path:
+                raise ValueError('Select a TSV, CSV or TXT marker-review file.')
+            return self.load_marker_review(path)
+        if purpose == 'taxonomy_ref':
+            path = next((p for p in saved if Path(p).suffix.lower() in {'.fasta', '.fa', '.fna', '.fas', '.gz'}), None)
+            if not path:
+                raise ValueError('Select a FASTA reference file.')
+            return self.set_taxonomy_screen(path, self.screen_taxa)
+        if purpose == 'taxonomy_taxa':
+            path = next((p for p in saved if Path(p).suffix.lower() in _MAP_EXTENSIONS | {'.gz'}), None)
+            if not path:
+                raise ValueError('Select a taxonomy mapping table.')
+            return self.set_taxonomy_screen(self.screen_ref, path)
+        raise ValueError('Unsupported upload purpose.')
 
     def load_uploaded_ab1_zip(self, archive_bytes: bytes, filename: str = 'sanger_reads.zip') -> dict:
         """Safely extract AB1/ABI files from a browser-uploaded ZIP and load them."""
@@ -2035,7 +2060,42 @@ class SangerStudio:
         self.marker_review_fields = fields
         self.marker_review_rows = normalised
         self.dialog_start = source.parent
-        return self.marker_review_state()
+        review_state = self.marker_review_state()
+        # Review-first cohort workflow: discover cohort manifest and load mapped AB1s
+        # without prompting the user to manually browse for chromatograms.
+        manifest_path, cohort_root = _discover_cohort_manifest_for_review(source)
+        auto_load_status = 'No cohort manifest discovered; review loaded without reads.'
+        if manifest_path:
+            try:
+                manifest_entries = _read_cohort_manifest_for_review(manifest_path, normalised)
+                maps = [entry['sample_map'] for entry in manifest_entries]
+                read_dirs = {entry['sample_map']: entry['read_dir'] for entry in manifest_entries if entry.get('read_dir')}
+                if maps:
+                    rows, source_paths = _combine_standalone_sample_maps(maps, read_dirs)
+                    with self.lock:
+                        self.map_rows = [dict(row) for row in rows]
+                        self.map_path = maps[0] if len(maps) == 1 else None
+                        self.input_source = 'cohort_manifest'
+                        self.input_directory = str(cohort_root)
+                        self.input_files = source_paths
+                        self.onboarding_taxonomy = None
+                        self.pre_screen_taxonomy_by_isolate = {}
+                    samples = _samples_from_rows(rows)
+                    review_state.update({
+                        'samples': samples, 'read_count': len(rows), 'input_kind': 'standalone_sample_map',
+                        'path': str(self.map_path) if self.map_path else '', 'map_paths': source_paths,
+                        'taxonomy_loaded': False, 'taxonomy_status': 'NOT_SCREENED',
+                        'onboarding_taxonomy': self.onboarding_taxonomy_state(),
+                        'status_message': f'Automatically loaded {len(samples)} isolate(s) and {len(rows)} read(s) from {len(source_paths)} cohort manifest map(s).',
+                        'auto_loaded_from_manifest': True,
+                    })
+                    auto_load_status = review_state['status_message']
+                else:
+                    auto_load_status = 'Cohort manifest found, but no matching Sanger sample maps were listed for review partner/dataset values.'
+            except Exception as exc:
+                auto_load_status = f'Cohort manifest was found, but automatic read loading failed: {exc}'
+        review_state['auto_load_status'] = auto_load_status
+        return review_state
 
     def marker_review_state(self) -> dict:
         rows = []
@@ -2096,9 +2156,63 @@ class SangerStudio:
                 raw_notes = item.get('notes')
                 notes = str(raw_notes if raw_notes is not None else (row.get('notes') or '')).strip()
                 manual_selection_changed = False
+                candidate_selection_changed = False
+
+                # Persist the explicit retained assembly/read candidate separately
+                # from the legacy individual-read fallback selector.
+                selected_candidate_id = str(item.get('selected_candidate_id') or '').strip()
+                if selected_candidate_id:
+                    previous_candidate_id = str(row.get('selected_candidate_id') or '').strip()
+                    candidate_selection_changed = previous_candidate_id != selected_candidate_id
+                    if candidate_selection_changed:
+                        # Only a newly changed selection must be validated against
+                        # the current inspection. An unchanged candidate imported
+                        # from a saved review is historical evidence and should be
+                        # retained across Studio sessions without requiring that
+                        # the candidate be regenerated in this session.
+                        inspection_for_candidate = self.last_inspection.get(sid)
+                        # Assemblies and individual-read fallback candidates are
+                        # stored separately in an inspection. Validate against both;
+                        # otherwise valid fallback selections are falsely reported stale.
+                        inspection = inspection_for_candidate or {}
+                        valid_candidates = list(inspection.get('assembly_candidates') or [])
+                        fallback_options = _parse_fallback_read_options(inspection.get('fallback_read_options'))
+                        candidate = next((c for c in valid_candidates if str(c.get('CandidateID') or '').strip() == selected_candidate_id), None)
+                        fallback = next((c for c in fallback_options if str(c.get('read_id') or '').strip() == selected_candidate_id), None)
+                        if candidate is None and fallback is None:
+                            raise ValueError(
+                                f'{sid}: newly selected candidate {selected_candidate_id!r} is not in the latest inspection '
+                                '(neither an assembly candidate nor an individual-read fallback). '
+                                'Re-inspect this isolate and select a candidate from the current results.'
+                            )
+                        if candidate is not None:
+                            read_ids = [x.strip() for x in str(candidate.get('ReadIDs') or '').split(';') if x.strip()]
+                            row['selected_candidate_type'] = 'INDIVIDUAL_READ' if len(read_ids) <= 1 else 'ASSEMBLY'
+                            row['selected_candidate_length'] = str(candidate.get('OutputLength') or candidate.get('SequenceLength') or len(str(candidate.get('Sequence') or '')))
+                        else:
+                            row['selected_candidate_type'] = 'INDIVIDUAL_READ'
+                            row['selected_candidate_length'] = str(fallback.get('length') or fallback.get('trimmed_length') or '')
+                        row['selected_candidate_source'] = 'MANUAL'
+                        manual_selection_changed = manual_selection_changed or candidate_selection_changed
+                        if not reviewer:
+                            raise ValueError(f'{sid}: reviewer identity is required when selecting a retained assembly/read candidate.')
+                        row['reviewer'] = reviewer
+                    # Preserve the ID and its stored metadata for an unchanged
+                    # candidate from an attached review file.
+                    row['selected_candidate_id'] = selected_candidate_id
+                elif 'selected_candidate_id' in item:
+                    row['selected_candidate_id'] = ''
+                    row['selected_candidate_type'] = ''
+                    row['selected_candidate_length'] = ''
+                    row['selected_candidate_source'] = ''
 
                 if 'selected_read_id' in item:
                     selected_read_id = str(item.get('selected_read_id') or '').strip()
+                    # If a final candidate (assembly or individual read) is
+                    # selected, it supersedes the legacy fallback-read selector.
+                    # Clear any stale dropdown value before QC validation.
+                    if selected_candidate_id:
+                        selected_read_id = ''
 
                     # An inspection may have been run after the cohort review TSV
                     # was attached. In that workflow the browser receives the
@@ -2218,6 +2332,8 @@ class SangerStudio:
                             row['reviewed_at'] = (
                                 today if row.get('read_selection_source') == 'MANUAL' else ''
                             )
+                        elif candidate_selection_changed:
+                            row['reviewed_at'] = today
                         elif row.get('read_selection_source') != 'MANUAL':
                             row['reviewed_at'] = ''
                     row['_original_decision'] = ''
@@ -2228,7 +2344,9 @@ class SangerStudio:
                 'eligible_for_manual_acceptance', 'allowed_decisions',
                 'fallback_read_options', 'recommended_read_id', 'selected_read_id',
                 'read_selection_source', 'fallback_reason', 'processing_mode',
-                'assembly_status', 'output_type',
+                'assembly_status', 'output_type', 'selected_candidate_id',
+                'selected_candidate_type', 'selected_candidate_length',
+                'selected_candidate_source',
             ):
                 if required_field not in fields:
                     fields.append(required_field)
@@ -2977,8 +3095,37 @@ def serve(*, port: int = 8765, open_browser: bool = True) -> None:
             except Exception as exc:
                 self._json(400, {'error': str(exc)})
 
+        def _multipart_upload(self):
+            from email.parser import BytesParser
+            from email.policy import default
+            length = int(self.headers.get('Content-Length') or '0')
+            if length <= 0 or length > 1024 * 1024 * 1024:
+                raise ValueError('Upload must be between 1 byte and 1 GB.')
+            body = self.rfile.read(length)
+            if len(body) != length:
+                raise ValueError('Upload was incomplete.')
+            message = BytesParser(policy=default).parsebytes(
+                b'Content-Type: ' + self.headers.get('Content-Type', '').encode('ascii', 'replace') + b'\r\nMIME-Version: 1.0\r\n\r\n' + body
+            )
+            purpose = ''
+            uploads = []
+            for part in message.iter_parts():
+                field = part.get_param('name', header='content-disposition')
+                filename = part.get_filename()
+                payload = part.get_payload(decode=True) or b''
+                if field == 'purpose':
+                    purpose = payload.decode('utf-8', 'replace').strip()
+                elif filename:
+                    relative = part.get_param('filename', header='content-disposition') or filename
+                    uploads.append((relative, payload))
+            return purpose, uploads
+
         def do_POST(self):  # noqa: N802 - stdlib handler name
             try:
+                if self.path == '/api/browser-upload':
+                    purpose, uploads = self._multipart_upload()
+                    self._json(200, studio.load_browser_uploads(purpose, uploads))
+                    return
                 if self.path == '/api/upload-ab1-zip':
                     size = int(self.headers.get('Content-Length') or '0')
                     if size <= 0 or size > 500 * 1024 * 1024:
@@ -3069,6 +3216,7 @@ def serve(*, port: int = 8765, open_browser: bool = True) -> None:
             print(f'[sanger-studio] {self.address_string()} - {format % args}')
 
     try:
+        # Sanger Studio uses browser-native file selection; no GUI toolkit is opened from server handlers.
         server = ThreadingHTTPServer(('127.0.0.1', int(port)), Handler)
     except OSError as exc:
         raise SystemExit(f'[sanger-studio] Could not bind to 127.0.0.1:{port}: {exc}') from exc

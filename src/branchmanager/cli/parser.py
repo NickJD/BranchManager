@@ -1370,20 +1370,23 @@ def build_parser():
     project_init.add_argument('--root', required=True, help='Project root directory')
     project_init.add_argument('--name', default='BranchManager Project', help='Human-readable project name')
     project_init.add_argument('--config-source', help='Optional existing project config JSON to copy')
-    project_init.add_argument('--releases-dir', default=None, help='Release-store directory relative to project root (default Releases/BranchManager_Project)')
+    project_init.add_argument('--releases-dir', default=None, help='Release-store directory, relative to project root or absolute (default Releases/BranchManager_Project)')
     project_init.add_argument('--overwrite', action='store_true', help='Replace existing project config (manifest is refreshed)')
     for action_name, action_help in (('info','Show project metadata'), ('validate','Validate project manifest/config'), ('list-releases','List releases')):
         pp = project_sub.add_parser(action_name, help=action_help)
         pp.add_argument('--root', required=True, help='Project root directory')
+        pp.add_argument('--releases-dir', default=None, help='Override the release-store directory for this command')
 
     release_parser = sub.add_parser('release', help='Create, inspect and validate project releases')
     release_sub = release_parser.add_subparsers(dest='release_action', required=True)
     release_adopt = release_sub.add_parser('adopt', help='Adopt an existing release directory without overwriting its contents')
     release_adopt.add_argument('--project', '--root', dest='project_root', required=True, help='Project root')
+    release_adopt.add_argument('--releases-dir', default=None, help='Override the release-store directory for this command')
     release_adopt.add_argument('--release-id', required=True, help='Existing release directory name')
     release_adopt.add_argument('--no-config-snapshot', action='store_true', help='Do not add a project config snapshot')
     release_create = release_sub.add_parser('create', help='Create an isolated release directory')
     release_create.add_argument('--project', '--root', dest='project_root', required=True, help='Project root')
+    release_create.add_argument('--releases-dir', default=None, help='Override the release-store directory for this command')
     release_create.add_argument('--release-id', default=None, help='Optional release ID (default UTC timestamp)')
     release_create.add_argument('--parent-release', default=None, help='Parent release ID or directory')
     release_create.add_argument('--copy-database', action='store_true', help='Copy parent release database with SQLite backup')
@@ -1391,6 +1394,7 @@ def build_parser():
     for action_name, action_help in (('info','Show release manifest and resolved paths'), ('validate','Validate release structure and SQLite'), ('status','Update release lifecycle status')):
         rp = release_sub.add_parser(action_name, help=action_help)
         rp.add_argument('--project', '--root', dest='project_root', required=True, help='Project root')
+        rp.add_argument('--releases-dir', default=None, help='Override the release-store directory for this command')
         rp.add_argument('--release', required=True, help='Release ID or release directory')
         if action_name == 'status':
             rp.add_argument('--set', dest='status_value', required=True, choices=['CREATED','IN_PROGRESS','VALIDATING','READY','FAILED','ABORTED','ARCHIVED'])
@@ -1414,6 +1418,8 @@ def build_parser():
             continue
         _command_parser.add_argument('--release', dest='release_context', default=None,
             help='Release ID or release directory; supplies the release database and safe default output paths')
+        _command_parser.add_argument('--project-root', default=None, help='Project root for release resolution')
+        _command_parser.add_argument('--releases-dir', default=None, help='Override the release-store directory for this command')
         for _action in _command_parser._actions:
             # Release context supplies these paths; retain the arguments for
             # standalone/legacy use and permit explicit overrides.

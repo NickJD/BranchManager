@@ -580,7 +580,7 @@ def test_webpage_shutdown_endpoint_stops_only_the_local_studio_server(monkeypatc
     import urllib.request
 
     studio_module = load_studio_module()
-    real_server = studio_module.ThreadingHTTPServer
+    real_server = studio_module.HTTPServer
     captured = {}
 
     class CapturingServer(real_server):
@@ -588,7 +588,7 @@ def test_webpage_shutdown_endpoint_stops_only_the_local_studio_server(monkeypatc
             super().__init__(*args, **kwargs)
             captured['server'] = self
 
-    monkeypatch.setattr(studio_module, 'ThreadingHTTPServer', CapturingServer)
+    monkeypatch.setattr(studio_module, 'HTTPServer', CapturingServer)
     monkeypatch.setattr(importlib.resources, 'files', lambda _package: PACKAGE_ROOT)
     monkeypatch.chdir(tmp_path)
     server_thread = threading.Thread(

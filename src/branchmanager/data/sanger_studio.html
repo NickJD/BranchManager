@@ -63,6 +63,12 @@
           <button class="secondary" id="chooseReadsBtn" type="button">Select AB1/ABI files</button>
           <button class="secondary" id="uploadZipBtn" type="button">Upload AB1 ZIP</button>
           <input id="ab1ZipInput" type="file" accept=".zip,application/zip" hidden>
+        <input id="browserReadsInput" type="file" accept=".ab1,.abi" multiple hidden>
+        <input id="browserFolderInput" type="file" webkitdirectory directory multiple hidden>
+        <input id="browserMapInput" type="file" accept=".tsv,.csv,.txt" hidden>
+        <input id="browserReviewInput" type="file" accept=".tsv,.csv,.txt" hidden>
+        <input id="browserTaxRefInput" type="file" accept=".fasta,.fa,.fna,.fas,.gz" hidden>
+        <input id="browserTaxTableInput" type="file" accept=".tsv,.csv,.txt,.gz" hidden>
         </div>
         <p class="help">Choose a directory containing AB1/ABI chromatograms (including nested folders), an Assistant cohort, sample maps, individual chromatograms, or a ZIP containing AB1/ABI files. ZIP uploads are extracted locally by Studio; raw chromatograms are grouped by inferred sample ID. Check every inferred primer and direction before assembly. Assistant taxonomy is optional. Studio automatically detects Assistant cohort outputs, standalone sample maps, or raw AB1/ABI chromatograms.</p>
         <div id="mapStatus" class="small" style="margin-top:10px">No input loaded yet. Choose a folder, sample map or chromatogram files.</div>
@@ -74,7 +80,7 @@
           <summary class="small" style="cursor:pointer">Alternative: load a standalone sample map</summary>
           <div class="row" style="margin-top:8px"><button class="secondary" id="chooseMapBtn" type="button">Choose sample map</button></div>
           <div class="mapline" style="margin-top:8px"><input id="mapPath" type="text" placeholder="Paste a standalone sample map path"><button id="loadMap">Load path</button></div>
-          <p class="help">For unusual directory structures, select a TSV/CSV/TXT map directly. Read paths can live anywhere; relative paths resolve from the map file.</p>
+          <p class="help">For unusual directory structures, upload a TSV/CSV/TXT map. If the map uses relative read paths, upload the containing folder instead so the paths and files remain together; absolute read paths remain supported when the local server can access them.</p>
         </details>
         <div class="batchbox">
           <div class="row between"><strong>Output directory</strong><button class="secondary" id="chooseOutputBtn">Choose folder</button></div>
@@ -235,8 +241,8 @@ async function applyLoadedMap(data){
  if(studioState.samples.length)selectSample(studioState.samples[0].sequence_id);
 }
 async function loadMap(path){setStatus($('#mapStatus'),'Loading map and checking referenced files…');try{let data=await api('/api/load-map',{path});await applyLoadedMap(data)}catch(e){setStatus($('#mapStatus'),e.message,true)}}
-async function chooseMap(){setStatus($('#mapStatus'),'Choose a sample map in the file dialog…');try{let data=await api('/api/pick-map',{});await applyLoadedMap(data);if(!data.cancelled)$('#mapStatus').textContent+= ' All read paths were resolved.'}catch(e){setStatus($('#mapStatus'),e.message,true)}}
-async function chooseReads(){setStatus($('#mapStatus'),'Choose AB1/ABI files in the file dialog…');try{let data=await api('/api/pick-reads',{});data.quick_map=true;data.status_message=`Loaded ${data.samples.length} isolate(s), ${data.read_count} read(s) from selected chromatograms.`;await applyLoadedMap(data);if(!data.cancelled)$('#mapStatus').textContent+=' Check inferred IDs, primers and directions before processing.'}catch(e){setStatus($('#mapStatus'),e.message,true)}}
+async function chooseMap(){$('#browserMapInput').click()}
+async function chooseReads(){$('#browserReadsInput').click()}
 async function uploadAb1Zip(file){
  if(!file)return;
  const button=$('#uploadZipBtn');button.disabled=true;
@@ -252,27 +258,32 @@ async function uploadAb1Zip(file){
  }catch(e){setStatus($('#mapStatus'),e.message,true)}
  finally{button.disabled=false;$('#ab1ZipInput').value=''}
 }
-async function chooseInputFolder(){
- const button=$('#chooseInputFolderBtn');button.disabled=true;
- setStatus($('#mapStatus'),'Choose a folder. Studio is checking for Assistant cohort files, sample maps and AB1/ABI chromatograms…');
+async function chooseInputFolder(){$('#browserFolderInput').click()}
+async function handleBrowserUpload(purpose,input){
+ const files=Array.from(input.files||[]);if(!files.length)return;
+ const form=new FormData();form.append('purpose',purpose);
+ files.forEach(f=>form.append('files',f,f.webkitRelativePath||f.name));
+ const status=purpose==='folder'?$('#mapStatus'):purpose==='reads'?$('#mapStatus'):purpose==='map'?$('#mapStatus'):purpose==='review'?$('#cohortReviewStatus'):$('#taxScreenStatus');
+ setStatus(status,`Uploading ${files.length} selected file(s)…`);
  try{
-  const d=await api('/api/pick-input-folder',{});if(d.cancelled)return;
-  studioState.onboarding_taxonomy=d.onboarding_taxonomy||{loaded:Boolean(d.taxonomy_loaded),root:'',read_count:0,taxonomy_read_count:0,hit_count:0,isolate_count:0,message:d.status_message||'No pre-screened taxonomy loaded.'};
-  if(d.screen_ref){studioState.screen_ref=d.screen_ref;$('#screenRefPath').value=d.screen_ref;}
-  if(d.screen_taxa!==undefined){studioState.screen_taxa=d.screen_taxa||'';$('#screenTaxaPath').value=studioState.screen_taxa;}
-  await applyLoadedMap(d);
-  renderOnboardingTaxonomyState(studioState.onboarding_taxonomy);
-  if(d.taxonomy_loaded){
-   updateTaxonomyScreenStatus('Pre-screened Assistant taxonomy loaded. VSEARCH remains optional.');
-  }else{
-   const refAvailable=Boolean(studioState.screen_ref);
-   updateTaxonomyScreenStatus(refAvailable?'No cached taxonomy (NOT_SCREENED). Fresh VSEARCH is available but opt-in.':'No cached taxonomy (NOT_SCREENED). Choose a reference FASTA to enable optional VSEARCH.');
-   $('#sampleTaxonomyStatus').textContent='NOT_SCREENED';
-  }
- }catch(e){setStatus($('#mapStatus'),e.message,true)}
- finally{button.disabled=false}
+  const response=await fetch('/api/browser-upload',{method:'POST',body:form});
+  const data=await response.json();if(!response.ok)throw new Error(data.error||'Upload failed');
+  if(purpose==='folder'){
+   studioState.onboarding_taxonomy=data.onboarding_taxonomy||{loaded:Boolean(data.taxonomy_loaded),message:data.status_message||'No pre-screened taxonomy loaded.'};
+   if(data.screen_ref){studioState.screen_ref=data.screen_ref;$('#screenRefPath').value=data.screen_ref;}
+   if(data.screen_taxa!==undefined){studioState.screen_taxa=data.screen_taxa||'';$('#screenTaxaPath').value=studioState.screen_taxa;}
+   await applyLoadedMap(data);renderOnboardingTaxonomyState(studioState.onboarding_taxonomy);
+   updateTaxonomyScreenStatus(data.taxonomy_loaded?'Pre-screened Assistant taxonomy loaded. VSEARCH remains optional.':'No cached taxonomy (NOT_SCREENED). Fresh VSEARCH remains opt-in.');
+  }else if(purpose==='reads'){
+   data.quick_map=true;data.status_message=`Loaded ${data.samples.length} isolate(s), ${data.read_count} read(s) from uploaded chromatograms.`;await applyLoadedMap(data);
+   $('#mapStatus').textContent=data.status_message+' Check inferred IDs, primers and directions before assembly.';
+  }else if(purpose==='map'){await applyLoadedMap(data);$('#mapStatus').textContent='Sample map loaded. All read paths were resolved.'}
+  else if(purpose==='review'){await attachReviewFromData(data)}
+  else if(purpose==='taxonomy_ref'){Object.assign(studioState,data);$('#screenRefPath').value=data.screen_ref;$('#screenTaxaPath').value=data.screen_taxa;updateTaxonomyScreenStatus('Reference uploaded for optional re-screening.')}
+  else if(purpose==='taxonomy_taxa'){Object.assign(studioState,data);$('#screenRefPath').value=data.screen_ref;$('#screenTaxaPath').value=data.screen_taxa;updateTaxonomyScreenStatus('Taxonomy mapping uploaded and configured.')}
+ }catch(e){setStatus(status,e.message,true)}finally{input.value=''}
 }
-async function chooseOutput(){try{let d=await api('/api/pick-output',{});if(d.cancelled)return;studioState.out=d.out;$('#outputPath').textContent=d.out;$('#outputBadge').textContent='Output: '+d.out}catch(e){setStatus($('#batchStatus'),e.message,true)}}
+async function chooseOutput(){const path=window.prompt('Enter the output directory path on this computer:',studioState.out||'');if(!path)return;try{let d=await api('/api/set-output',{path});studioState.out=d.out;$('#outputPath').textContent=d.out;$('#outputBadge').textContent='Output: '+d.out}catch(e){setStatus($('#batchStatus'),e.message,true)}}
 function updateTaxonomyScreenStatus(message){$('#taxScreenStatus').textContent=message;$('#taxScreenConfigSource').textContent=studioState.taxonomy_config_path?`Auto-detected from ${studioState.taxonomy_config_path}`:''}
 function renderOnboardingTaxonomyState(data){
  const loaded=Boolean(data&&data.loaded);
@@ -285,8 +296,8 @@ async function applyTaxonomySettings(){
  try{let d=await api('/api/set-taxonomy-screen',{screen_ref:$('#screenRefPath').value,screen_taxa:$('#screenTaxaPath').value});studioState.screen_ref=d.screen_ref;studioState.screen_taxa=d.screen_taxa;studioState.taxonomy_screen_enabled=d.enabled;updateTaxonomyScreenStatus(d.enabled?'Reference saved. Fresh VSEARCH runs only when the re-screen checkbox is enabled; otherwise cached onboarding taxonomy is used when available.':'No reference configured; VSEARCH re-screening unavailable.');}
  catch(e){setStatus($('#taxScreenStatus'),e.message,true)}
 }
-async function chooseTaxonomyRef(){try{let d=await api('/api/pick-taxonomy-reference',{});if(d.cancelled)return;$('#screenRefPath').value=d.screen_ref;$('#screenTaxaPath').value=d.screen_taxa;studioState.screen_ref=d.screen_ref;studioState.screen_taxa=d.screen_taxa;studioState.taxonomy_screen_enabled=d.enabled;updateTaxonomyScreenStatus('Reference selected for optional re-screening.')}catch(e){setStatus($('#taxScreenStatus'),e.message,true)}}
-async function chooseTaxonomyTable(){try{let d=await api('/api/pick-taxonomy-table',{});if(d.cancelled)return;$('#screenRefPath').value=d.screen_ref;$('#screenTaxaPath').value=d.screen_taxa;studioState.screen_ref=d.screen_ref;studioState.screen_taxa=d.screen_taxa;studioState.taxonomy_screen_enabled=d.enabled;updateTaxonomyScreenStatus('Taxonomy mapping selected for optional re-screening.')}catch(e){setStatus($('#taxScreenStatus'),e.message,true)}}
+async function chooseTaxonomyRef(){$('#browserTaxRefInput').click()}
+async function chooseTaxonomyTable(){$('#browserTaxTableInput').click()}
 async function shutdownStudio(){
  const button=$('#shutdownBtn');
  if(inspectionRunning||batchRunning){setStatus($('#mapStatus'),'Wait for the current inspection or batch processing run to finish before shutting down Studio.',true);return}
@@ -335,9 +346,10 @@ function reconcileReviewReads(){
  return {exact,aliasMatches,ambiguous,unmatched};
 }
 async function attachReview(){
- setStatus($('#cohortReviewStatus'),'Choose a cohort marker review template…');
+ $('#browserReviewInput').click();
+}
+async function attachReviewFromData(d){
  try{
-  let d=await api('/api/pick-marker-review',{});if(d.cancelled)return;
   renderCohortReview(d);
   if(d.auto_loaded_from_manifest&&d.samples){await applyLoadedMap(d);}
   else if(!(studioState?.samples||[]).length){
@@ -1204,7 +1216,7 @@ function renderResult(r){
  let review=r.qc_class==='PASS_WITH_WARNINGS'&&r.recommendation==='MANUAL_REVIEW';$('#reviewBox').classList.toggle('hidden',!review);$('#reviewStatus').textContent='';if(!review&&r.qc_class==='FAIL_QC')$('#why').innerHTML+=`<br><br><b>This marker failed automated QC.</b> Its eligibility for any exception decision is controlled by the attached cohort review template; inspect the sequence evidence and use the cohort review panel where appropriate.`;$('#results').scrollIntoView({behavior:'smooth',block:'start'})
 }
 async function saveReview(decision){if(!lastInspection)return;try{let r=await api('/api/review',{sequence_id:lastInspection.sequence_id,decision,reviewer:$('#reviewer').value,notes:$('#reviewNotes').value});$('#reviewStatus').textContent=`Saved ${decision} decision to ${r.path}`;$('#reviewFile').href='/artifact?path=marker_review_decisions.tsv'}catch(e){$('#reviewStatus').textContent=e.message;$('#reviewStatus').className='error'}}
-async function init(){try{studioState=await api('/api/state');$('#outputBadge').textContent='Output: '+studioState.out;$('#outputPath').textContent=studioState.out;$('#mapPath').value=studioState.map_path||'';$('#screenRefPath').value=studioState.screen_ref||'';$('#screenTaxaPath').value=studioState.screen_taxa||'';updateTaxonomyScreenStatus(studioState.taxonomy_screen_enabled?'Reference available for optional VSEARCH re-screening.':'No reference configured for optional re-screening.');renderOnboardingTaxonomyState(studioState.onboarding_taxonomy);renderSettings();renderSamples();$('#sequenceType').onchange=applySequenceProfile;applySequenceProfile();$('#chooseInputFolderBtn').onclick=chooseInputFolder;$('#chooseMapBtn').onclick=chooseMap;$('#chooseReadsBtn').onclick=chooseReads;$('#uploadZipBtn').onclick=()=>$('#ab1ZipInput').click();$('#ab1ZipInput').onchange=e=>uploadAb1Zip(e.target.files&&e.target.files[0]);$('#chooseOutputBtn').onclick=chooseOutput;$('#shutdownBtn').onclick=shutdownStudio;$('#chooseTaxonomyRefBtn').onclick=chooseTaxonomyRef;$('#chooseTaxonomyTableBtn').onclick=chooseTaxonomyTable;$('#applyTaxonomySettingsBtn').onclick=applyTaxonomySettings;$('#rerunTaxonomyCheck').onchange=()=>updateTaxonomyScreenStatus($('#rerunTaxonomyCheck').checked?'Fresh VSEARCH will run on the current trimmed reads during the next inspection.':'Off: use pre-screened onboarding taxonomy where available.');$('#attachReviewBtn').onclick=attachReview;$('#loadMap').onclick=()=>loadMap($('#mapPath').value);$('#sampleSearch').oninput=renderSamples;$('#runBtn').onclick=inspect;$('#runBtnSidebar').onclick=inspect;$('#processAllBtn').onclick=processAll;$('#resetSettings').onclick=renderSettings;$('#approveBtn').onclick=()=>saveReview('approve');$('#rejectBtn').onclick=()=>saveReview('reject');$('#cohortReviewSearch').oninput=renderCohortReviewRows;$('#cohortReviewFilter').onchange=renderCohortReviewRows;$('#cohortReviewRows').addEventListener('change',e=>{let tr=e.target.closest('tr[data-seq]');if(!tr||!cohortReview)return;let record=cohortReview.rows.find(r=>r.sequence_id===tr.dataset.seq);if(!record)return;if(e.target.classList.contains('cohortDecision')){record.decision=e.target.value;let n=cohortReview.rows.filter(r=>String(r.decision||'').trim()).length;$('#cohortReviewPill').textContent=`${n}/${cohortReview.total} decided`}if(e.target.classList.contains('cohortNotes'))record.notes=e.target.value;if(e.target.classList.contains('fallbackReadChoice')){record.selected_read_id=e.target.value;record.read_selection_source=e.target.value&&e.target.value!==record.recommended_read_id?'MANUAL':'AUTO_LONGEST_USABLE_READ';}});$('#cohortReviewRows').addEventListener('input',e=>{if(!e.target.classList.contains('cohortNotes')||!cohortReview)return;let tr=e.target.closest('tr[data-seq]'),record=cohortReview.rows.find(r=>r.sequence_id===tr?.dataset.seq);if(record)record.notes=e.target.value});$('#cohortReviewRows').addEventListener('click',e=>{let b=e.target.closest('[data-review-inspect]');if(!b)return;let id=b.dataset.reviewInspect;if((studioState.samples||[]).some(s=>s.sequence_id===id)){selectSample(id);$('#sampleHeading').scrollIntoView({behavior:'smooth',block:'start'})}else{setStatus($('#cohortReviewSaveStatus'),`${id} is not present in the currently loaded raw-read map. Attach the relevant partner sample map to inspect its chromatograms.`,true)}});$('#saveCohortReviewBtn').onclick=saveCohortReview;if(studioState.marker_review)renderCohortReview(studioState.marker_review);if(studioState.samples?.length){$('#mapStatus').textContent=studioState.onboarding_taxonomy?.loaded?studioState.onboarding_taxonomy.message:`Loaded ${studioState.samples.length} isolate(s) from the startup state.`;selectSample(studioState.samples[0].sequence_id)}}catch(e){$('#outputBadge').textContent='Studio connection failed';$('#mapStatus').textContent=e.message}}
+async function init(){try{studioState=await api('/api/state');$('#outputBadge').textContent='Output: '+studioState.out;$('#outputPath').textContent=studioState.out;$('#mapPath').value=studioState.map_path||'';$('#screenRefPath').value=studioState.screen_ref||'';$('#screenTaxaPath').value=studioState.screen_taxa||'';updateTaxonomyScreenStatus(studioState.taxonomy_screen_enabled?'Reference available for optional VSEARCH re-screening.':'No reference configured for optional re-screening.');renderOnboardingTaxonomyState(studioState.onboarding_taxonomy);renderSettings();renderSamples();$('#sequenceType').onchange=applySequenceProfile;applySequenceProfile();$('#chooseInputFolderBtn').onclick=chooseInputFolder;$('#chooseMapBtn').onclick=chooseMap;$('#chooseReadsBtn').onclick=chooseReads;$('#uploadZipBtn').onclick=()=>$('#ab1ZipInput').click();$('#ab1ZipInput').onchange=e=>uploadAb1Zip(e.target.files&&e.target.files[0]);$('#browserReadsInput').onchange=e=>handleBrowserUpload('reads',e.target);$('#browserFolderInput').onchange=e=>handleBrowserUpload('folder',e.target);$('#browserMapInput').onchange=e=>handleBrowserUpload('map',e.target);$('#browserReviewInput').onchange=e=>handleBrowserUpload('review',e.target);$('#browserTaxRefInput').onchange=e=>handleBrowserUpload('taxonomy_ref',e.target);$('#browserTaxTableInput').onchange=e=>handleBrowserUpload('taxonomy_taxa',e.target);$('#chooseOutputBtn').onclick=chooseOutput;$('#shutdownBtn').onclick=shutdownStudio;$('#chooseTaxonomyRefBtn').onclick=chooseTaxonomyRef;$('#chooseTaxonomyTableBtn').onclick=chooseTaxonomyTable;$('#applyTaxonomySettingsBtn').onclick=applyTaxonomySettings;$('#rerunTaxonomyCheck').onchange=()=>updateTaxonomyScreenStatus($('#rerunTaxonomyCheck').checked?'Fresh VSEARCH will run on the current trimmed reads during the next inspection.':'Off: use pre-screened onboarding taxonomy where available.');$('#attachReviewBtn').onclick=attachReview;$('#loadMap').onclick=()=>loadMap($('#mapPath').value);$('#sampleSearch').oninput=renderSamples;$('#runBtn').onclick=inspect;$('#runBtnSidebar').onclick=inspect;$('#processAllBtn').onclick=processAll;$('#resetSettings').onclick=renderSettings;$('#approveBtn').onclick=()=>saveReview('approve');$('#rejectBtn').onclick=()=>saveReview('reject');$('#cohortReviewSearch').oninput=renderCohortReviewRows;$('#cohortReviewFilter').onchange=renderCohortReviewRows;$('#cohortReviewRows').addEventListener('change',e=>{let tr=e.target.closest('tr[data-seq]');if(!tr||!cohortReview)return;let record=cohortReview.rows.find(r=>r.sequence_id===tr.dataset.seq);if(!record)return;if(e.target.classList.contains('cohortDecision')){record.decision=e.target.value;let n=cohortReview.rows.filter(r=>String(r.decision||'').trim()).length;$('#cohortReviewPill').textContent=`${n}/${cohortReview.total} decided`}if(e.target.classList.contains('cohortNotes'))record.notes=e.target.value;if(e.target.classList.contains('fallbackReadChoice')){record.selected_read_id=e.target.value;record.read_selection_source=e.target.value&&e.target.value!==record.recommended_read_id?'MANUAL':'AUTO_LONGEST_USABLE_READ';}});$('#cohortReviewRows').addEventListener('input',e=>{if(!e.target.classList.contains('cohortNotes')||!cohortReview)return;let tr=e.target.closest('tr[data-seq]'),record=cohortReview.rows.find(r=>r.sequence_id===tr?.dataset.seq);if(record)record.notes=e.target.value});$('#cohortReviewRows').addEventListener('click',e=>{let b=e.target.closest('[data-review-inspect]');if(!b)return;let id=b.dataset.reviewInspect;if((studioState.samples||[]).some(s=>s.sequence_id===id)){selectSample(id);$('#sampleHeading').scrollIntoView({behavior:'smooth',block:'start'})}else{setStatus($('#cohortReviewSaveStatus'),`${id} is not present in the currently loaded raw-read map. Attach the relevant partner sample map to inspect its chromatograms.`,true)}});$('#saveCohortReviewBtn').onclick=saveCohortReview;if(studioState.marker_review)renderCohortReview(studioState.marker_review);if(studioState.samples?.length){$('#mapStatus').textContent=studioState.onboarding_taxonomy?.loaded?studioState.onboarding_taxonomy.message:`Loaded ${studioState.samples.length} isolate(s) from the startup state.`;selectSample(studioState.samples[0].sequence_id)}}catch(e){$('#outputBadge').textContent='Studio connection failed';$('#mapStatus').textContent=e.message}}
 init();
 </script>
 </body>

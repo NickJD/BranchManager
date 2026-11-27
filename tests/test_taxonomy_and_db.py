@@ -3445,7 +3445,7 @@ class OutputHelperTests(unittest.TestCase):
             self.assertNotIn('SequencingSetID', lines[0])
             self.assertNotIn('LocalTreeFigure', lines[0])
 
-    def test_selection_summary_includes_redundant_and_lower_priority_but_excludes_failed_and_committed(self):
+    def test_selection_summary_includes_all_unresolved_sab_decisions_and_excludes_completed(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / 'selection_summary.tsv'
             rows = [
@@ -3465,7 +3465,19 @@ class OutputHelperTests(unittest.TestCase):
             write_selection_summary_tsv(out, rows)
             lines = out.read_text().splitlines()
             ids = {line.split('\t')[0] for line in lines[1:]}
-            self.assertEqual(ids, {'REDUNDANT', 'LOW_PRIORITY'})
+            self.assertEqual(ids, {'REDUNDANT', 'LOW_PRIORITY', 'FAILED', 'COMMITTED'})
+
+
+    def test_selection_summary_retains_no_sequence_record_for_sab_action(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / 'selection_summary.tsv'
+            rows = [{'id': 'NO_MARKER', 'partner_id': 'QUB', 'no_marker_sequence': True,
+                    'marker_qc_class': 'FAIL_QC', 'marker_qc_reasons': 'reads failed QC'}]
+            write_selection_summary_tsv(out, rows)
+            lines = out.read_text().splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertIn('NO_MARKER', lines[1])
+            self.assertIn('RESEQUENCE REQUIRED - NO SEQUENCE', lines[1])
 
 
     def test_selection_decision_does_not_treat_related_available_genome_as_duplicate(self):

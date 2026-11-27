@@ -81,9 +81,11 @@ def test_dashboard_can_overlay_current_sab_and_genome_status_from_database(tmp_p
          'AlreadySelectedForGenomeSequencing': 'False', 'GenomeAlreadySequenced': 'False'},
         {'SequenceID': 'QUB_0003', 'PartnerID': 'QUB', 'Recommendation': 'PRIORITISE - SET PRIMARY',
          'AlreadySelectedForGenomeSequencing': 'False', 'GenomeAlreadySequenced': 'False'},
+        {'SequenceID': 'QUB_0004', 'PartnerID': 'QUB', 'Recommendation': 'RESEQUENCE REQUIRED - NO SEQUENCE',
+         'MarkerQC': 'FAIL_QC', 'AlreadySelectedForGenomeSequencing': 'False', 'GenomeAlreadySequenced': 'False'},
     ])
     _write_tsv(assessment / 'sequence_assessment.tsv', [
-        {'ID': 'QUB_0001'}, {'ID': 'QUB_0002'}, {'ID': 'QUB_0003'},
+        {'ID': 'QUB_0001'}, {'ID': 'QUB_0002'}, {'ID': 'QUB_0003'}, {'ID': 'QUB_0004'},
     ])
     db_path = tmp_path / 'project.sqlite'
     with sqlite3.connect(db_path) as conn:
@@ -110,6 +112,7 @@ def test_dashboard_can_overlay_current_sab_and_genome_status_from_database(tmp_p
             INSERT INTO sequences VALUES ('QUB_0001', 'QUB');
             INSERT INTO sequences VALUES ('QUB_0002', 'QUB');
             INSERT INTO sequences VALUES ('QUB_0003', 'QUB');
+            INSERT INTO sequences VALUES ('QUB_0004', 'QUB');
             INSERT INTO genome_records VALUES ('QUB_0003', 'GCA_000003.1', 'GENOME_QC_FAILED', 0, 70, 8, '', '', 'QC failed');
         """)
 
@@ -127,10 +130,11 @@ def test_dashboard_can_overlay_current_sab_and_genome_status_from_database(tmp_p
     assert records['QUB_0003']['genome_already_sequenced'] is True
     assert data['counts']['selected_pending'] == 1
     assert data['counts']['already_sequenced'] == 1
-    assert data['counts']['partner_lifecycle']['QUB']['total'] == 3
+    assert data['counts']['partner_lifecycle']['QUB']['total'] == 4
     assert data['counts']['partner_lifecycle']['QUB']['selected_pending'] == 1
     assert data['counts']['partner_lifecycle']['QUB']['sequenced'] == 1
     assert data['counts']['partner_lifecycle']['QUB']['remaining'] == 1
+    assert data['counts']['partner_lifecycle']['QUB']['qc_action_required'] == 1
     assert 'partnerLifecycleBody' in page
     assert len(data['genome_records']) == 1
     assert data['run']['database_overlay'] is True

@@ -161,3 +161,118 @@ def test_current_bundle_is_replaced_by_new_ready_release(tmp_path):
     assert "B" in (current / "dashboard" / "performance_review_dashboard.html").read_text()
     with sqlite3.connect(current / "project.sqlite") as conn:
         assert conn.execute("SELECT value FROM marker").fetchone()[0] == "B"
+
+
+def test_legacy_manifests_work_after_project_moves(tmp_path, capsys):
+    from branchmanager.cli_core import main
+
+    manager = make_project(tmp_path)
+    old_root = manager.project_root
+    release = manager.create_release("parent")
+    release_dir = Path(release["release_dir"])
+    with sqlite3.connect(release["database"]) as conn:
+        conn.execute("CREATE TABLE source (value TEXT)")
+        conn.execute("INSERT INTO source VALUES ('preserved')")
+
+    project_path = old_root / "project_manifest.json"
+    project = json.loads(project_path.read_text())
+    project["releases_root"] = str(manager.releases_root())
+    project_path.write_text(json.dumps(project))
+    release_path = release_dir / RELEASE_MANIFEST
+    legacy_release = json.loads(release_path.read_text())
+    legacy_release["release_dir"] = str(release_dir)
+    legacy_release["database"] = str(release_dir / "project.sqlite")
+    release_path.write_text(json.dumps(legacy_release))
+    pointer = manager.releases_root() / "latest.json"
+    pointer.write_text(json.dumps({"release_id": "parent", "release_dir": str(release_dir)}))
+
+    new_root = tmp_path / "moved" / "ProjectRoot"
+    new_root.parent.mkdir()
+    old_root.rename(new_root)
+    moved = ReleaseManager(new_root)
+    new_release = new_root / "Releases" / "BranchManager_Project" / "versions" / "parent"
+    assert moved.load_project()["project_root"] == str(new_root)
+    assert moved.resolve_release("latest") == new_release
+    assert moved.get_release_manifest("parent")["database"] == str(new_release / "project.sqlite")
+    assert moved.validate_release("parent")["valid"]
+    assert main(["release", "info", "--project", str(new_root), "--release", "parent"]) == 0
+    assert json.loads(capsys.readouterr().out)["release_dir"] == str(new_release)
+    assert main(["release", "create", "--project", str(new_root), "--release-id", "child",
+                 "--parent-release", "parent", "--copy-database"]) == 0
+    with sqlite3.connect(moved.get_release_manifest("child")["database"]) as conn:
+        assert conn.execute("SELECT value FROM source").fetchone()[0] == "preserved"
+    assert json.loads((new_root / "project_manifest.json").read_text()) == project
+
+
+def test_new_release_paths_are_relative_on_disk(tmp_path):
+    manager = make_project(tmp_path)
+    release = manager.create_release("portable")
+    project = json.loads(manager.project_manifest_path.read_text())
+    manifest = json.loads((Path(release["release_dir"]) / RELEASE_MANIFEST).read_text())
+    pointer = json.loads((manager.releases_root() / "latest.json").read_text())
+    assert project["releases_root"] == "Releases/BranchManager_Project"
+    assert manifest["release_dir"] == "."
+    assert manifest["database"] == "project.sqlite"
+    assert pointer["release_id"] == "portable"
+    assert "release_dir" not in pointer
+
+
+def test_moved_external_store_requires_explicit_override(tmp_path, capsys):
+    from branchmanager.cli_core import main
+
+    root = tmp_path / "old" / "project"
+    store = tmp_path / "old" / "external"
+    manager = ReleaseManager(root)
+    manager.init_project("External", releases_dir=store)
+    manager.create_release("parent")
+    new_root = tmp_path / "new" / "project"
+    new_store = tmp_path / "new" / "external"
+    new_root.parent.mkdir()
+    root.rename(new_root)
+    store.rename(new_store)
+
+    with pytest.raises(ValueError, match="specify --releases-dir"):
+        ReleaseManager(new_root).list_releases()
+    assert main(["project", "list-releases", "--root", str(new_root),
+                 "--releases-dir", str(new_store)]) == 0
+    assert "parent" in capsys.readouterr().out
+    assert main(["release", "info", "--project", str(new_root), "--releases-dir", str(new_store),
+                 "--release", "latest"]) == 0
+    assert json.loads(capsys.readouterr().out)["release_dir"] == str(new_store / "versions" / "parent")
+    assert main(["release", "create", "--project", str(new_root), "--releases-dir", str(new_store),
+                 "--release-id", "next"]) == 0
+    assert (new_store / "versions" / "next" / RELEASE_MANIFEST).is_file()
+
+
+def test_relative_external_store_moves_with_project(tmp_path):
+    root = tmp_path / "old" / "project"
+    manager = ReleaseManager(root)
+    manager.init_project("Relative", releases_dir="../store")
+    manager.create_release("parent")
+    assert json.loads(manager.project_manifest_path.read_text())["releases_root"] == "../store"
+    (tmp_path / "old").rename(tmp_path / "new")
+    moved = ReleaseManager(tmp_path / "new" / "project")
+    assert moved.resolve_release("latest") == tmp_path / "new" / "store" / "versions" / "parent"
+
+
+def test_relocated_release_rejects_external_database(tmp_path):
+    manager = make_project(tmp_path)
+    release = manager.create_release("parent")
+    path = Path(release["release_dir"]) / RELEASE_MANIFEST
+    manifest = json.loads(path.read_text())
+    manifest["release_dir"] = release["release_dir"]
+    manifest["database"] = str(tmp_path / "outside.sqlite")
+    path.write_text(json.dumps(manifest))
+    new_root = tmp_path / "moved"
+    manager.project_root.rename(new_root)
+    result = ReleaseManager(new_root).validate_release("parent", check_database=False)
+    assert not result["valid"]
+    assert any("outside release" in issue for issue in result["issues"])
+
+
+def test_latest_pointer_cannot_refer_to_itself(tmp_path):
+    manager = make_project(tmp_path)
+    manager.create_release("parent")
+    (manager.releases_root() / "latest.json").write_text(json.dumps({"release_id": "latest"}))
+    with pytest.raises(ValueError, match="cannot refer to itself"):
+        manager.resolve_release("latest")

@@ -168,7 +168,7 @@ class StudioTaxonomyDisplayTests(unittest.TestCase):
         self.assertIn('id="taxonomyResults"', html)
         self.assertIn('function renderTaxonomyResults(r)', html)
         self.assertIn("x.NearBest", html)
-        self.assertIn("/api/pick-taxonomy-reference", html)
+        self.assertIn("browserTaxRefInput", html)
         self.assertIn("/api/set-taxonomy-screen", html)
         self.assertIn("id=\"runBtnSidebar\"", html)
         self.assertIn('id="chooseInputFolderBtn"', html)

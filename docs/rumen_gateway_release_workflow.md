@@ -15,7 +15,7 @@ Use release-specific paths and the project profile. Each release owns its databa
 8. Run `assistant --cohort-resume ... --marker-review <review.tsv>` against the same release and cohort preparation folder. This operation **does perform the joint marker assessment**. Its internal Performance Review outputs are initially written below `cohort/01_joint_assistant/03_performance_review_hiring_panel/`. The corrected BranchManager build also promotes assessment files to the release-level `assessment/` and the HTML dashboard to `dashboard/`, and marks the assessment/dashboard workflow states complete when the required promoted files are present.
 9. Inspect the release-level assessment tables and dashboard. Do not infer scientific sign-off from workflow status alone.
 10. Run `branchmanager release validate --project "$PROJECT_ROOT" --release "$RELEASE_ID"` and inspect the validation report.
-11. Only mark the release `READY` after validation and review. BranchManager now refuses READY if assessment/dashboard workflow stages are not COMPLETE or if these files are absent/empty: `assessment/sequence_assessment.tsv`, `assessment/selection_summary.tsv`, `dashboard/performance_review_dashboard.html`.
+11. Only mark the release `READY` after validation and review. BranchManager now refuses READY if assessment/dashboard workflow stages are not COMPLETE or if these files are absent/empty: `assessment/sequence_assessment.tsv`, `assessment/selection_summary.tsv` (complete pending SAB decision set; QC/resequencing cases included, completed sequencing commitments excluded), `dashboard/performance_review_dashboard.html`.
 
 
 ## Continuation release
@@ -35,7 +35,7 @@ A READY release must have non-empty:
 
 
 - `assessment/sequence_assessment.tsv`
-- `assessment/selection_summary.tsv`
+- `assessment/selection_summary.tsv` (complete pending SAB decision set; QC/resequencing cases included, completed sequencing commitments excluded)
 - `dashboard/performance_review_dashboard.html`
 
 and workflow statuses `assessment=COMPLETE`, `dashboard=COMPLETE`, and `validation=COMPLETE`. SQLite integrity alone is not sufficient for release readiness.

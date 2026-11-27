@@ -59,7 +59,7 @@ included in this repository.
 | Novelty and baseline assessment | Comparisons against project baselines and configured external references, with explicit evidence and limitations. |
 | Pangenome assessment | GTDB-derived taxonomic grouping, genome representation and target-gap reporting where the necessary evidence is available. |
 | Genome evidence | Import and integration of genome-derived 16S and genome QC/taxonomy evidence. |
-| Selection and reporting | Candidate panels, primary/backup recommendations, decision-focused SAB shortlists, quarterly review outputs and interactive HTML reporting. |
+| Selection and reporting | Candidate panels, primary/backup recommendations, complete SAB decision files with QC-action separation, quarterly review outputs and interactive HTML reporting. |
 | Ground-truth validation | Create and approve checksummed reference snapshots, compare subsequent runs against approved baselines, detect workflow drift and generate validation reports. |
 | Project profiles | Reusable JSON configuration for collection-specific paths, references, baselines and workflow defaults. |
 
